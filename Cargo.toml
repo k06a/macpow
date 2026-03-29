@@ -1,0 +1,33 @@
+[package]
+name = "macpow"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time power consumption monitor for Apple Silicon Macs"
+license = "MIT"
+repository = "https://github.com/k06a/macpow"
+homepage = "https://github.com/k06a/macpow"
+keywords = ["apple-silicon", "power", "monitor", "tui", "macos"]
+categories = ["command-line-utilities", "hardware-support"]
+readme = "README.md"
+
+[lib]
+name = "macpow"
+path = "src/lib.rs"
+
+[[bin]]
+name = "macpow"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.29"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+libc = "0.2"
+kbd = "0.2.0"
+kbd-crossterm = "0.2.0"
+unicode-width = "0.2.0"
