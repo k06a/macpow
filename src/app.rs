@@ -30,10 +30,10 @@ const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇',
 
 fn power_color(w: f32) -> Color {
     match w {
-        w if w < 1.0 => Color::White,
-        w if w < 5.0 => Color::Green,
-        w if w < 10.0 => Color::Yellow,
-        _ => Color::Red,
+        w if w < 1.0 => Color::Green,
+        w if w < 5.0 => Color::Yellow,
+        w if w < 10.0 => Color::Rgb(255, 165, 0), // orange
+        _ => Color::Rgb(255, 50, 50),              // bright red
     }
 }
 
@@ -321,6 +321,10 @@ pub struct App {
     proc_keys: std::collections::HashMap<i32, &'static str>,
     fan_wh: Vec<f64>,
     machine_name: String,
+    tree_data_y: u16,
+    tree_scroll: usize,
+    tree_vis_h: usize,
+    term_height: u16,
 }
 
 impl App {
@@ -349,6 +353,10 @@ impl App {
             proc_keys: std::collections::HashMap::new(),
             fan_wh: Vec::new(),
             machine_name,
+            tree_data_y: 0,
+            tree_scroll: 0,
+            tree_vis_h: 0,
+            term_height: 40,
         }
     }
 
@@ -525,6 +533,24 @@ impl App {
         self.cursor = pos.clamp(0, max) as usize;
     }
 
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let y = mouse.row;
+            if y >= self.tree_data_y {
+                let vi = (y - self.tree_data_y) as usize;
+                if vi < self.tree_vis_h {
+                    let target = self.tree_scroll + vi;
+                    if target < self.total_rows
+                        && !self.row_is_sep.get(target).copied().unwrap_or(false)
+                    {
+                        self.cursor = target;
+                    }
+                }
+            }
+        }
+    }
+
     fn toggle_pin(&mut self) {
         if let Some(Some(key)) = self.row_keys_cache.get(self.cursor) {
             if let Some(pos) = self.pinned.iter().position(|&k| k == *key) {
@@ -599,6 +625,7 @@ impl App {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
+        self.term_height = f.area().height;
         let all_rows = self.build_rows();
 
         // Filter out children of collapsed nodes
@@ -737,6 +764,8 @@ impl App {
             }
         };
 
+        rows.push(TreeRow::separator());
+
         // ── Battery (standalone row before the tree)
         if m.battery.present {
             let batt_w = s.battery.get();
@@ -751,7 +780,7 @@ impl App {
                 (false, t) if t > 0 => format!("{}h {:02}m remaining", t / 60, t % 60),
                 _ => "calc…".into(),
             };
-            let batt_label = format!("Battery {:.0}% — {}", m.battery.percent, charge_status);
+            let batt_label = format!("Battery {:.0}% ({})", m.battery.percent, charge_status);
             let batt_style = if m.battery.charging {
                 Style::default().fg(Color::Green)
             } else {
@@ -1232,10 +1261,13 @@ impl App {
         // ── Software (standalone collapsible section after the tree)
         rows.push(TreeRow::separator());
         let all_sw_energy = (m.all_procs_energy_mj - self.proc_baseline.values().sum::<f64>()).max(0.0);
+        // Dynamic limit: fill available space, minimum 10
+        let non_sw_rows = rows.len() + 3; // separator + header + footer + borders
+        let proc_limit = ((self.term_height as usize).saturating_sub(non_sw_rows)).max(10);
         {
             let mut sw_row = TreeRow::pw(
                 "software", None, "",
-                "Software (filter: top 10 by total)",
+                &format!("Software (filter: top {} by total)", proc_limit),
                 m.all_procs_power_w + 0.0,
                 all_sw_energy / 3600.0 / 1000.0,
                 BOLD, pin("software"),
@@ -1244,7 +1276,7 @@ impl App {
             rows.push(sw_row);
         }
         if m.top_processes.is_empty() {
-            rows.push(TreeRow::info(Some("software"), "  ", "(collecting…)", "", "", PENDING));
+            rows.push(TreeRow::info(Some("software"), "", "(collecting…)", "", "", PENDING));
         }
         let self_pid = std::process::id() as i32;
         let baseline = &self.proc_baseline;
@@ -1258,16 +1290,16 @@ impl App {
             .filter(|(_, adj)| *adj > 0.0)
             .collect();
         display_procs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        display_procs.truncate(10);
+        display_procs.truncate(proc_limit);
         // Pre-compute per-process keys
         let proc_row_keys: Vec<&'static str> = display_procs.iter()
             .map(|(p, _)| proc_key(&mut self.proc_keys, p.pid))
             .collect();
         rows.extend(display_procs.iter().enumerate().map(|(i, (p, adj_mj))| {
             let pfx = if i == display_procs.len() - 1 {
-                "  └─ "
+                "└─ "
             } else {
-                "  ├─ "
+                "├─ "
             };
             let dead = p.power_w == 0.0 && *adj_mj > 0.0;
             let color = if dead {
@@ -1298,7 +1330,7 @@ impl App {
 
     // ── Two-pass buffer renderer ────────────────────────────────────────────
 
-    fn draw_tree_buf(&self, f: &mut Frame, area: Rect, rows: &[&TreeRow], all_rows: &[TreeRow]) {
+    fn draw_tree_buf(&mut self, f: &mut Frame, area: Rect, rows: &[&TreeRow], all_rows: &[TreeRow]) {
         let block = Block::default().borders(Borders::ALL).title(format!(
             " Power Tree ({}/{}) ",
             self.cursor + 1,
@@ -1314,9 +1346,10 @@ impl App {
 
         let hdr_y = inner.y;
         let right = inner.right();
-        // Inline sparkline column when wide enough
-        let spark_w = if inner.width > 90 { (inner.width - 90).min(60) } else { 0 };
-        let tot_x = right.saturating_sub(COL_TOT).saturating_sub(spark_w);
+        // Inline sparkline column when wide enough (1-char gap after Total)
+        let spark_gap: u16 = if inner.width > 90 { 1 } else { 0 };
+        let spark_w = if inner.width > 90 { (inner.width - 90 - 1).min(60) } else { 0 };
+        let tot_x = right.saturating_sub(COL_TOT).saturating_sub(spark_w).saturating_sub(spark_gap);
         let cur_x = tot_x.saturating_sub(COL_CUR);
         let tmp_x = cur_x.saturating_sub(COL_TEMP);
         let frq_x = tmp_x.saturating_sub(COL_FREQ);
@@ -1331,10 +1364,13 @@ impl App {
             right_str(buf, spark_x, hdr_y, spark_w, "History", BOLD);
         }
 
-        let data_y = hdr_y + 2;
-        let vis_h = inner.height.saturating_sub(2) as usize;
+        let data_y = hdr_y + 1;
+        let vis_h = inner.height.saturating_sub(1) as usize;
         let total = rows.len();
         let scroll = self.scroll_offset(vis_h, total);
+        self.tree_data_y = data_y;
+        self.tree_scroll = scroll;
+        self.tree_vis_h = vis_h;
         let pin_w: u16 = 2;
         let tree_x = inner.x + pin_w;
 
@@ -1556,13 +1592,13 @@ impl App {
             Span::raw(" fold  "),
             Span::styled("space", Style::default().fg(Color::Yellow)),
             Span::raw(" pin    "),
-            Span::styled("■", Style::default().fg(Color::White)),
-            Span::raw("<1W "),
             Span::styled("■", Style::default().fg(Color::Green)),
-            Span::raw("<5W "),
+            Span::raw("<1W "),
             Span::styled("■", Style::default().fg(Color::Yellow)),
+            Span::raw("<5W "),
+            Span::styled("■", Style::default().fg(Color::Rgb(255, 165, 0))),
             Span::raw("<10W "),
-            Span::styled("■", Style::default().fg(Color::Red)),
+            Span::styled("■", Style::default().fg(Color::Rgb(255, 50, 50))),
             Span::raw("≥10W "),
             Span::styled("■", PENDING),
             Span::raw("pending"),

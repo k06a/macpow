@@ -669,7 +669,7 @@ impl Sampler {
                             .partial_cmp(&a.energy_mj)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    procs.truncate(10);
+                    procs.truncate(50);
                     if let Ok(mut mg) = m.lock() {
                         mg.all_procs_power_w = total_power;
                         mg.all_procs_energy_mj = total_energy;

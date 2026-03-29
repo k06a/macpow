@@ -70,6 +70,7 @@ fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
     }
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    stdout().execute(crossterm::event::EnableMouseCapture)?;
     let _ = stdout().execute(PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::all()));
 
     let backend = CrosstermBackend::new(stdout());
@@ -82,15 +83,22 @@ fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
         }
         terminal.draw(|f| app.draw(f))?;
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && app.handle_key(key) {
-                    break;
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.handle_key(key) {
+                        break;
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                }
+                _ => {}
             }
         }
     }
 
     let _ = stdout().execute(PopKeyboardEnhancementFlags);
+    stdout().execute(crossterm::event::DisableMouseCapture)?;
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     Ok(())
