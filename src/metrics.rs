@@ -559,10 +559,19 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(interval_ms: u64) -> Self {
-        let gpu_cores = read_gpu_core_count();
-        let dram_gb = read_dram_gb();
-        let ssd_model = read_ssd_model();
-        let max_nits = read_display_max_nits();
+        // Parallelize init reads — all independent
+        let (gpu_cores, dram_gb, ssd_model, max_nits) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| read_gpu_core_count());
+            let h2 = s.spawn(|| read_dram_gb());
+            let h3 = s.spawn(|| read_ssd_model());
+            let h4 = s.spawn(|| read_display_max_nits());
+            (
+                h1.join().unwrap_or(0),
+                h2.join().unwrap_or(0),
+                h3.join().unwrap_or_default(),
+                h4.join().unwrap_or(500.0),
+            )
+        });
 
         let shared = Arc::new(Mutex::new(Metrics {
             gpu_cores,
@@ -603,10 +612,18 @@ impl Sampler {
                 let Some(mut smc) = SmcConnection::open().ok() else {
                     return;
                 };
-                let handle = smc.start_temp_discovery();
-                smc.finish_temp_discovery(handle);
+                let mut disc_handle: Option<std::thread::JoinHandle<Vec<(String, String)>>> =
+                    Some(smc.start_temp_discovery());
                 let mut prev_ticks = read_cpu_ticks();
                 loop {
+                    // Non-blocking: check if temp discovery finished
+                    if let Some(ref h) = disc_handle {
+                        if h.is_finished() {
+                            if let Some(h) = disc_handle.take() {
+                                smc.finish_temp_discovery(h);
+                            }
+                        }
+                    }
                     let temps = smc.read_temperatures();
                     let fans = smc.read_fans();
                     let sys_power = smc.read_system_power();
