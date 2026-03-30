@@ -110,6 +110,7 @@ pub struct DisplayInfo {
     pub brightness_pct: f32,
     pub nits: f32,
     pub estimated_power_w: f32,
+    pub available: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

@@ -1173,14 +1173,16 @@ impl App {
         }
 
         // ── Display
-        if m.display.brightness_pct > 0.0 {
+        if m.display.available {
             let name = if m.display.nits > 0.0 {
                 format!(
                     "Display ({:.0}% brightness, {:.0} nits)",
                     m.display.brightness_pct, m.display.nits
                 )
-            } else {
+            } else if m.display.brightness_pct > 0.0 {
                 format!("Display ({:.0}% brightness)", m.display.brightness_pct)
+            } else {
+                "Display (0% brightness)".into()
             };
             rows.push(TreeRow::pw(
                 "display",
@@ -1197,10 +1199,10 @@ impl App {
                 "display",
                 Some("system"),
                 &t("display"),
-                "Display (pending…)",
+                "Display (off)",
                 0.0,
-                0.0,
-                PENDING,
+                w.display,
+                DIM,
                 pin("display"),
             ));
         }

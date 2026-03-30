@@ -765,11 +765,17 @@ impl Sampler {
         {
             let m = shared.clone();
             handles.push(std::thread::spawn(move || loop {
-                if let Some(brightness) = read_display_brightness() {
-                    if let Ok(mut mg) = m.lock() {
+                if let Ok(mut mg) = m.lock() {
+                    if let Some(brightness) = read_display_brightness() {
                         mg.display.brightness_pct = brightness * 100.0;
                         mg.display.estimated_power_w = brightness * MAX_DISPLAY_W;
                         mg.display.nits = brightness * max_nits;
+                        mg.display.available = true;
+                    } else {
+                        mg.display.brightness_pct = 0.0;
+                        mg.display.estimated_power_w = 0.0;
+                        mg.display.nits = 0.0;
+                        mg.display.available = false;
                     }
                 }
                 std::thread::sleep(dt);
