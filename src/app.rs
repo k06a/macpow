@@ -386,7 +386,7 @@ impl App {
             wh: Wh::default(),
             sma: MetricsSma::new(0.0),
             sma_window: 0,
-            latency_ms: 500,
+            latency_ms: 250,
             temp_min: BTreeMap::new(),
             temp_max: BTreeMap::new(),
             temp_sum: BTreeMap::new(),
@@ -754,9 +754,9 @@ impl App {
 
     fn cycle_latency(&mut self) {
         self.latency_ms = match self.latency_ms {
-            500 => 2000,
-            2000 => 5000,
-            _ => 500,
+            250 => 1000,
+            1000 => 2000,
+            _ => 250,
         };
     }
 
