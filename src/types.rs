@@ -114,6 +114,7 @@ pub struct BatteryInfo {
     pub voltage_mv: f64,
     pub amperage_ma: f64,
     pub drain_w: f64,
+    pub capacity_wh: f64,
     pub current_capacity: i64,
     pub max_capacity: i64,
     pub percent: f64,

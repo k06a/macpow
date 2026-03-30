@@ -936,23 +936,36 @@ impl App {
         // ── Battery (standalone row before the tree)
         if m.battery.present {
             let batt_w = s.battery.get();
-            let display_w = if m.battery.charging {
-                batt_w.abs()
+            let t = m.battery.time_remaining_min;
+            let has_time = t > 0;
+            let effectively_charging = m.battery.external_connected && m.battery.drain_w < 0.0;
+            let (display_w, charge_status, batt_style) = if m.battery.external_connected {
+                // On external power: show charging power (positive)
+                let status = if effectively_charging && has_time {
+                    format!("full in {}h {:02}m", t / 60, t % 60)
+                } else if effectively_charging {
+                    "charging…".into()
+                } else {
+                    "on power".into()
+                };
+                (
+                    batt_w.abs(),
+                    status,
+                    Style::default().fg(Color::Rgb(46, 139, 87)),
+                )
             } else {
-                -batt_w.abs()
-            };
-            let charge_status = match (m.battery.charging, m.battery.time_remaining_min) {
-                (true, t) if t > 0 => format!("full in {}h {:02}m", t / 60, t % 60),
-                (true, _) => "charging…".into(),
-                (false, t) if t > 0 => format!("{}h {:02}m remaining", t / 60, t % 60),
-                _ => "calc…".into(),
+                // On battery: show drain power (negative)
+                (
+                    -batt_w.abs(),
+                    if has_time {
+                        format!("{}h {:02}m remaining", t / 60, t % 60)
+                    } else {
+                        "estimating…".into()
+                    },
+                    Style::default().fg(power_color(batt_w.abs())),
+                )
             };
             let batt_label = format!("Battery {:.0}% ({})", m.battery.percent, charge_status);
-            let batt_style = if m.battery.charging {
-                Style::default().fg(Color::Rgb(46, 139, 87))
-            } else {
-                Style::default().fg(power_color(batt_w.abs()))
-            };
             rows.push(TreeRow::pw_full(
                 "battery",
                 None,

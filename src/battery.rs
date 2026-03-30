@@ -34,16 +34,27 @@ unsafe fn read_battery_inner() -> Option<BatteryInfo> {
         .unwrap_or(0.0);
     let current_cap = cf_utils::cfdict_get_i64(dict, "CurrentCapacity").unwrap_or(0);
     let max_cap = cf_utils::cfdict_get_i64(dict, "MaxCapacity").unwrap_or(1);
-    let is_charging = cf_utils::cfdict_get_bool(dict, "IsCharging").unwrap_or(false);
+    let os_is_charging = cf_utils::cfdict_get_bool(dict, "IsCharging").unwrap_or(false);
     let external = cf_utils::cfdict_get_bool(dict, "ExternalConnected").unwrap_or(false);
-    let time_remaining = cf_utils::cfdict_get_i64(dict, "TimeRemaining").unwrap_or(-1);
+    let raw_time = cf_utils::cfdict_get_i64(dict, "TimeRemaining").unwrap_or(-1);
+    let nominal_charge_mah = cf_utils::cfdict_get_f64(dict, "NominalChargeCapacity").unwrap_or(0.0);
+    let capacity_wh = nominal_charge_mah * voltage_mv / 1_000_000.0;
 
+    let is_charging = os_is_charging;
     let power_w = voltage_mv * amperage_ma.abs() / 1_000_000.0;
-    let drain_w = if is_charging { -power_w } else { power_w };
+    // drain_w: negative = charging (energy in), positive = discharging (energy out)
+    let drain_w = if external { -power_w } else { power_w };
     let percent = if max_cap > 0 {
         (current_cap as f64 / max_cap as f64) * 100.0
     } else {
         0.0
+    };
+
+    // Pass raw macOS estimate; metrics thread will compute SMA-based fallback
+    let time_remaining = if raw_time > 0 && raw_time < 6000 {
+        raw_time
+    } else {
+        -1
     };
 
     cf_utils::cf_release(props as _);
@@ -54,6 +65,7 @@ unsafe fn read_battery_inner() -> Option<BatteryInfo> {
         voltage_mv,
         amperage_ma,
         drain_w,
+        capacity_wh,
         current_capacity: current_cap,
         max_capacity: max_cap,
         percent,

@@ -805,21 +805,37 @@ impl Sampler {
         // ── Battery ──────────────────────────────────────────────────────
         {
             let m = shared.clone();
-            handles.push(std::thread::spawn(move || loop {
-                let mut b = battery::read_battery();
-                if let Ok(mg) = m.lock() {
-                    if b.present
-                        && !b.external_connected
-                        && b.amperage_ma < 0.0
-                        && mg.sys_power_w > 0.0
-                    {
-                        b.drain_w = mg.sys_power_w as f64;
+            handles.push(std::thread::spawn(move || {
+                let mut power_sma = crate::sma::TimeSma::new(300.0); // 5-minute window
+                loop {
+                    let mut b = battery::read_battery();
+                    if let Ok(mg) = m.lock() {
+                        if b.present && !b.external_connected && mg.sys_power_w > 0.0 {
+                            b.drain_w = mg.sys_power_w as f64;
+                        }
                     }
+                    // Feed absolute power into 5-min SMA for time estimation
+                    if b.present {
+                        power_sma.push(b.drain_w.abs() as f32);
+                    }
+                    // Compute time remaining from SMA when macOS doesn't provide it
+                    if b.present && b.time_remaining_min <= 0 && b.capacity_wh > 0.0 {
+                        let avg_power = power_sma.get() as f64;
+                        if avg_power > 0.5 {
+                            let remaining_wh = b.capacity_wh * b.percent / 100.0;
+                            b.time_remaining_min = if b.external_connected {
+                                let full_wh = b.capacity_wh - remaining_wh;
+                                (full_wh / avg_power * 60.0) as i64
+                            } else {
+                                (remaining_wh / avg_power * 60.0) as i64
+                            };
+                        }
+                    }
+                    if let Ok(mut mg) = m.lock() {
+                        mg.battery = b;
+                    }
+                    std::thread::sleep(dt);
                 }
-                if let Ok(mut mg) = m.lock() {
-                    mg.battery = b;
-                }
-                std::thread::sleep(dt);
             }));
         }
 
