@@ -291,7 +291,11 @@ fn read_dvfs_freq_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
             }
 
             let mut name_buf = [0i8; 128];
-            IORegistryEntryGetName(entry, name_buf.as_mut_ptr());
+            name_buf[127] = 0;
+            if IORegistryEntryGetName(entry, name_buf.as_mut_ptr()) != 0 {
+                IOObjectRelease(entry);
+                continue;
+            }
             let name = std::ffi::CStr::from_ptr(name_buf.as_ptr()).to_string_lossy();
 
             if name == "pmgr" {

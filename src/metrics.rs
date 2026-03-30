@@ -146,7 +146,11 @@ fn read_keyboard_brightness() -> Option<f32> {
             }
 
             let mut name_buf = [0i8; 128];
-            IORegistryEntryGetName(service, name_buf.as_mut_ptr());
+            name_buf[127] = 0;
+            if IORegistryEntryGetName(service, name_buf.as_mut_ptr()) != 0 {
+                IOObjectRelease(service);
+                continue;
+            }
             let name = std::ffi::CStr::from_ptr(name_buf.as_ptr()).to_string_lossy();
 
             if name.contains("kbd-backlight") {
@@ -392,9 +396,10 @@ extern "C" {
 }
 
 const RUSAGE_INFO_V4: i32 = 4;
-// ri_billed_energy is at byte offset 256 in rusage_info_v4 (field index 32, u64)
-const BILLED_ENERGY_OFFSET: usize = 32 * 8;
-const RUSAGE_V4_SIZE: usize = 36 * 8; // 36 u64 fields
+// rusage_info_v4: 16-byte UUID + 35 uint64_t fields = 296 bytes
+// ri_billed_energy is field #31 (0-indexed) after the UUID
+const BILLED_ENERGY_OFFSET: usize = 16 + 31 * 8; // = 264
+const RUSAGE_V4_SIZE: usize = 16 + 35 * 8; // = 296
 
 fn read_all_process_energy() -> std::collections::HashMap<i32, (String, u64)> {
     let mut result = std::collections::HashMap::new();
@@ -654,6 +659,9 @@ fn read_cpu_ticks() -> Vec<(u64, u64)> {
             &mut count,
         ) != 0
         {
+            return Vec::new();
+        }
+        if info.is_null() || ncpu == 0 {
             return Vec::new();
         }
         let result: Vec<(u64, u64)> = (0..ncpu as usize)
