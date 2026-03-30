@@ -706,10 +706,10 @@ impl Sampler {
     pub fn new(interval_ms: u64) -> Self {
         // Parallelize init reads — all independent
         let (gpu_cores, dram_gb, ssd_model, max_nits) = std::thread::scope(|s| {
-            let h1 = s.spawn(read_gpu_core_count);
-            let h2 = s.spawn(read_dram_gb);
-            let h3 = s.spawn(read_ssd_model);
-            let h4 = s.spawn(read_display_max_nits);
+            let h1 = s.spawn(|| std::panic::catch_unwind(read_gpu_core_count).unwrap_or(0));
+            let h2 = s.spawn(|| std::panic::catch_unwind(read_dram_gb).unwrap_or(0));
+            let h3 = s.spawn(|| std::panic::catch_unwind(read_ssd_model).unwrap_or_default());
+            let h4 = s.spawn(|| std::panic::catch_unwind(read_display_max_nits).unwrap_or(500.0));
             (
                 h1.join().unwrap_or(0),
                 h2.join().unwrap_or(0),

@@ -26,8 +26,10 @@ fn main() -> Result<()> {
     let json_mode = args.json;
 
     if args.dump {
-        let ior = macpow::ioreport::IOReportSampler::new()?;
-        ior.dump_channels();
+        match macpow::ioreport::IOReportSampler::new() {
+            Ok(ior) => ior.dump_channels(),
+            Err(e) => eprintln!("Failed to initialize IOReport: {e}\nThis Mac may not support the required IOReport channels."),
+        }
         return Ok(());
     }
 
@@ -70,6 +72,13 @@ fn run_json(rx: mpsc::Receiver<Metrics>) -> Result<()> {
     Ok(())
 }
 
+fn restore_terminal() {
+    let _ = stdout().execute(PopKeyboardEnhancementFlags);
+    let _ = stdout().execute(crossterm::event::DisableMouseCapture);
+    let _ = disable_raw_mode();
+    let _ = stdout().execute(LeaveAlternateScreen);
+}
+
 fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
     if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
         anyhow::bail!("TUI requires a real terminal. Use --json for piped output.");
@@ -79,35 +88,39 @@ fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
     stdout().execute(crossterm::event::EnableMouseCapture)?;
     let _ = stdout().execute(PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::all()));
 
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        let backend = CrosstermBackend::new(stdout());
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::new();
 
-    loop {
-        while let Ok(m) = rx.try_recv() {
-            app.update(m);
-        }
-        terminal.draw(|f| app.draw(f))?;
-        if event::poll(Duration::from_millis(app.poll_interval_ms()))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if app.handle_key(key) {
-                        break;
+        loop {
+            while let Ok(m) = rx.try_recv() {
+                app.update(m);
+            }
+            terminal.draw(|f| app.draw(f))?;
+            if event::poll(Duration::from_millis(app.poll_interval_ms()))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if app.handle_key(key) {
+                            break;
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse);
+                    }
+                    _ => {}
                 }
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse);
-                }
-                _ => {}
             }
         }
-    }
+        Ok(())
+    }));
 
-    let _ = stdout().execute(PopKeyboardEnhancementFlags);
-    stdout().execute(crossterm::event::DisableMouseCapture)?;
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
+    restore_terminal();
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => anyhow::bail!("TUI panicked unexpectedly. Terminal has been restored."),
+    }
 }
 
 extern "C" fn sigint_handler(_: libc::c_int) {
