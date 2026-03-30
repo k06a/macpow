@@ -238,32 +238,108 @@ fn reverse_lookup_brightness(table: &[f32], current_hp: f32) -> f32 {
     (idx / (table.len() - 1) as f32).clamp(0.0, 1.0)
 }
 
-// ── Audio: volume via osascript + playback detection via pmset assertions ────
+// ── Audio: volume via CoreAudio + playback detection via power assertions ────
 
-fn read_audio_info() -> AudioInfo {
-    let output = match std::process::Command::new("osascript")
-        .args(["-e", "get volume settings"])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return AudioInfo::default(),
-    };
+#[link(name = "CoreAudio", kind = "framework")]
+extern "C" {
+    fn AudioObjectGetPropertyData(
+        object_id: u32,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const libc::c_void,
+        data_size: *mut u32,
+        data: *mut libc::c_void,
+    ) -> i32;
+}
 
-    let volume = output.split(',').find_map(|p| {
-        p.trim()
-            .strip_prefix("output volume:")?
-            .trim()
-            .parse::<f32>()
-            .ok()
+#[repr(C)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+const AUDIO_OBJECT_SYSTEM: u32 = 1;
+const AUDIO_HARDWARE_PROP_DEFAULT_OUTPUT: u32 = u32::from_be_bytes(*b"dOut");
+const AUDIO_DEVICE_PROP_VOLUME_SCALAR: u32 = u32::from_be_bytes(*b"volm");
+const AUDIO_DEVICE_PROP_MUTE: u32 = u32::from_be_bytes(*b"mute");
+const AUDIO_OBJECT_PROP_SCOPE_OUTPUT: u32 = u32::from_be_bytes(*b"outp");
+const AUDIO_OBJECT_PROP_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+const AUDIO_OBJECT_PROP_ELEMENT_MAIN: u32 = 0;
+
+fn read_audio_volume() -> (Option<f32>, bool) {
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            selector: AUDIO_HARDWARE_PROP_DEFAULT_OUTPUT,
+            scope: AUDIO_OBJECT_PROP_SCOPE_GLOBAL,
+            element: AUDIO_OBJECT_PROP_ELEMENT_MAIN,
+        };
+        let mut device_id: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let kr = AudioObjectGetPropertyData(
+            AUDIO_OBJECT_SYSTEM,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut device_id as *mut u32 as *mut libc::c_void,
+        );
+        if kr != 0 || device_id == 0 {
+            return (None, false);
+        }
+
+        let vol_addr = AudioObjectPropertyAddress {
+            selector: AUDIO_DEVICE_PROP_VOLUME_SCALAR,
+            scope: AUDIO_OBJECT_PROP_SCOPE_OUTPUT,
+            element: AUDIO_OBJECT_PROP_ELEMENT_MAIN,
+        };
+        let mut volume: f32 = 0.0;
+        let mut vol_size = std::mem::size_of::<f32>() as u32;
+        let vol_ok = AudioObjectGetPropertyData(
+            device_id,
+            &vol_addr,
+            0,
+            std::ptr::null(),
+            &mut vol_size,
+            &mut volume as *mut f32 as *mut libc::c_void,
+        ) == 0;
+
+        let mute_addr = AudioObjectPropertyAddress {
+            selector: AUDIO_DEVICE_PROP_MUTE,
+            scope: AUDIO_OBJECT_PROP_SCOPE_OUTPUT,
+            element: AUDIO_OBJECT_PROP_ELEMENT_MAIN,
+        };
+        let mut muted: u32 = 0;
+        let mut mute_size = std::mem::size_of::<u32>() as u32;
+        let _ = AudioObjectGetPropertyData(
+            device_id,
+            &mute_addr,
+            0,
+            std::ptr::null(),
+            &mut mute_size,
+            &mut muted as *mut u32 as *mut libc::c_void,
+        );
+
+        let vol_pct = if vol_ok {
+            Some((volume * 100.0).clamp(0.0, 100.0))
+        } else {
+            None
+        };
+        (vol_pct, muted != 0)
+    }
+}
+
+fn detect_audio_from_assertions(assertions: &[crate::types::PowerAssertion]) -> (bool, bool) {
+    let device_active = assertions.iter().any(|a| {
+        a.name.contains("BuiltInSpeakerDevice") || a.name.contains("audio-out")
     });
-    let muted = output.split(',').any(|p| {
-        p.trim()
-            .strip_prefix("output muted:")
-            .map(|v| v.trim() == "true")
-            .unwrap_or(false)
-    });
+    let playing = assertions.iter().any(|a| a.name.contains("AudioTap"));
+    (device_active, playing)
+}
 
-    let (device_active, playing) = detect_audio_playback();
+fn read_audio_info(assertions: &[crate::types::PowerAssertion]) -> AudioInfo {
+    let (volume, muted) = read_audio_volume();
+    let (device_active, playing) = detect_audio_from_assertions(assertions);
 
     let effective_vol = if muted {
         0.0
@@ -283,25 +359,6 @@ fn read_audio_info() -> AudioInfo {
         playing,
         estimated_power_w,
     }
-}
-
-/// Check `pmset -g assertions` for audio activity:
-/// - `BuiltInSpeakerDevice` assertion → audio device is open
-/// - `AudioTap` assertion → audio is actively playing/routing
-fn detect_audio_playback() -> (bool, bool) {
-    let output = match std::process::Command::new("pmset")
-        .args(["-g", "assertions"])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return (false, false),
-    };
-
-    let device_active = output
-        .lines()
-        .any(|l| l.contains("BuiltInSpeakerDevice") || l.contains("audio-out"));
-    let playing = output.lines().any(|l| l.contains("AudioTap"));
-    (device_active, playing)
 }
 
 // ── GPU core count from IORegistry ───────────────────────────────────────────
@@ -422,53 +479,87 @@ fn read_ssd_model() -> String {
     }
 }
 
+extern "C" {
+    fn host_statistics64(host: u32, flavor: i32, info: *mut u8, count: *mut u32) -> i32;
+}
+const HOST_VM_INFO64: i32 = 4;
+const HOST_VM_INFO64_COUNT: u32 = 38; // sizeof(vm_statistics64_data_t) / sizeof(integer_t)
+const PAGE_SIZE: u64 = 16384;
+
 fn read_mem_used_gb() -> f32 {
-    let output = std::process::Command::new("vm_stat")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
-    let text = match output {
-        Some(t) => t,
-        None => return 0.0,
-    };
-    let page_size: u64 = text.lines().next()
-        .and_then(|l| l.split("page size of ").nth(1))
-        .and_then(|s| s.trim_end_matches(" bytes)").parse().ok())
-        .unwrap_or(16384);
-    let get = |key: &str| -> u64 {
-        text.lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split(':').nth(1))
-            .and_then(|v| v.trim().trim_end_matches('.').parse().ok())
-            .unwrap_or(0)
-    };
-    let active = get("Pages active");
-    let inactive = get("Pages inactive");
-    let wired = get("Pages wired down");
-    let compressed = get("Pages occupied by compressor");
-    let used_bytes = (active + inactive + wired + compressed) * page_size;
-    used_bytes as f32 / (1024.0 * 1024.0 * 1024.0)
+    #[repr(C)]
+    struct VmStats64 {
+        free_count: u32,
+        active_count: u32,
+        inactive_count: u32,
+        wire_count: u32,
+        zero_fill_count: u64,
+        reactivations: u64,
+        pageins: u64,
+        pageouts: u64,
+        faults: u64,
+        cow_faults: u64,
+        lookups: u64,
+        hits: u64,
+        purges: u64,
+        purgeable_count: u32,
+        speculative_count: u32,
+        decompressions: u64,
+        compressions: u64,
+        swapins: u64,
+        swapouts: u64,
+        compressor_page_count: u32,
+        throttled_count: u32,
+        external_page_count: u32,
+        internal_page_count: u32,
+        total_uncompressed_pages_in_compressor: u64,
+    }
+    unsafe {
+        let mut info = std::mem::zeroed::<VmStats64>();
+        let mut count = HOST_VM_INFO64_COUNT;
+        let kr = host_statistics64(
+            mach_host_self(),
+            HOST_VM_INFO64,
+            &mut info as *mut VmStats64 as *mut u8,
+            &mut count,
+        );
+        if kr != 0 {
+            return 0.0;
+        }
+        let used_pages = info.active_count as u64
+            + info.inactive_count as u64
+            + info.wire_count as u64
+            + info.compressor_page_count as u64;
+        (used_pages * PAGE_SIZE) as f32 / (1024.0 * 1024.0 * 1024.0)
+    }
 }
 
 fn read_gpu_utilization() -> (u32, u32, u32) {
-    // Dynamically find AGX accelerator by trying class name patterns G13..G19
-    for gen in (13..=19).rev() {
-        for suffix in &["X\0", "G\0", "P\0"] {
-            let name = format!("AGXAcceleratorG{}{}", gen, suffix);
-            let result = unsafe { try_gpu_util_class(name.as_bytes()) };
-            // Check if the class actually exists
-            let matched = unsafe {
-                let m = IOServiceMatching(name.as_ptr() as *const i8);
-                if m.is_null() { false } else {
-                    let s = IOServiceGetMatchingService(0, m);
-                    if s != 0 { IOObjectRelease(s); true } else { false }
+    static GPU_CLASS: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+
+    let cached = GPU_CLASS.get_or_init(|| {
+        for gen in (13..=19).rev() {
+            for suffix in &["X\0", "G\0", "P\0"] {
+                let name = format!("AGXAcceleratorG{}{}", gen, suffix);
+                let matched = unsafe {
+                    let m = IOServiceMatching(name.as_ptr() as *const i8);
+                    if m.is_null() { false } else {
+                        let s = IOServiceGetMatchingService(0, m);
+                        if s != 0 { IOObjectRelease(s); true } else { false }
+                    }
+                };
+                if matched {
+                    return Some(name.into_bytes());
                 }
-            };
-            if matched { return result; }
+            }
         }
+        None
+    });
+
+    match cached {
+        Some(name) => unsafe { try_gpu_util_class(name) },
+        None => (0, 0, 0),
     }
-    (0, 0, 0)
 }
 
 unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
@@ -703,7 +794,10 @@ impl Sampler {
         {
             let m = shared.clone();
             handles.push(std::thread::spawn(move || loop {
-                let audio = read_audio_info();
+                let assertions = m.lock().ok()
+                    .map(|mg| mg.power_assertions.clone())
+                    .unwrap_or_default();
+                let audio = read_audio_info(&assertions);
                 if let Ok(mut mg) = m.lock() {
                     mg.audio = audio;
                 }

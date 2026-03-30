@@ -1,32 +1,74 @@
 use crate::types::{DiskInfo, NetworkInfo};
 use std::collections::HashMap;
 
-/// Parsed cumulative byte counters from `netstat -ib`.
+/// Parsed cumulative byte counters per network interface.
 pub type NetCounters = HashMap<String, (u64, u64)>; // iface → (bytes_in, bytes_out)
 
-/// Read cumulative network byte counters (no sudo needed).
-pub fn read_net_counters() -> NetCounters {
-    let output = match std::process::Command::new("netstat").args(["-ib"]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return HashMap::new(),
-    };
+#[repr(C)]
+struct IfData {
+    ifi_type: u8,
+    ifi_typelen: u8,
+    ifi_physical: u8,
+    ifi_addrlen: u8,
+    ifi_hdrlen: u8,
+    ifi_recvquota: u8,
+    ifi_xmitquota: u8,
+    ifi_unused1: u8,
+    ifi_mtu: u32,
+    ifi_metric: u32,
+    ifi_baudrate: u32,
+    ifi_ipackets: u32,
+    ifi_ierrors: u32,
+    ifi_opackets: u32,
+    ifi_oerrors: u32,
+    ifi_collisions: u32,
+    ifi_ibytes: u32,
+    ifi_obytes: u32,
+    ifi_imcasts: u32,
+    ifi_omcasts: u32,
+    ifi_iqdrops: u32,
+    ifi_noproto: u32,
+    ifi_recvtiming: u32,
+    ifi_xmittiming: u32,
+    ifi_lastchange: libc::timeval,
+}
 
-    output
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            (cols.len() >= 11 && cols[0] != "lo0" && cols[2].starts_with("<Link")).then_some(())?;
-            let ibytes: u64 = cols[6].parse().unwrap_or(0);
-            let obytes: u64 = cols[9].parse().unwrap_or(0);
-            (ibytes > 0 || obytes > 0).then(|| (cols[0].to_string(), ibytes, obytes))
-        })
-        .fold(HashMap::new(), |mut acc, (iface, ib, ob)| {
-            let entry = acc.entry(iface).or_insert((0, 0));
-            entry.0 = entry.0.max(ib);
-            entry.1 = entry.1.max(ob);
-            acc
-        })
+/// Read cumulative network byte counters via getifaddrs (no subprocess).
+pub fn read_net_counters() -> NetCounters {
+    let mut result = HashMap::new();
+    unsafe {
+        let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut addrs) != 0 {
+            return result;
+        }
+        let mut cur = addrs;
+        while !cur.is_null() {
+            let entry = &*cur;
+            cur = entry.ifa_next;
+
+            if entry.ifa_addr.is_null() || entry.ifa_data.is_null() {
+                continue;
+            }
+            // AF_LINK = 18 on macOS
+            if (*entry.ifa_addr).sa_family as i32 != libc::AF_LINK {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(entry.ifa_name).to_string_lossy();
+            if name == "lo0" {
+                continue;
+            }
+            let data = &*(entry.ifa_data as *const IfData);
+            let ib = data.ifi_ibytes as u64;
+            let ob = data.ifi_obytes as u64;
+            if ib > 0 || ob > 0 {
+                let e = result.entry(name.into_owned()).or_insert((0, 0));
+                e.0 = e.0.max(ib);
+                e.1 = e.1.max(ob);
+            }
+        }
+        libc::freeifaddrs(addrs);
+    }
+    result
 }
 
 /// Compute network rates from two counter snapshots.

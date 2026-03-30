@@ -97,6 +97,7 @@ fn bytes_to_sp78(b: &[u8]) -> f32 {
 pub struct SmcConnection {
     conn: u32,
     temp_keys: Option<Vec<(String, String)>>,
+    key_info_cache: std::collections::HashMap<u32, SmcKeyInfoData>,
 }
 
 unsafe impl Send for SmcConnection {}
@@ -122,6 +123,7 @@ impl SmcConnection {
             Ok(Self {
                 conn,
                 temp_keys: None,
+                key_info_cache: std::collections::HashMap::new(),
             })
         }
     }
@@ -135,9 +137,10 @@ impl SmcConnection {
             if conn2 == 0 {
                 return Vec::new();
             }
-            let tmp = SmcConnection {
+            let mut tmp = SmcConnection {
                 conn: conn2,
                 temp_keys: None,
+                key_info_cache: std::collections::HashMap::new(),
             };
             let keys = tmp.discover_temp_keys();
             // Don't close via Drop — we manually close
@@ -198,15 +201,19 @@ impl SmcConnection {
         }
     }
 
-    fn read_key_info(&self, key: u32) -> Result<SmcKeyInfoData> {
+    fn read_key_info(&mut self, key: u32) -> Result<SmcKeyInfoData> {
+        if let Some(&cached) = self.key_info_cache.get(&key) {
+            return Ok(cached);
+        }
         let mut input = SmcKeyData::default();
         input.key = key;
         input.data8 = SMC_CMD_READ_KEYINFO;
         let out = self.call(&input)?;
+        self.key_info_cache.insert(key, out.key_info);
         Ok(out.key_info)
     }
 
-    pub fn read_key_raw(&self, key_str: &str) -> Result<(SmcKeyInfoData, [u8; 32])> {
+    pub fn read_key_raw(&mut self, key_str: &str) -> Result<(SmcKeyInfoData, [u8; 32])> {
         let key = fourcc(key_str);
         let info = self.read_key_info(key)?;
 
@@ -220,7 +227,7 @@ impl SmcConnection {
     }
 
     /// Read a float value from an SMC key (handles `flt `, `iof `, `sp78` types).
-    pub fn read_f32(&self, key_str: &str) -> Result<f32> {
+    pub fn read_f32(&mut self, key_str: &str) -> Result<f32> {
         let (info, bytes) = self.read_key_raw(key_str)?;
         let val = match info.data_type {
             TYPE_FLT | TYPE_IOF => bytes_to_f32_le(&bytes),
@@ -273,7 +280,7 @@ impl SmcConnection {
     // ── temperatures ─────────────────────────────────────────────────────────
 
     pub fn read_temperatures(&mut self) -> Vec<TempSensor> {
-        let keys = match self.temp_keys.as_ref() {
+        let keys = match self.temp_keys.clone() {
             Some(k) => k,
             None => return Vec::new(),
         };
@@ -289,7 +296,7 @@ impl SmcConnection {
             .collect()
     }
 
-    fn discover_temp_keys(&self) -> Vec<(String, String)> {
+    fn discover_temp_keys(&mut self) -> Vec<(String, String)> {
         let prefixes: &[(&str, &str)] = &[
             ("Tp", "CPU"),
             ("Te", "CPU"),
@@ -321,7 +328,7 @@ impl SmcConnection {
 
     // ── fans ─────────────────────────────────────────────────────────────────
 
-    pub fn read_fans(&self) -> Vec<FanInfo> {
+    pub fn read_fans(&mut self) -> Vec<FanInfo> {
         let num_fans = self
             .read_key_raw("FNum")
             .ok()
@@ -356,7 +363,7 @@ impl SmcConnection {
 
     /// Read keyboard backlight level (0.0–1.0). Returns 0 if not available.
     #[allow(dead_code)]
-    pub fn read_keyboard_backlight(&self) -> f32 {
+    pub fn read_keyboard_backlight(&mut self) -> f32 {
         // Try LKSB key first, then LKBR
         if let Ok((info, bytes)) = self.read_key_raw("LKSB") {
             if info.data_size >= 2 {
@@ -375,7 +382,7 @@ impl SmcConnection {
     // ── system power ─────────────────────────────────────────────────────────
 
     /// Read total system power from SMC `PSTR` key (watts). Returns 0 if unavailable.
-    pub fn read_system_power(&self) -> f32 {
+    pub fn read_system_power(&mut self) -> f32 {
         self.read_f32("PSTR").unwrap_or(0.0)
     }
 }

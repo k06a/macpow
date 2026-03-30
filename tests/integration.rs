@@ -113,7 +113,7 @@ fn smc_opens() {
 
 #[test]
 fn smc_system_power_in_range() {
-    let smc = SmcConnection::open().unwrap();
+    let mut smc = SmcConnection::open().unwrap();
     let pstr = smc.read_system_power();
     assert!(pstr >= 0.0, "PSTR should be non-negative");
     assert!(
@@ -126,7 +126,7 @@ fn smc_system_power_in_range() {
 
 #[test]
 fn smc_fans_in_range() {
-    let smc = SmcConnection::open().unwrap();
+    let mut smc = SmcConnection::open().unwrap();
     let fans = smc.read_fans();
     fans.iter().for_each(|fan| {
         assert!(fan.actual_rpm >= 0.0, "Fan RPM should be non-negative");
