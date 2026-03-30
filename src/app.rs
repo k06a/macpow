@@ -970,11 +970,7 @@ impl App {
         rows.push(TreeRow::separator());
 
         // ── Root: machine name with system total
-        let display_wh = if w.display_soc > 0.0 {
-            w.display_soc + w.display_ext
-        } else {
-            w.display
-        };
+        let display_wh = w.display + w.display_ext;
         let sys_wh = w.cpu
             + w.gpu
             + w.ane
@@ -1360,19 +1356,10 @@ impl App {
             rows.push(r);
         }
 
-        // ── Display (prefer IOReport measured power, fallback to brightness estimate)
+        // ── Display (brightness estimate for built-in + IOReport DISPEXT for external)
         {
-            let has_ior_display = s.display_soc.get() > 0.0 || w.display_soc > 0.0;
-            let disp_w = if has_ior_display {
-                s.display_soc.get() + s.display_ext.get()
-            } else {
-                s.display.get()
-            };
-            let disp_wh = if has_ior_display {
-                w.display_soc + w.display_ext
-            } else {
-                w.display
-            };
+            let disp_w = s.display.get() + s.display_ext.get();
+            let disp_wh = w.display + w.display_ext;
             let name = if m.display.available {
                 if m.display.nits > 0.0 {
                     format!(
