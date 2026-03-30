@@ -1609,7 +1609,13 @@ impl App {
             let bat = d
                 .batteries
                 .iter()
-                .map(|(l, p)| format!("{}: {}", l, p))
+                .map(|(l, p)| {
+                    if l.is_empty() {
+                        p.clone()
+                    } else {
+                        format!("{}: {}", l, p)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let bat_str = if !bat.is_empty() {
