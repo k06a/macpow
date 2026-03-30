@@ -970,7 +970,7 @@ impl App {
         rows.push(TreeRow::separator());
 
         // ── Root: machine name with system total
-        let display_wh = w.display + w.display_ext;
+        let display_wh = w.display + w.display_soc + w.display_ext;
         let sys_wh = w.cpu
             + w.gpu
             + w.ane
@@ -1358,8 +1358,8 @@ impl App {
 
         // ── Display (brightness estimate for built-in + IOReport DISPEXT for external)
         {
-            let disp_w = s.display.get() + s.display_ext.get();
-            let disp_wh = w.display + w.display_ext;
+            let disp_w = s.display.get() + s.display_soc.get() + s.display_ext.get();
+            let disp_wh = w.display + w.display_soc + w.display_ext;
             let name = if m.display.available {
                 if m.display.nits > 0.0 {
                     format!(
