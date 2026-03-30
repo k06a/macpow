@@ -47,29 +47,48 @@ pub fn compute_net_rates(prev: &NetCounters, cur: &NetCounters, dt_s: f64) -> Ne
     }
 }
 
-/// Read disk I/O rates from `iostat` (no sudo needed).
-pub fn read_disk_rates() -> DiskInfo {
-    let output = match std::process::Command::new("iostat")
-        .args(["-d", "-c", "2", "-w", "1"])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return DiskInfo::default(),
-    };
+/// Cumulative disk byte counters from IOBlockStorageDriver Statistics.
+pub type DiskCounters = (u64, u64); // (bytes_read, bytes_written)
 
-    // iostat outputs two samples; take the last data line
-    // Format: "  KB/t  tps  MB/s" per disk
-    let lines: Vec<&str> = output.lines().collect();
-    if let Some(last) = lines.last() {
-        let cols: Vec<&str> = last.split_whitespace().collect();
-        // cols: KB/t tps MB/s (for each disk, we take the first)
-        if cols.len() >= 3 {
-            let mb_s: f64 = cols[2].parse().unwrap_or(0.0);
-            return DiskInfo {
-                read_bytes_per_sec: mb_s * 1024.0 * 1024.0 * 0.5, // rough split
-                write_bytes_per_sec: mb_s * 1024.0 * 1024.0 * 0.5,
-            };
+/// Read cumulative disk byte counters from IORegistry (no subprocess needed).
+pub fn read_disk_counters() -> DiskCounters {
+    use crate::cf_utils;
+    use crate::iokit_ffi::*;
+    unsafe {
+        let matching = IOServiceMatching(b"IOBlockStorageDriver\0".as_ptr() as *const i8);
+        if matching.is_null() { return (0, 0); }
+        let mut iter: u32 = 0;
+        if IOServiceGetMatchingServices(0, matching, &mut iter) != 0 { return (0, 0); }
+        let mut total_read: u64 = 0;
+        let mut total_write: u64 = 0;
+        loop {
+            let entry = IOIteratorNext(iter);
+            if entry == 0 { break; }
+            let mut props = std::ptr::null_mut();
+            if IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null(), 0) == 0
+                && !props.is_null()
+            {
+                let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
+                let stats = cf_utils::cfdict_get(dict, "Statistics");
+                if !stats.is_null() {
+                    let sd = stats as core_foundation_sys::dictionary::CFDictionaryRef;
+                    total_read += cf_utils::cfdict_get_i64(sd, "Bytes (Read)").unwrap_or(0) as u64;
+                    total_write += cf_utils::cfdict_get_i64(sd, "Bytes (Write)").unwrap_or(0) as u64;
+                }
+                cf_utils::cf_release(props as _);
+            }
+            IOObjectRelease(entry);
         }
+        IOObjectRelease(iter);
+        (total_read, total_write)
     }
-    DiskInfo::default()
+}
+
+/// Compute disk rates from two counter snapshots.
+pub fn compute_disk_rates(prev: &DiskCounters, cur: &DiskCounters, dt_s: f64) -> DiskInfo {
+    if dt_s <= 0.0 { return DiskInfo::default(); }
+    DiskInfo {
+        read_bytes_per_sec: cur.0.saturating_sub(prev.0) as f64 / dt_s,
+        write_bytes_per_sec: cur.1.saturating_sub(prev.1) as f64 / dt_s,
+    }
 }

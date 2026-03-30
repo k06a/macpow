@@ -42,6 +42,7 @@ unsafe fn list_usb_inner() -> Option<Vec<UsbDevice>> {
         let mut vendor_id: u32 = 0;
         let mut product_id: u32 = 0;
         let mut power_ma: Option<u32> = None;
+        let mut speed: u32 = 0;
 
         if IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null(), 0) == 0
             && !props.is_null()
@@ -52,8 +53,11 @@ unsafe fn list_usb_inner() -> Option<Vec<UsbDevice>> {
             power_ma = cf_utils::cfdict_get_i64(dict, "USB Power")
                 .or_else(|| cf_utils::cfdict_get_i64(dict, "bMaxPower"))
                 .map(|v| v as u32);
+            speed = cf_utils::cfdict_get_i64(dict, "Device Speed").unwrap_or(0) as u32;
             cf_utils::cf_release(props as _);
         }
+
+        let (bytes_read, bytes_written) = find_storage_stats(entry);
 
         IOObjectRelease(entry);
 
@@ -62,11 +66,49 @@ unsafe fn list_usb_inner() -> Option<Vec<UsbDevice>> {
             vendor_id,
             product_id,
             power_ma,
+            speed,
+            bytes_read,
+            bytes_written,
         });
     }
 
     IOObjectRelease(iter);
     Some(devices)
+}
+
+/// Walk child tree of a USB device to find IOBlockStorageDriver Statistics.
+unsafe fn find_storage_stats(entry: u32) -> (u64, u64) {
+    const KIO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
+    let mut child_iter: u32 = 0;
+    let plane = b"IOService\0".as_ptr() as *const i8;
+    if IORegistryEntryCreateIterator(entry, plane, KIO_REGISTRY_ITERATE_RECURSIVELY, &mut child_iter) != 0 {
+        return (0, 0);
+    }
+    let mut result = (0u64, 0u64);
+    loop {
+        let child = IOIteratorNext(child_iter);
+        if child == 0 { break; }
+        let mut props: CFMutableDictionaryRef = std::ptr::null_mut();
+        if IORegistryEntryCreateCFProperties(child, &mut props, std::ptr::null(), 0) == 0
+            && !props.is_null()
+        {
+            let dict = props as CFDictionaryRef;
+            let stats = cf_utils::cfdict_get(dict, "Statistics");
+            if !stats.is_null() {
+                let stats_dict = stats as CFDictionaryRef;
+                let br = cf_utils::cfdict_get_i64(stats_dict, "Bytes (Read)").unwrap_or(0) as u64;
+                let bw = cf_utils::cfdict_get_i64(stats_dict, "Bytes (Write)").unwrap_or(0) as u64;
+                if br > 0 || bw > 0 {
+                    result = (br, bw);
+                }
+            }
+            cf_utils::cf_release(props as _);
+        }
+        IOObjectRelease(child);
+        if result.0 > 0 || result.1 > 0 { break; }
+    }
+    IOObjectRelease(child_iter);
+    result
 }
 
 // ── Power assertions ─────────────────────────────────────────────────────────

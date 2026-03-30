@@ -37,9 +37,11 @@ extern "C" {
     fn CGMainDisplayID() -> u32;
 }
 
-/// Read current display brightness (0.0–1.0) via DisplayServices private framework.
-/// Loaded dynamically since it's not a public framework.
-fn read_display_brightness() -> Option<f32> {
+/// Cached DisplayServices function pointer (loaded once via dlopen).
+static DISPLAY_BRIGHTNESS_FN: std::sync::OnceLock<Option<unsafe extern "C" fn(u32, *mut f32) -> i32>> =
+    std::sync::OnceLock::new();
+
+fn load_display_brightness_fn() -> Option<unsafe extern "C" fn(u32, *mut f32) -> i32> {
     use std::ffi::CStr;
     unsafe {
         let path = CStr::from_bytes_with_nul_unchecked(
@@ -52,16 +54,20 @@ fn read_display_brightness() -> Option<f32> {
         let sym_name = CStr::from_bytes_with_nul_unchecked(b"DisplayServicesGetBrightness\0");
         let sym = libc::dlsym(handle, sym_name.as_ptr());
         if sym.is_null() {
-            libc::dlclose(handle);
             return None;
         }
-        let get_brightness: unsafe extern "C" fn(u32, *mut f32) -> i32 = std::mem::transmute(sym);
+        // Don't dlclose — keep the library loaded for the process lifetime
+        Some(std::mem::transmute(sym))
+    }
+}
 
+/// Read current display brightness (0.0–1.0) via DisplayServices private framework.
+fn read_display_brightness() -> Option<f32> {
+    let get_brightness = (*DISPLAY_BRIGHTNESS_FN.get_or_init(load_display_brightness_fn))?;
+    unsafe {
         let display = CGMainDisplayID();
         let mut br: f32 = 0.0;
         let ret = get_brightness(display, &mut br);
-        libc::dlclose(handle);
-
         if ret == 0 {
             Some(br.clamp(0.0, 1.0))
         } else {
@@ -389,12 +395,165 @@ fn read_dram_gb() -> u32 {
         .unwrap_or(0)
 }
 
+fn read_ssd_model() -> String {
+    unsafe {
+        let matching = IOServiceMatching(b"IONVMeController\0".as_ptr() as *const i8);
+        if matching.is_null() { return String::new(); }
+        let mut iter: u32 = 0;
+        if IOServiceGetMatchingServices(0, matching, &mut iter) != 0 { return String::new(); }
+        let entry = IOIteratorNext(iter);
+        if entry == 0 { IOObjectRelease(iter); return String::new(); }
+        let mut props = std::ptr::null_mut();
+        let mut model = String::new();
+        let mut interconnect = String::new();
+        if IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null(), 0) == 0 && !props.is_null() {
+            let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
+            model = cf_utils::cfdict_get_string(dict, "Model Number").unwrap_or_default().trim().to_string();
+            interconnect = cf_utils::cfdict_get_string(dict, "Physical Interconnect").unwrap_or_default();
+            cf_utils::cf_release(props as _);
+        }
+        IOObjectRelease(entry);
+        IOObjectRelease(iter);
+        if !model.is_empty() {
+            format!("{}, {}", model, interconnect)
+        } else {
+            "NVMe".into()
+        }
+    }
+}
+
+fn read_mem_used_gb() -> f32 {
+    let output = std::process::Command::new("vm_stat")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    let text = match output {
+        Some(t) => t,
+        None => return 0.0,
+    };
+    let page_size: u64 = text.lines().next()
+        .and_then(|l| l.split("page size of ").nth(1))
+        .and_then(|s| s.trim_end_matches(" bytes)").parse().ok())
+        .unwrap_or(16384);
+    let get = |key: &str| -> u64 {
+        text.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|v| v.trim().trim_end_matches('.').parse().ok())
+            .unwrap_or(0)
+    };
+    let active = get("Pages active");
+    let inactive = get("Pages inactive");
+    let wired = get("Pages wired down");
+    let compressed = get("Pages occupied by compressor");
+    let used_bytes = (active + inactive + wired + compressed) * page_size;
+    used_bytes as f32 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn read_gpu_utilization() -> (u32, u32, u32) {
+    // Dynamically find AGX accelerator by trying class name patterns G13..G19
+    for gen in (13..=19).rev() {
+        for suffix in &["X\0", "G\0", "P\0"] {
+            let name = format!("AGXAcceleratorG{}{}", gen, suffix);
+            let result = unsafe { try_gpu_util_class(name.as_bytes()) };
+            // Check if the class actually exists
+            let matched = unsafe {
+                let m = IOServiceMatching(name.as_ptr() as *const i8);
+                if m.is_null() { false } else {
+                    let s = IOServiceGetMatchingService(0, m);
+                    if s != 0 { IOObjectRelease(s); true } else { false }
+                }
+            };
+            if matched { return result; }
+        }
+    }
+    (0, 0, 0)
+}
+
+unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
+    let matching = IOServiceMatching(class_name.as_ptr() as *const i8);
+    if matching.is_null() { return (0, 0, 0); }
+    let service = IOServiceGetMatchingService(0, matching);
+    if service == 0 { return (0, 0, 0); }
+    let mut props = std::ptr::null_mut();
+    let result = if IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0) == 0
+        && !props.is_null()
+    {
+        let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
+        let stats = cf_utils::cfdict_get(dict, "PerformanceStatistics");
+        if !stats.is_null() {
+            let sd = stats as core_foundation_sys::dictionary::CFDictionaryRef;
+            let dev = cf_utils::cfdict_get_i64(sd, "Device Utilization %").unwrap_or(0) as u32;
+            let ren = cf_utils::cfdict_get_i64(sd, "Renderer Utilization %").unwrap_or(0) as u32;
+            let til = cf_utils::cfdict_get_i64(sd, "Tiler Utilization %").unwrap_or(0) as u32;
+            (dev, ren, til)
+        } else { (0, 0, 0) }
+    } else { (0, 0, 0) };
+    if !props.is_null() { cf_utils::cf_release(props as _); }
+    IOObjectRelease(service);
+    result
+}
+
+// ── Per-CPU utilization via Mach host_processor_info ─────────────────────────
+
+extern "C" {
+    fn host_processor_info(
+        host: u32,
+        flavor: i32,
+        out_cpu_count: *mut u32,
+        out_info: *mut *mut i32,
+        out_count: *mut u32,
+    ) -> i32;
+    fn mach_host_self() -> u32;
+    fn vm_deallocate(target: u32, address: usize, size: usize) -> i32;
+}
+
+const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+const CPU_STATE_USER: usize = 0;
+const CPU_STATE_SYSTEM: usize = 1;
+const CPU_STATE_IDLE: usize = 2;
+// const CPU_STATE_NICE: usize = 3;
+const CPU_LOAD_FIELDS: usize = 4;
+
+fn read_cpu_ticks() -> Vec<(u64, u64)> {
+    unsafe {
+        let mut ncpu: u32 = 0;
+        let mut info: *mut i32 = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        if host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &mut ncpu, &mut info, &mut count) != 0 {
+            return Vec::new();
+        }
+        let result: Vec<(u64, u64)> = (0..ncpu as usize).map(|i| {
+            let base = i * CPU_LOAD_FIELDS;
+            let user = *info.add(base + CPU_STATE_USER) as u64;
+            let sys = *info.add(base + CPU_STATE_SYSTEM) as u64;
+            let idle = *info.add(base + CPU_STATE_IDLE) as u64;
+            let nice = *info.add(base + 3) as u64;
+            let total = user + sys + idle + nice;
+            let used = user + sys;
+            (used, total)
+        }).collect();
+        vm_deallocate(crate::iokit_ffi::mach_task_self(), info as usize, count as usize * 4);
+        result
+    }
+}
+
+fn compute_cpu_usage(prev: &[(u64, u64)], cur: &[(u64, u64)]) -> Vec<f32> {
+    cur.iter().zip(prev.iter()).map(|((cu, ct), (pu, pt))| {
+        let dt = ct.saturating_sub(*pt);
+        let du = cu.saturating_sub(*pu);
+        if dt > 0 { (du as f32 / dt as f32 * 100.0).clamp(0.0, 100.0) } else { 0.0 }
+    }).collect()
+}
+
 use std::sync::{Arc, Mutex};
 
 pub struct Sampler {
     shared: Arc<Mutex<Metrics>>,
     gpu_cores: u32,
     dram_gb: u32,
+    ssd_model: String,
     _handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -402,6 +561,7 @@ impl Sampler {
     pub fn new(interval_ms: u64) -> Self {
         let gpu_cores = read_gpu_core_count();
         let dram_gb = read_dram_gb();
+        let ssd_model = read_ssd_model();
         let max_nits = read_display_max_nits();
 
         let shared = Arc::new(Mutex::new(Metrics {
@@ -445,10 +605,14 @@ impl Sampler {
                 };
                 let handle = smc.start_temp_discovery();
                 smc.finish_temp_discovery(handle);
+                let mut prev_ticks = read_cpu_ticks();
                 loop {
                     let temps = smc.read_temperatures();
                     let fans = smc.read_fans();
                     let sys_power = smc.read_system_power();
+                    let cur_ticks = read_cpu_ticks();
+                    let cpu_usage = compute_cpu_usage(&prev_ticks, &cur_ticks);
+                    prev_ticks = cur_ticks;
                     if let Ok(mut mg) = m.lock() {
                         mg.temperatures = temps;
                         mg.fans = fans;
@@ -457,6 +621,11 @@ impl Sampler {
                         } else {
                             mg.soc.total_w
                         };
+                        mg.mem_used_gb = read_mem_used_gb();
+                        mg.cpu_usage_pct = cpu_usage;
+                        let (_, gr, gt) = read_gpu_utilization();
+                        mg.soc.gpu_util_renderer = gr;
+                        mg.soc.gpu_util_tiler = gt;
                     }
                     std::thread::sleep(dt);
                 }
@@ -578,7 +747,7 @@ impl Sampler {
                     mg.bluetooth_devices = devs;
                     mg.bluetooth_power_w = pw;
                 }
-                std::thread::sleep(dt);
+                std::thread::sleep(Duration::from_secs(30));
             }));
         }
 
@@ -594,21 +763,28 @@ impl Sampler {
             }));
         }
 
-        // ── Disk I/O → SSD power estimation ─────────────────────────────
+        // ── Disk I/O → SSD power estimation (IORegistry counters, no subprocess)
         {
             let m = shared.clone();
             handles.push(std::thread::spawn(move || {
+                let mut prev = powermetrics::read_disk_counters();
+                let mut prev_time = Instant::now();
                 loop {
-                    let disk = powermetrics::read_disk_rates();
+                    std::thread::sleep(dt);
+                    let cur = powermetrics::read_disk_counters();
+                    let now = Instant::now();
+                    let dt_s = now.duration_since(prev_time).as_secs_f64();
+                    let disk = powermetrics::compute_disk_rates(&prev, &cur, dt_s);
                     let total_bps = disk.read_bytes_per_sec + disk.write_bytes_per_sec;
-                    let max_bps = 3_000.0 * 1024.0 * 1024.0; // ~3 GB/s for Apple NVMe
+                    let max_bps = 3_000.0 * 1024.0 * 1024.0;
                     let utilization = (total_bps / max_bps).clamp(0.0, 1.0) as f32;
                     let power = SSD_IDLE_W + utilization * (SSD_MAX_ACTIVE_W - SSD_IDLE_W);
                     if let Ok(mut mg) = m.lock() {
                         mg.disk = disk;
                         mg.ssd_power_w = power;
                     }
-                    std::thread::sleep(dt);
+                    prev = cur;
+                    prev_time = now;
                 }
             }));
         }
@@ -685,6 +861,7 @@ impl Sampler {
             shared,
             gpu_cores,
             dram_gb,
+            ssd_model,
             _handles: handles,
         }
     }
@@ -698,6 +875,7 @@ impl Sampler {
             .clone();
         m.gpu_cores = self.gpu_cores;
         m.dram_gb = self.dram_gb;
+        m.ssd_model = self.ssd_model.clone();
         m
     }
 }

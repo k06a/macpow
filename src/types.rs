@@ -36,6 +36,9 @@ pub struct Metrics {
     pub sys_power_w: f32,
     pub gpu_cores: u32,
     pub dram_gb: u32,
+    pub mem_used_gb: f32,
+    pub cpu_usage_pct: Vec<f32>,
+    pub ssd_model: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -57,7 +60,11 @@ pub struct SocPower {
     pub ecpu_clusters: Vec<CpuCluster>,
     pub pcpu_cluster: CpuCluster,
     pub gpu_w: f32,
+    pub gpu_util_device: u32,
+    pub gpu_util_renderer: u32,
+    pub gpu_util_tiler: u32,
     pub ane_w: f32,
+    pub ane_parts: Vec<(String, f32)>,
     pub dram_w: f32,
     pub gpu_sram_w: f32,
     pub total_w: f32,
@@ -134,6 +141,9 @@ pub struct UsbDevice {
     pub vendor_id: u32,
     pub product_id: u32,
     pub power_ma: Option<u32>,
+    pub speed: u32,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

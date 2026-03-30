@@ -215,35 +215,34 @@ fn read_dvfs_freq_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         .map(|(k, v)| (k.clone(), to_mhz(v)))
         .collect();
 
-    // Find P-CPU: highest max freq among sram tables (typically 4000-5000 MHz)
+    // Find P-CPU: highest max freq among sram tables (typically 3000-6000+ MHz)
     if let Some((_, freqs)) = sram_tables
         .iter()
-        .filter(|(_, v)| v.last().copied().unwrap_or(0) > 3000)
+        .filter(|(_, v)| v.last().copied().unwrap_or(0) > 2000)
         .max_by_key(|(_, v)| v.last().copied().unwrap_or(0))
     {
         pcpu = freqs.clone();
     }
 
-    // Find E-CPU: second highest max freq among sram tables (typically 2000-3500 MHz),
-    // with max freq less than P-CPU's max
+    // Find E-CPU: sram table with max freq less than P-CPU's max, at least 500 MHz
     let pcpu_max = pcpu.last().copied().unwrap_or(u32::MAX);
     if let Some((_, freqs)) = sram_tables
         .iter()
         .filter(|(_, v)| {
             let max = v.last().copied().unwrap_or(0);
-            max > 1000 && max < pcpu_max && v.len() > 3
+            max > 500 && max < pcpu_max && v.len() > 2
         })
         .max_by_key(|(_, v)| v.last().copied().unwrap_or(0))
     {
         ecpu = freqs.clone();
     }
 
-    // Find GPU: non-sram table with max freq in 1000-2500 MHz range
+    // Find GPU: non-sram table with max freq in 300-5000 MHz range
     if let Some((_, freqs)) = non_sram_tables
         .iter()
         .filter(|(_, v)| {
             let max = v.last().copied().unwrap_or(0);
-            max >= 800 && max <= 2500 && v.len() >= 5
+            max >= 300 && max <= 5000 && v.len() >= 3
         })
         .max_by_key(|(_, v)| v.len())
     {
@@ -255,7 +254,7 @@ fn read_dvfs_freq_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
             .iter()
             .filter(|(_, v)| {
                 let max = v.last().copied().unwrap_or(0);
-                max >= 800 && max <= 2500 && v.len() >= 5
+                max >= 300 && max <= 5000 && v.len() >= 3
             })
             .max_by_key(|(_, v)| v.len())
         {
@@ -375,6 +374,9 @@ impl IOReportSampler {
             let mut ecpu_freq_residency: Vec<(usize, i64)> = Vec::new();
             let mut pcpu_freq_residency: Vec<(usize, i64)> = Vec::new();
             let mut gpu_freq_residency: Vec<(usize, i64)> = Vec::new();
+            // Idle+active residency for utilization calculation
+            let mut gpu_idle_res: i64 = 0;
+            let mut gpu_active_res: i64 = 0;
 
             let n = cf_utils::cfarray_len(channels_arr);
 
@@ -402,11 +404,20 @@ impl IOReportSampler {
                         })
                         .unwrap_or(2) as i32;
 
+                    // Collect idle residency (states before offset)
+                    if is_gpu {
+                        for s in 0..offset {
+                            let r = IOReportStateGetResidency(ch, s);
+                            if r > 0 { gpu_idle_res += r; }
+                        }
+                    }
+
                     for s in offset..state_count {
                         let residency = IOReportStateGetResidency(ch, s);
                         if residency <= 0 {
                             continue;
                         }
+                        if is_gpu { gpu_active_res += residency; }
                         let idx = (s - offset) as usize;
                         let target = if is_gpu {
                             &mut gpu_freq_residency
@@ -468,6 +479,7 @@ impl IOReportSampler {
                     }
                     n if n.starts_with("ANE") => {
                         soc.ane_w += watts;
+                        soc.ane_parts.push((n.to_string(), watts));
                     }
                     n if n.starts_with("DRAM") => {
                         soc.dram_w += watts;
@@ -532,6 +544,12 @@ impl IOReportSampler {
             soc.ecpu_freq_mhz = calc_freq(&ecpu_freq_residency, &self.ecpu_freqs);
             soc.pcpu_freq_mhz = calc_freq(&pcpu_freq_residency, &self.pcpu_freqs);
             soc.gpu_freq_mhz = calc_freq(&gpu_freq_residency, &self.gpu_freqs);
+
+            // GPU active residency % from IOReport (same method as asitop/mactop)
+            let total_gpu_res = gpu_idle_res + gpu_active_res;
+            if total_gpu_res > 0 {
+                soc.gpu_util_device = (gpu_active_res as f64 / total_gpu_res as f64 * 100.0).round() as u32;
+            }
 
             cf_utils::cf_release(delta as _);
             soc.compute_total();

@@ -298,6 +298,7 @@ impl SmcConnection {
             ("Tm", "Memory"),
             ("TB", "Battery"),
             ("Tw", "Wireless"),
+            ("Ta", "ANE"),
         ];
 
         let count = self.key_count();

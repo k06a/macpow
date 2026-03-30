@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::DarkGray);
+const DATA_STYLE: Style = Style::new().fg(Color::Rgb(80, 140, 255));
 const PENDING: Style = Style::new().fg(Color::Magenta);
 const CURSOR_BG: Style = Style::new().bg(Color::Rgb(40, 40, 50));
 const TREE_STYLE: Style = Style::new().fg(Color::White);
@@ -30,10 +31,10 @@ const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇',
 
 fn power_color(w: f32) -> Color {
     match w {
-        w if w < 1.0 => Color::Green,
-        w if w < 5.0 => Color::Yellow,
-        w if w < 10.0 => Color::Rgb(255, 165, 0), // orange
-        _ => Color::Rgb(255, 50, 50),              // bright red
+        w if w < 1.0 => Color::Rgb(46, 139, 87),
+        w if w < 5.0 => Color::Rgb(255, 255, 50),   // lemon yellow
+        w if w < 10.0 => Color::Rgb(255, 140, 0),    // carrot orange
+        _ => Color::Rgb(255, 50, 50),                 // bright red
     }
 }
 
@@ -248,6 +249,8 @@ struct Wh {
     battery: f64,
     net_down_bytes: f64,
     net_up_bytes: f64,
+    disk_read_bytes: f64,
+    disk_write_bytes: f64,
 }
 
 // ── SMA bank ─────────────────────────────────────────────────────────────────
@@ -305,6 +308,7 @@ pub struct App {
     wh: Wh,
     sma: MetricsSma,
     pub sma_window: u32,
+    pub latency_ms: u64,
     temp_min: BTreeMap<String, f32>,
     temp_max: BTreeMap<String, f32>,
     temp_sum: BTreeMap<String, f64>,
@@ -320,6 +324,9 @@ pub struct App {
     proc_baseline: std::collections::HashMap<i32, f64>,
     proc_keys: std::collections::HashMap<i32, &'static str>,
     fan_wh: Vec<f64>,
+    usb_wh: Vec<f64>,
+    usb_prev_bytes: Vec<(u64, u64)>,
+    usb_rates: Vec<(f64, f64)>,
     machine_name: String,
     tree_data_y: u16,
     tree_scroll: usize,
@@ -337,13 +344,17 @@ impl App {
             wh: Wh::default(),
             sma: MetricsSma::new(0.0),
             sma_window: 0,
+            latency_ms: 500,
             temp_min: BTreeMap::new(),
             temp_max: BTreeMap::new(),
             temp_sum: BTreeMap::new(),
             temp_count: BTreeMap::new(),
             history: BTreeMap::new(),
             pinned: Vec::new(),
-            collapsed: std::collections::HashSet::new(),
+            collapsed: [
+                "wifi", "ssd", "ecpu", "pcpu", "gpu", "ane",
+                "usb0", "usb1", "usb2", "usb3", "usb4", "usb5", "usb6", "usb7",
+            ].into_iter().collect(),
             total_rows: 0,
             row_keys_cache: Vec::new(),
             row_parents_cache: Vec::new(),
@@ -352,6 +363,9 @@ impl App {
             proc_baseline: std::collections::HashMap::new(),
             proc_keys: std::collections::HashMap::new(),
             fan_wh: Vec::new(),
+            usb_wh: Vec::new(),
+            usb_prev_bytes: Vec::new(),
+            usb_rates: Vec::new(),
             machine_name,
             tree_data_y: 0,
             tree_scroll: 0,
@@ -399,19 +413,45 @@ impl App {
             for (i, fan) in m.fans.iter().enumerate() {
                 self.fan_wh[i] += fan.estimated_power_w as f64 * dt_h;
             }
+            // Per-USB device Wh + data rates
+            self.usb_wh.resize(m.usb_devices.len(), 0.0);
+            self.usb_rates.resize(m.usb_devices.len(), (0.0, 0.0));
+            self.usb_prev_bytes.resize(m.usb_devices.len(), (0, 0));
+            for (i, d) in m.usb_devices.iter().enumerate() {
+                let watts = d.power_ma.unwrap_or(0) as f64 * 5.0 / 1000.0;
+                self.usb_wh[i] += watts * dt_h;
+                let (prev_r, prev_w) = self.usb_prev_bytes[i];
+                if prev_r > 0 || prev_w > 0 {
+                    self.usb_rates[i] = (
+                        d.bytes_read.saturating_sub(prev_r) as f64 / dt_s,
+                        d.bytes_written.saturating_sub(prev_w) as f64 / dt_s,
+                    );
+                }
+                self.usb_prev_bytes[i] = (d.bytes_read, d.bytes_written);
+            }
             self.wh.wifi += m.wifi.estimated_power_w as f64 * dt_h;
             self.wh.bluetooth += m.bluetooth_power_w as f64 * dt_h;
             self.wh.sys += m.sys_power_w as f64 * dt_h;
             self.wh.battery += m.battery.drain_w * dt_h;
             self.wh.net_down_bytes += m.network.bytes_in_per_sec * dt_s;
             self.wh.net_up_bytes += m.network.bytes_out_per_sec * dt_s;
+            self.wh.disk_read_bytes += m.disk.read_bytes_per_sec * dt_s;
+            self.wh.disk_write_bytes += m.disk.write_bytes_per_sec * dt_s;
         }
         self.last_tick = Some(Instant::now());
 
         self.push_history("soc", m.soc.total_w as f64);
         self.push_history("cpu", m.soc.cpu_w as f64);
         self.push_history("ecpu", m.soc.ecpu_total_w() as f64);
+        for (ci, core) in m.soc.ecpu_clusters.iter().flat_map(|cl| cl.cores.iter()).enumerate() {
+            let key = proc_key(&mut self.proc_keys, -(ci as i32 + 1000));
+            self.push_history(key, core.watts as f64);
+        }
         self.push_history("pcpu", m.soc.pcpu_total_w() as f64);
+        for (ci, core) in m.soc.pcpu_cluster.cores.iter().enumerate() {
+            let key = proc_key(&mut self.proc_keys, -(ci as i32 + 2000));
+            self.push_history(key, core.watts as f64);
+        }
         self.push_history("gpu", m.soc.gpu_w as f64);
         self.push_history("ane", m.soc.ane_w as f64);
         self.push_history("dram", m.soc.dram_w as f64);
@@ -427,8 +467,15 @@ impl App {
         for (i, fan) in m.fans.iter().enumerate() {
             self.push_history(fan_key(i), fan.estimated_power_w as f64);
         }
+        for (i, d) in m.usb_devices.iter().enumerate() {
+            self.push_history(usb_key(i), d.power_ma.unwrap_or(0) as f64 * 5.0 / 1000.0);
+        }
         self.push_history("wifi", m.wifi.estimated_power_w as f64);
         self.push_history("bluetooth", m.bluetooth_power_w as f64);
+        self.push_history("net_down", m.network.bytes_in_per_sec);
+        self.push_history("net_up", m.network.bytes_out_per_sec);
+        self.push_history("disk_read", m.disk.read_bytes_per_sec);
+        self.push_history("disk_write", m.disk.write_bytes_per_sec);
         self.push_history(
             "peripherals",
             (m.wifi.estimated_power_w + m.bluetooth_power_w) as f64,
@@ -488,7 +535,7 @@ impl App {
                 self.collapse_or_parent();
             }
             if hotkey == Hotkey::new(Key::L) {
-                self.expand_or_child();
+                self.cycle_latency();
             }
         }
 
@@ -506,8 +553,8 @@ impl App {
             KeyCode::Char('j') | KeyCode::Char('о') => self.move_cursor(1),
             KeyCode::Char('r') | KeyCode::Char('к') => self.reset(),
             KeyCode::Char('a') | KeyCode::Char('ф') => self.cycle_sma(),
+            KeyCode::Char('l') | KeyCode::Char('д') => self.cycle_latency(),
             KeyCode::Char('h') | KeyCode::Char('р') => self.collapse_or_parent(),
-            KeyCode::Char('l') | KeyCode::Char('д') => self.expand_or_child(),
             KeyCode::Esc => return true,
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
@@ -517,6 +564,8 @@ impl App {
             KeyCode::PageUp => self.move_cursor(-10),
             KeyCode::PageDown => self.move_cursor(10),
             KeyCode::Char(' ') => self.toggle_pin(),
+            KeyCode::Char('-') => self.collapse_all(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.expand_all(),
             _ => {}
         }
         false
@@ -598,6 +647,20 @@ impl App {
         }
     }
 
+    fn collapse_all(&mut self) {
+        for key in &self.row_keys_cache {
+            if let Some(k) = key {
+                if self.row_parents_cache.iter().any(|p| *p == Some(*k)) {
+                    self.collapsed.insert(*k);
+                }
+            }
+        }
+    }
+
+    fn expand_all(&mut self) {
+        self.collapsed.clear();
+    }
+
     fn reset(&mut self) {
         self.wh = Wh::default();
         self.sma.clear_all();
@@ -607,6 +670,7 @@ impl App {
         self.temp_count.clear();
         self.history.clear();
         self.fan_wh.iter_mut().for_each(|v| *v = 0.0);
+        self.usb_wh.iter_mut().for_each(|v| *v = 0.0);
         self.proc_baseline = self
             .metrics
             .top_processes
@@ -622,6 +686,18 @@ impl App {
             _ => 0,
         };
         self.sma.set_all_windows(self.sma_window as f64);
+    }
+
+    fn cycle_latency(&mut self) {
+        self.latency_ms = match self.latency_ms {
+            500 => 2000,
+            2000 => 5000,
+            _ => 500,
+        };
+    }
+
+    pub fn poll_interval_ms(&self) -> u64 {
+        self.latency_ms
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
@@ -650,13 +726,16 @@ impl App {
             }
         }
 
-        let cursor_key = self.row_keys_cache.get(self.cursor).copied().flatten();
+        let cursor_key = self.row_keys_cache.get(self.cursor).copied().flatten()
+            .or_else(|| {
+                // Fall back to parent's key for rows without their own key
+                self.row_parents_cache.get(self.cursor).copied().flatten()
+            });
         let chart_keys = self.chart_keys(cursor_key);
-        let chart_h = if chart_keys.is_empty() {
-            0
-        } else {
-            chart_keys.len() as u16 * CHART_HEIGHT
-        };
+        // Always reserve chart space to prevent tree jumping
+        let min_charts = if self.pinned.is_empty() { 1 } else { self.pinned.len() };
+        let chart_count = chart_keys.len().max(min_charts);
+        let chart_h = chart_count as u16 * CHART_HEIGHT;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -725,9 +804,9 @@ impl App {
                 .get(cat)
                 .map(|v| {
                     let avg = v.iter().sum::<f32>() / v.len() as f32;
-                    let hmin = self.temp_min.get(cat).copied().unwrap_or(avg);
-                    let hmax = self.temp_max.get(cat).copied().unwrap_or(avg);
-                    format!("{:.0}°C ({:.0}–{:.0})", avg, hmin, hmax)
+                    let cur_min = v.iter().copied().fold(f32::INFINITY, f32::min);
+                    let cur_max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    format!("{:.0}°C ({:.0}–{:.0})", avg, cur_min, cur_max)
                 })
                 .unwrap_or_else(|| {
                     if temps_pending {
@@ -740,7 +819,7 @@ impl App {
 
         let mut rows: Vec<TreeRow> = Vec::new();
 
-        let inline_cats_list = ["CPU", "GPU", "Memory", "SSD", "Battery"];
+        let inline_cats_list = ["CPU", "GPU", "Memory", "SSD", "Battery", "ANE"];
         let has_remaining_temps = temp_groups
             .keys()
             .any(|k| !inline_cats_list.contains(&k.as_str()));
@@ -782,7 +861,7 @@ impl App {
             };
             let batt_label = format!("Battery {:.0}% ({})", m.battery.percent, charge_status);
             let batt_style = if m.battery.charging {
-                Style::default().fg(Color::Green)
+                Style::default().fg(Color::Rgb(46, 139, 87))
             } else {
                 Style::default().fg(power_color(batt_w.abs()))
             };
@@ -855,11 +934,21 @@ impl App {
                 BOLD,
                 pin("soc"),
             ));
+            // Per-CPU usage from Mach API (first e_count are E-cores, next p_count are P-cores)
+            // Mach API returns P-cores first (perflevel0), then E-cores (perflevel1)
+            let cpu_usage = &m.cpu_usage_pct;
+            let p_usage: Vec<f32> = cpu_usage.iter().take(p_count).copied().collect();
+            let e_usage: Vec<f32> = cpu_usage.iter().skip(p_count).take(e_count).copied().collect();
+            let e_avg_usage = if e_usage.is_empty() { 0.0 } else { e_usage.iter().sum::<f32>() / e_usage.len() as f32 };
+            let p_avg_usage = if p_usage.is_empty() { 0.0 } else { p_usage.iter().sum::<f32>() / p_usage.len() as f32 };
+            let cpu_avg_usage = if cpu_usage.is_empty() { 0.0 }
+                else { cpu_usage.iter().take(e_count + p_count).sum::<f32>() / (e_count + p_count) as f32 };
+
             rows.push(TreeRow::pw_full(
                 "cpu",
                 Some("soc"),
                 &format!("{}├─ ", cp),
-                &format!("CPU ({} cores)", e_count + p_count),
+                &format!("CPU ({} cores, {:.0}%)", e_count + p_count, cpu_avg_usage),
                 s.cpu.get(),
                 w.cpu,
                 "",
@@ -867,34 +956,96 @@ impl App {
                 Style::default(),
                 pin("cpu"),
             ));
+            // Assign CPU temp sensors to cores (sorted Tp0* keys map to cores in order)
+            let mut cpu_temps: Vec<f32> = m.temperatures.iter()
+                .filter(|t| t.category == "CPU" && t.key.starts_with("Tp0"))
+                .map(|t| t.value_celsius)
+                .collect();
+            let e_temps: Vec<f32> = cpu_temps.drain(..e_count.min(cpu_temps.len())).collect();
+            let p_temps: Vec<f32> = cpu_temps.drain(..p_count.min(cpu_temps.len())).collect();
+            let e_avg_temp = if e_temps.is_empty() { String::new() }
+                else {
+                    let avg = e_temps.iter().sum::<f32>() / e_temps.len() as f32;
+                    let min = e_temps.iter().copied().fold(f32::INFINITY, f32::min);
+                    let max = e_temps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    format!("{:.0}°C ({:.0}–{:.0})", avg, min, max)
+                };
+            let p_avg_temp = if p_temps.is_empty() { String::new() }
+                else {
+                    let avg = p_temps.iter().sum::<f32>() / p_temps.len() as f32;
+                    let min = p_temps.iter().copied().fold(f32::INFINITY, f32::min);
+                    let max = p_temps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    format!("{:.0}°C ({:.0}–{:.0})", avg, min, max)
+                };
+
             rows.push(TreeRow::pw_full(
                 "ecpu",
                 Some("cpu"),
                 &format!("{}│  ├─ ", cp),
-                &format!("E-Cores ({})", e_count),
+                &format!("E-Cores ({}, {:.0}%)", e_count, e_avg_usage),
                 s.ecpu.get(),
                 w.ecpu,
                 &fmt_freq(s.ecpu_freq.get()),
-                "",
-                DIM,
+                &e_avg_temp,
+                Style::default(),
                 pin("ecpu"),
             ));
+
+            // Per E-core rows (collapsed by default)
+            {
+                let ecpu_cont = format!("{}│  │  ", cp);
+                let all_ecores: Vec<_> = m.soc.ecpu_clusters.iter()
+                    .flat_map(|cl| cl.cores.iter())
+                    .collect();
+
+                for (ci, core) in all_ecores.iter().enumerate() {
+                    let pfx = if ci == all_ecores.len() - 1 {
+                        format!("{}└─ ", ecpu_cont)
+                    } else {
+                        format!("{}├─ ", ecpu_cont)
+                    };
+                    let key = proc_key(&mut self.proc_keys, -(ci as i32 + 1000));
+                    let temp = e_temps.get(ci).map(|t| format!("{:.0}°C", t)).unwrap_or_default();
+                    let usage = e_usage.get(ci).map(|u| format!(" ({:>3.0}%) {}", u, usage_bar(*u))).unwrap_or_default();
+                    rows.push(TreeRow::pw_full(key, Some("ecpu"), &pfx,
+                        &format!("{:<10}{}", core.name, usage),
+                        core.watts, 0.0, "", &temp, Style::default(), pin(key)));
+                }
+            }
             rows.push(TreeRow::pw_full(
                 "pcpu",
                 Some("cpu"),
                 &format!("{}│  └─ ", cp),
-                &format!("P-Cores ({})", p_count),
+                &format!("P-Cores ({}, {:.0}%)", p_count, p_avg_usage),
                 s.pcpu.get(),
                 w.pcpu,
                 &fmt_freq(s.pcpu_freq.get()),
-                "",
-                DIM,
+                &p_avg_temp,
+                Style::default(),
                 pin("pcpu"),
             ));
+            // Per P-core rows (collapsed by default)
+            {
+                let pcpu_cont = format!("{}│     ", cp);
+                for (ci, core) in m.soc.pcpu_cluster.cores.iter().enumerate() {
+                    let pfx = if ci == m.soc.pcpu_cluster.cores.len() - 1 {
+                        format!("{}└─ ", pcpu_cont)
+                    } else {
+                        format!("{}├─ ", pcpu_cont)
+                    };
+                    let key = proc_key(&mut self.proc_keys, -(ci as i32 + 2000));
+                    let temp = p_temps.get(ci).map(|t| format!("{:.0}°C", t)).unwrap_or_default();
+                    let usage = p_usage.get(ci).map(|u| format!(" ({:>3.0}%) {}", u, usage_bar(*u))).unwrap_or_default();
+                    rows.push(TreeRow::pw_full(key, Some("pcpu"), &pfx,
+                        &format!("{:<10}{}", core.name, usage),
+                        core.watts, 0.0, "", &temp, Style::default(), pin(key)));
+                }
+            }
+            let gpu_util = m.soc.gpu_util_device;
             let gpu_name = if m.gpu_cores > 0 {
-                format!("GPU ({} cores)", m.gpu_cores)
+                format!("GPU ({} cores, {}%)", m.gpu_cores, gpu_util)
             } else {
-                "GPU".into()
+                format!("GPU ({}%)", gpu_util)
             };
             rows.push(TreeRow::pw_full(
                 "gpu",
@@ -908,18 +1059,50 @@ impl App {
                 Style::default(),
                 pin("gpu"),
             ));
-            rows.push(TreeRow::pw(
+            // GPU utilization sub-items (collapsed by default)
+            {
+                let gpu_cont = format!("{}│  ", cp);
+                rows.push(TreeRow::info(
+                    Some("gpu"), &format!("{}├─ ", gpu_cont),
+                    &format!("Renderer ({:>3}%) {}", m.soc.gpu_util_renderer, usage_bar(m.soc.gpu_util_renderer as f32)),
+                    "", "", Style::default(),
+                ));
+                rows.push(TreeRow::info(
+                    Some("gpu"), &format!("{}└─ ", gpu_cont),
+                    &format!("Tiler    ({:>3}%) {}", m.soc.gpu_util_tiler, usage_bar(m.soc.gpu_util_tiler as f32)),
+                    "", "", Style::default(),
+                ));
+            }
+            rows.push(TreeRow::pw_full(
                 "ane",
                 Some("soc"),
                 &format!("{}├─ ", cp),
                 "ANE",
                 s.ane.get(),
                 w.ane,
+                "",
+                &temp_info("ANE"),
                 Style::default(),
                 pin("ane"),
             ));
+            // ANE sub-engines (collapsed by default)
+            if m.soc.ane_parts.len() > 1 {
+                let ane_cont = format!("{}│  ", cp);
+                for (ai, (name, watts)) in m.soc.ane_parts.iter().enumerate() {
+                    let pfx = if ai == m.soc.ane_parts.len() - 1 {
+                        format!("{}└─ ", ane_cont)
+                    } else {
+                        format!("{}├─ ", ane_cont)
+                    };
+                    rows.push(TreeRow::pw(
+                        proc_key(&mut self.proc_keys, -(ai as i32 + 3000)),
+                        Some("ane"), &pfx, name, *watts, 0.0,
+                        Style::default(), false,
+                    ));
+                }
+            }
             let dram_name = if m.dram_gb > 0 {
-                format!("DRAM ({} GB)", m.dram_gb)
+                format!("DRAM ({:.1}/{} GB)", m.mem_used_gb, m.dram_gb)
             } else {
                 "DRAM".into()
             };
@@ -952,7 +1135,7 @@ impl App {
             "ssd",
             Some("system"),
             &t("ssd"),
-            "SSD (NVMe)",
+            &if m.ssd_model.is_empty() { "SSD".into() } else { format!("SSD ({})", m.ssd_model) },
             s.ssd.get(),
             w.ssd,
             "",
@@ -960,6 +1143,24 @@ impl App {
             BOLD,
             pin("ssd"),
         ));
+        // SSD Read/Write counters (collapsed by default)
+        {
+            let ssd_cont = c("ssd");
+            let mut r = TreeRow::info(
+                Some("ssd"), &format!("{}├─ ", ssd_cont), "Read",
+                &human_rate(m.disk.read_bytes_per_sec),
+                &human_bytes(self.wh.disk_read_bytes), DATA_STYLE,
+            );
+            r.key = Some("disk_read");
+            rows.push(r);
+            let mut r = TreeRow::info(
+                Some("ssd"), &format!("{}└─ ", ssd_cont), "Write",
+                &human_rate(m.disk.write_bytes_per_sec),
+                &human_bytes(self.wh.disk_write_bytes), DATA_STYLE,
+            );
+            r.key = Some("disk_write");
+            rows.push(r);
+        }
 
         // ── Display
         if m.display.brightness_pct > 0.0 {
@@ -994,36 +1195,23 @@ impl App {
             ));
         }
 
-        // ── Keyboard
-        if m.keyboard.brightness_pct > 0.0 || m.keyboard.estimated_power_w > 0.0 {
-            rows.push(TreeRow::pw(
-                "keyboard",
-                Some("system"),
-                &t("keyboard"),
-                &format!("Keyboard ({:.0}% brightness)", m.keyboard.brightness_pct),
-                s.keyboard.get(),
-                w.keyboard,
-                BOLD,
-                pin("keyboard"),
-            ));
-        } else {
-            rows.push(TreeRow::pw(
-                "keyboard",
-                Some("system"),
-                &t("keyboard"),
-                "Keyboard (pending…)",
-                0.0,
-                0.0,
-                PENDING,
-                pin("keyboard"),
-            ));
-        }
+        // ── Keyboard (always show — 0% brightness is valid, not pending)
+        rows.push(TreeRow::pw(
+            "keyboard",
+            Some("system"),
+            &t("keyboard"),
+            &format!("Keyboard ({:.0}% brightness)", m.keyboard.brightness_pct),
+            s.keyboard.get(),
+            w.keyboard,
+            BOLD,
+            pin("keyboard"),
+        ));
 
         // ── Audio
         let audio_status = match (m.audio.device_active, m.audio.playing, m.audio.volume_pct) {
             (false, _, _) => "off".into(),
             (_, true, Some(v)) => format!(
-                "{:.0}%{}",
+                "{:.0}% volume{}",
                 v,
                 if m.audio.muted { " muted" } else { ", playing" }
             ),
@@ -1076,7 +1264,7 @@ impl App {
                     fan_key(i),
                     Some("fans"),
                     &pfx,
-                    &format!("{} {:.0}/{:.0} RPM", fan.name, fan.actual_rpm, fan.max_rpm),
+                    &format!("{} ({:.0}/{:.0} RPM)", fan.name, fan.actual_rpm, fan.max_rpm),
                     fan.estimated_power_w,
                     fan_wh_val,
                     Style::default(),
@@ -1087,22 +1275,26 @@ impl App {
 
         // ── Peripherals
         let pc = c("peripherals");
+        let usb_total_w: f32 = m.usb_devices.iter()
+            .map(|d| d.power_ma.unwrap_or(0) as f32 * 5.0 / 1000.0)
+            .sum();
+        let usb_total_wh: f64 = self.usb_wh.iter().sum();
         rows.push(TreeRow::pw(
             "peripherals",
             Some("system"),
             &t("peripherals"),
             "Peripherals",
-            s.wifi.get() + s.bluetooth.get(),
-            w.wifi + w.bluetooth,
+            s.wifi.get() + s.bluetooth.get() + usb_total_w,
+            w.wifi + w.bluetooth + usb_total_wh,
             BOLD,
             pin("peripherals"),
         ));
 
         let (wifi_name, wifi_style) = match (m.wifi.connected, m.wifi.phy_mode.is_empty()) {
-            (true, _) => (
-                format!("WiFi ({} dBm, {})", m.wifi.rssi_dbm, m.wifi.phy_mode),
-                Style::default(),
-            ),
+            (true, _) => {
+                let ch = if m.wifi.channel.is_empty() { String::new() } else { format!(", ch{}", m.wifi.channel) };
+                (format!("WiFi ({} dBm, {}{})", m.wifi.rssi_dbm, m.wifi.phy_mode, ch), Style::default())
+            }
             (false, true) => ("WiFi (scanning…)".into(), PENDING),
             (false, false) => ("WiFi (off)".into(), Style::default()),
         };
@@ -1120,22 +1312,26 @@ impl App {
         let has_traffic =
             s.net_down.get() > 0.0 || s.net_up.get() > 0.0 || self.wh.net_down_bytes > 0.0;
         if m.wifi.connected || has_traffic {
-            rows.push(TreeRow::info(
+            let mut r = TreeRow::info(
                 Some("wifi"),
                 &format!("{}│  ├─ ", pc),
                 "↓ Download",
                 &human_rate(s.net_down.get() as f64),
                 &human_bytes(self.wh.net_down_bytes),
-                DIM,
-            ));
-            rows.push(TreeRow::info(
+                DATA_STYLE,
+            );
+            r.key = Some("net_down");
+            rows.push(r);
+            let mut r = TreeRow::info(
                 Some("wifi"),
                 &format!("{}│  └─ ", pc),
                 "↑ Upload",
                 &human_rate(s.net_up.get() as f64),
                 &human_bytes(self.wh.net_up_bytes),
-                DIM,
-            ));
+                DATA_STYLE,
+            );
+            r.key = Some("net_up");
+            rows.push(r);
         }
 
         let bt_name = if !m.bluetooth_devices.is_empty() {
@@ -1190,34 +1386,67 @@ impl App {
                 DIM,
             ));
         } else {
-            rows.push(TreeRow::info(
+            rows.push(TreeRow::pw(
+                "usb",
                 Some("peripherals"),
                 &format!("{}└─ ", pc),
                 &format!("USB ({} devices)", m.usb_devices.len()),
-                "",
-                "",
+                usb_total_w,
+                usb_total_wh,
                 Style::default(),
+                pin("usb"),
             ));
-            rows.extend(m.usb_devices.iter().enumerate().map(|(i, d)| {
+            for (i, d) in m.usb_devices.iter().enumerate() {
                 let pfx = if i == m.usb_devices.len() - 1 {
                     format!("{}   └─ ", pc)
                 } else {
                     format!("{}   ├─ ", pc)
                 };
-                let pwr = d.power_ma.map(|p| format!("{} mA", p)).unwrap_or_default();
-                TreeRow::info(
-                    Some("peripherals"),
+                let cont = if i == m.usb_devices.len() - 1 {
+                    format!("{}      ", pc)
+                } else {
+                    format!("{}   │  ", pc)
+                };
+                let watts = d.power_ma.unwrap_or(0) as f32 * 5.0 / 1000.0;
+                let usb_wh_val = self.usb_wh.get(i).copied().unwrap_or(0.0);
+                let key = usb_key(i);
+                let speed_str = match d.speed {
+                    0 => "1.5Mbps",
+                    1 => "12Mbps",
+                    2 => "480Mbps",
+                    3 => "5Gbps",
+                    4 => "10Gbps",
+                    5 => "20Gbps",
+                    _ => "?",
+                };
+                let pwr_str = d.power_ma.map(|p| format!(", {}mA", p)).unwrap_or_default();
+                rows.push(TreeRow::pw(
+                    key,
+                    Some("usb"),
                     &pfx,
-                    &format!("{} {:04x}:{:04x}", d.name, d.vendor_id, d.product_id),
-                    &pwr,
-                    "",
-                    DIM,
-                )
-            }));
+                    &format!("{} ({}{})", d.name.trim(), speed_str, pwr_str),
+                    watts,
+                    usb_wh_val,
+                    Style::default(),
+                    pin(key),
+                ));
+                // Data counters (children of usb device, collapsed by default)
+                if d.bytes_read > 0 || d.bytes_written > 0 {
+                    let (rate_r, rate_w) = self.usb_rates.get(i).copied().unwrap_or((0.0, 0.0));
+                    rows.push(TreeRow::info(
+                        Some(key), &format!("{}├─ ", cont), "Read",
+                        &human_rate(rate_r), &human_bytes(d.bytes_read as f64), DATA_STYLE,
+                    ));
+                    rows.push(TreeRow::info(
+                        Some(key), &format!("{}└─ ", cont), "Write",
+                        &human_rate(rate_w), &human_bytes(d.bytes_written as f64), DATA_STYLE,
+                    ));
+                }
+            }
         }
 
         // ── Temperatures (part of the tree, before Software)
-        let inline_cats = ["CPU", "GPU", "Memory", "SSD", "Battery"];
+        let inline_cats = ["CPU", "GPU", "Memory", "SSD", "Battery", "ANE"];
         let remaining: Vec<_> = temp_groups
             .iter()
             .filter(|(k, _)| !inline_cats.contains(&k.as_str()))
@@ -1261,9 +1490,11 @@ impl App {
         // ── Software (standalone collapsible section after the tree)
         rows.push(TreeRow::separator());
         let all_sw_energy = (m.all_procs_energy_mj - self.proc_baseline.values().sum::<f64>()).max(0.0);
-        // Dynamic limit: fill available space, minimum 10
-        let non_sw_rows = rows.len() + 3; // separator + header + footer + borders
-        let proc_limit = ((self.term_height as usize).saturating_sub(non_sw_rows)).max(10);
+        // Dynamic limit: count only visible rows (after collapse filtering)
+        let visible_tree_rows = rows.iter().filter(|r| !self.is_hidden(r, &rows)).count();
+        let chart_slots = if self.pinned.is_empty() { 1 } else { self.pinned.len() + 1 };
+        let reserved = visible_tree_rows + 6 + chart_slots * CHART_HEIGHT as usize;
+        let proc_limit = ((self.term_height as usize).saturating_sub(reserved)).max(10);
         {
             let mut sw_row = TreeRow::pw(
                 "software", None, "",
@@ -1444,11 +1675,12 @@ impl App {
                         let skip = hist.len().saturating_sub(w);
                         let visible: Vec<f64> = hist.iter().skip(skip).copied().collect();
                         let vis_max = visible.iter().copied().fold(0.0f64, f64::max).max(0.001);
+                        let is_data_key = matches!(key, "net_down" | "net_up" | "disk_read" | "disk_write");
                         for (ci, &val) in visible.iter().enumerate() {
                             let x = spark_x + (w - visible.len() + ci) as u16;
                             let level = (val / vis_max * 7.0).round() as usize;
                             let ch = SPARK_CHARS[level.min(7)];
-                            let color = power_color(val as f32);
+                            let color = if is_data_key { Color::Rgb(80, 140, 255) } else { power_color(val as f32) };
                             buf.set_string(x, y, &ch.to_string(), Style::default().fg(color));
                         }
                     }
@@ -1540,15 +1772,19 @@ impl App {
                 vec![0]
             };
 
+            let is_data = matches!(key, "net_down" | "net_up" | "disk_read" | "disk_write");
             let scale_h = inner[0].height;
+            let fmt_axis = |v: f64| -> String {
+                if is_data { human_rate(v) } else { format!("{:>5.1}", v) }
+            };
             let scale_lines: Vec<Line> = (0..scale_h)
                 .map(|row| {
                     if row == 0 {
-                        Line::from(Span::styled(format!("{:>5.1}", scale_max), DIM))
+                        Line::from(Span::styled(fmt_axis(scale_max), DIM))
                     } else if row == scale_h / 2 {
-                        Line::from(Span::styled(format!("{:>5.1}", scale_max / 2.0), DIM))
+                        Line::from(Span::styled(fmt_axis(scale_max / 2.0), DIM))
                     } else if row == scale_h - 1 {
-                        Line::from(Span::styled("  0.0", DIM))
+                        Line::from(Span::styled(fmt_axis(0.0), DIM))
                     } else {
                         Line::from("")
                     }
@@ -1556,6 +1792,11 @@ impl App {
                 .collect();
             f.render_widget(Paragraph::new(scale_lines), inner[0]);
 
+            let title_value = if is_data {
+                human_rate(current)
+            } else {
+                format!("{:.3} W", current)
+            };
             let spark = Sparkline::default()
                 .block(
                     Block::default()
@@ -1563,9 +1804,9 @@ impl App {
                         .border_style(DIM)
                         .title(Span::styled(
                             format!(
-                                " {} — {:.3} W{} ",
+                                " {} — {}{}",
                                 self.labels.get(key).map(|s| s.as_str()).unwrap_or(key),
-                                current,
+                                title_value,
                                 pin_icon
                             ),
                             title_style,
@@ -1573,7 +1814,13 @@ impl App {
                 )
                 .data(&vals)
                 .max(1000)
-                .style(Style::default().fg(power_color(current as f32)));
+                .style(Style::default().fg(
+                    if matches!(key, "net_down" | "net_up" | "disk_read" | "disk_write") {
+                        Color::Rgb(80, 140, 255)
+                    } else {
+                        power_color(current as f32)
+                    }
+                ));
             f.render_widget(spark, inner[1]);
         }
     }
@@ -1586,17 +1833,21 @@ impl App {
             Span::raw(" reset  "),
             Span::styled("a", Style::default().fg(Color::Yellow)),
             Span::raw(format!(" avg:{}s  ", self.sma_window)),
+            Span::styled("l", Style::default().fg(Color::Yellow)),
+            Span::raw(format!(" {}ms  ", self.latency_ms)),
             Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
             Span::raw(" select  "),
             Span::styled("←/→", Style::default().fg(Color::Yellow)),
             Span::raw(" fold  "),
+            Span::styled("+/-", Style::default().fg(Color::Yellow)),
+            Span::raw(" all  "),
             Span::styled("space", Style::default().fg(Color::Yellow)),
             Span::raw(" pin    "),
-            Span::styled("■", Style::default().fg(Color::Green)),
+            Span::styled("■", Style::default().fg(Color::Rgb(46, 139, 87))),
             Span::raw("<1W "),
-            Span::styled("■", Style::default().fg(Color::Yellow)),
+            Span::styled("■", Style::default().fg(Color::Rgb(255, 255, 50))),
             Span::raw("<5W "),
-            Span::styled("■", Style::default().fg(Color::Rgb(255, 165, 0))),
+            Span::styled("■", Style::default().fg(Color::Rgb(255, 140, 0))),
             Span::raw("<10W "),
             Span::styled("■", Style::default().fg(Color::Rgb(255, 50, 50))),
             Span::raw("≥10W "),
@@ -1665,9 +1916,24 @@ fn nice_scale(max_val: f64) -> f64 {
         .unwrap_or(max_val.ceil().max(1.0))
 }
 
+fn usage_bar(pct: f32) -> String {
+    let width = 10;
+    let filled = ((pct / 100.0) * width as f32).round() as usize;
+    let empty = width - filled.min(width);
+    format!("{}{}", "▓".repeat(filled), "░".repeat(empty))
+}
+
 fn fan_key(index: usize) -> &'static str {
     const KEYS: [&str; 8] = ["fan0", "fan1", "fan2", "fan3", "fan4", "fan5", "fan6", "fan7"];
     KEYS.get(index).copied().unwrap_or("fan0")
+}
+
+fn usb_key(index: usize) -> &'static str {
+    const KEYS: [&str; 16] = [
+        "usb0", "usb1", "usb2", "usb3", "usb4", "usb5", "usb6", "usb7",
+        "usb8", "usb9", "usb10", "usb11", "usb12", "usb13", "usb14", "usb15",
+    ];
+    KEYS.get(index).copied().unwrap_or("usb0")
 }
 
 fn proc_key(cache: &mut std::collections::HashMap<i32, &'static str>, pid: i32) -> &'static str {

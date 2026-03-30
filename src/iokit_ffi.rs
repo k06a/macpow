@@ -30,6 +30,12 @@ extern "C" {
         output_size: *mut usize,
     ) -> i32;
     pub fn IOObjectRelease(obj: u32) -> u32;
+    pub fn IORegistryEntryCreateIterator(
+        entry: u32,
+        plane: *const i8,
+        options: u32,
+        iterator: *mut u32,
+    ) -> i32;
     pub fn IOPMCopyAssertionsByProcess(
         assertions_by_pid: *mut core_foundation_sys::dictionary::CFDictionaryRef,
     ) -> i32;
