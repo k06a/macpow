@@ -343,6 +343,37 @@ impl IOReportSampler {
         }
     }
 
+    /// Dump all subscribed channel names for diagnostics.
+    pub fn dump_channels(&self) {
+        if let Ok(sample) = self.sample() {
+            unsafe {
+                let channels_arr =
+                    cf_utils::cfdict_get(sample.inner, "IOReportChannels") as CFArrayRef;
+                if channels_arr.is_null() {
+                    eprintln!("No IOReportChannels in sample");
+                    return;
+                }
+                let n = cf_utils::cfarray_len(channels_arr);
+                for i in 0..n {
+                    let ch = cf_utils::cfarray_get(channels_arr, i) as CFDictionaryRef;
+                    let group = cf_utils::cfstring_to_string(IOReportChannelGetGroup(ch))
+                        .unwrap_or_default();
+                    let subgroup = cf_utils::cfstring_to_string(IOReportChannelGetSubGroup(ch))
+                        .unwrap_or_default();
+                    let name = cf_utils::cfstring_to_string(IOReportChannelGetChannelName(ch))
+                        .unwrap_or_default();
+                    let unit = cf_utils::cfstring_to_string(IOReportChannelGetUnitLabel(ch))
+                        .unwrap_or_default();
+                    println!("{:<20} {:<40} {:<30} {}", group, subgroup, name, unit);
+                }
+                println!("\n--- DVFS frequency tables ---");
+                println!("E-CPU freqs (MHz): {:?}", self.ecpu_freqs);
+                println!("P-CPU freqs (MHz): {:?}", self.pcpu_freqs);
+                println!("GPU freqs (MHz):   {:?}", self.gpu_freqs);
+            }
+        }
+    }
+
     /// Compute the delta between two samples and parse energy metrics.
     pub fn parse_power(&self, prev: &Sample, cur: &Sample) -> Result<SocPower> {
         let dt_ms = cur.ts.duration_since(prev.ts).as_millis() as u64;
@@ -446,15 +477,14 @@ impl IOReportSampler {
                     n if n.ends_with("CPU Energy") => {
                         soc.cpu_w += watts;
                     }
-                    // E-core per-core: MCPU0_0, MCPU0_1, ..., MCPU1_0, ...
-                    n if n.starts_with("MCPU")
+                    // E-core per-core: MCPU0_0 (M1-M3), ECPU0_0 (M4+)
+                    n if (n.starts_with("MCPU") || n.starts_with("ECPU"))
                         && n.contains('_')
                         && !n.contains("SRAM")
                         && !n.contains("DTL") =>
                     {
-                        // Parse "MCPUx_y"
                         if let Some(pos) = n.find('_') {
-                            let cluster = &n[..pos]; // "MCPU0"
+                            let cluster = &n[..pos];
                             let core_name = n.to_string();
                             ecpu_cores
                                 .entry(cluster.to_string())
@@ -462,15 +492,18 @@ impl IOReportSampler {
                                 .insert(core_name, watts);
                         }
                     }
-                    // E-core cluster total: MCPU0, MCPU1 (no underscore, no suffix)
-                    n if n.starts_with("MCPU") && !n.contains('_') && !n.contains("DTL") => {
+                    // E-core cluster total: MCPU0 (M1-M3), ECPU0 (M4+)
+                    n if (n.starts_with("MCPU") || n.starts_with("ECPU"))
+                        && !n.contains('_')
+                        && !n.contains("DTL") =>
+                    {
                         ecpu_totals.insert(n.to_string(), watts);
                     }
-                    // P-core per-core: PACC_0, PACC_1, ...
-                    n if n.starts_with("PACC_") => {
+                    // P-core per-core: PACC_0 (M1-M3), PCPU_0 (M4+)
+                    n if n.starts_with("PACC_") || n.starts_with("PCPU_") => {
                         pcpu_cores.insert(n.to_string(), watts);
                     }
-                    // P-core cluster total: PCPU
+                    // P-core cluster total: PCPU (exact, no underscore)
                     "PCPU" => {
                         pcpu_total = watts;
                     }

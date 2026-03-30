@@ -11,6 +11,10 @@ pub struct CliArgs {
     /// Output JSON to stdout instead of TUI
     #[arg(long)]
     pub json: bool,
+
+    /// Dump all IOReport channel names and exit (for diagnostics)
+    #[arg(long)]
+    pub dump: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

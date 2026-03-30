@@ -25,6 +25,12 @@ fn main() -> Result<()> {
     let interval = args.interval;
     let json_mode = args.json;
 
+    if args.dump {
+        let ior = macpow::ioreport::IOReportSampler::new()?;
+        ior.dump_channels();
+        return Ok(());
+    }
+
     let (tx, rx) = mpsc::sync_channel::<Metrics>(2);
 
     // Sampler spawns independent threads per source, all update shared state.

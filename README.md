@@ -1,6 +1,6 @@
 # macpow
 
-Real-time power consumption monitor for Apple Silicon Macs (M1–M5).
+Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 
 <p align="center">
   <img src="./screenshot.png" width="50%" alt="macpow screenshot">
