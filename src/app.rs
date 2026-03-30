@@ -1813,7 +1813,7 @@ impl App {
             } else {
                 "├─ "
             };
-            let dead = p.power_w == 0.0 && *adj_mj > 0.0;
+            let dead = !p.alive;
             let color = if dead {
                 Color::DarkGray
             } else if p.pid == self_pid {

@@ -218,4 +218,5 @@ pub struct ProcessPower {
     pub name: String,
     pub power_w: f32,
     pub energy_mj: f64,
+    pub alive: bool,
 }

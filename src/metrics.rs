@@ -995,6 +995,11 @@ impl Sampler {
                         let entry = known
                             .entry(pid)
                             .or_insert_with(|| (name.clone(), energy_nj, 0.0, 0, 0.0, now));
+                        // Detect PID reuse: name changed or energy counter reset
+                        if entry.0 != *name || energy_nj < entry.1 {
+                            *entry = (name.clone(), energy_nj, 0.0, 0, 0.0, now);
+                            continue;
+                        }
                         let delta_nj = energy_nj.saturating_sub(entry.1);
                         let dt_s = now.duration_since(entry.5).as_secs_f64();
                         entry.0 = name.clone();
@@ -1012,17 +1017,19 @@ impl Sampler {
                     let mut procs: Vec<ProcessPower> = known
                         .iter()
                         .filter(|(_, (_, _, mj, _, _, _))| *mj > 0.0)
-                        .map(|(&pid, (name, _, session_mj, delta_nj, dt_s, _))| {
+                        .map(|(&pid, (name, _, session_mj, delta_nj, dt_s, seen))| {
                             let power_w = if *dt_s > 0.01 {
                                 (*delta_nj as f64 / 1e9 / dt_s) as f32
                             } else {
                                 0.0
                             };
+                            let alive = cur.contains_key(&pid);
                             ProcessPower {
                                 pid,
                                 name: name.clone(),
                                 power_w,
                                 energy_mj: *session_mj,
+                                alive,
                             }
                         })
                         .collect();
