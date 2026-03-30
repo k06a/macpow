@@ -118,6 +118,8 @@ fn parse_usize_ascii(s: &str) -> Option<usize> {
 fn parse_cpu_stats_core_key(name: &str) -> Option<CpuCoreKey> {
     let (kind, suffix) = if let Some(rest) = name.strip_prefix("ECPU") {
         (CpuKind::Efficiency, rest)
+    } else if let Some(rest) = name.strip_prefix("MCPU") {
+        (CpuKind::Efficiency, rest)
     } else if let Some(rest) = name.strip_prefix("PCPU") {
         (CpuKind::Performance, rest)
     } else {
@@ -846,6 +848,26 @@ mod tests {
                 kind: CpuKind::Performance,
                 cluster: 1,
                 core: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_legacy_mcpu_cpu_stats_names() {
+        assert_eq!(
+            parse_cpu_stats_core_key("MCPU00"),
+            Some(CpuCoreKey {
+                kind: CpuKind::Efficiency,
+                cluster: 0,
+                core: 0,
+            })
+        );
+        assert_eq!(
+            parse_cpu_stats_core_key("MCPU15"),
+            Some(CpuCoreKey {
+                kind: CpuKind::Efficiency,
+                cluster: 1,
+                core: 5,
             })
         );
     }
