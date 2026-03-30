@@ -1,6 +1,6 @@
 [package]
 name = "macpow"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Real-time power consumption monitor for Apple Silicon Macs"
 license = "MIT"
@@ -31,3 +31,8 @@ libc = "0.2"
 kbd = "0.2.0"
 kbd-crossterm = "0.2.0"
 unicode-width = "0.2.0"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
