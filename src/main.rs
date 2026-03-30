@@ -25,11 +25,6 @@ fn main() -> Result<()> {
     let interval = args.interval;
     let json_mode = args.json;
 
-    if args.version {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
     if args.dump {
         match macpow::ioreport::IOReportSampler::new() {
             Ok(ior) => ior.dump_channels(),
