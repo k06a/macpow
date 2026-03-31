@@ -832,10 +832,8 @@ impl Sampler {
                     return;
                 };
                 let mut prev = ior.sample().ok();
-                let mut first = true;
                 loop {
-                    std::thread::sleep(if first { Duration::from_millis(25) } else { dt });
-                    first = false;
+                    std::thread::sleep(dt);
                     if let Ok(cur) = ior.sample() {
                         if let Some(ref p) = prev {
                             if let Ok(soc) = ior.parse_power(p, &cur) {
