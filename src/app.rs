@@ -34,7 +34,7 @@ const BAR_EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '
 fn power_color(w: f32) -> Color {
     match w {
         w if w < 1.0 => Color::Rgb(46, 139, 87),
-        w if w < 5.0 => Color::Rgb(255, 255, 50), // lemon yellow
+        w if w < 5.0 => Color::Rgb(220, 180, 0), // golden yellow
         w if w < 10.0 => Color::Rgb(255, 140, 0), // carrot orange
         _ => Color::Rgb(255, 50, 50),             // bright red
     }
@@ -2165,7 +2165,7 @@ impl App {
             Span::raw(" pin    "),
             Span::styled("■", Style::default().fg(Color::Rgb(46, 139, 87))),
             Span::raw("<1W "),
-            Span::styled("■", Style::default().fg(Color::Rgb(255, 255, 50))),
+            Span::styled("■", Style::default().fg(Color::Rgb(220, 180, 0))),
             Span::raw("<5W "),
             Span::styled("■", Style::default().fg(Color::Rgb(255, 140, 0))),
             Span::raw("<10W "),
