@@ -2014,6 +2014,7 @@ impl App {
                 BOLD,
                 pin("software"),
             );
+            sw_row.current = format!("{:>5.1} mW", m.all_procs_power_w * 1000.0);
             sw_row.label_style = BOLD;
             rows.push(sw_row);
         }
@@ -2075,6 +2076,7 @@ impl App {
                 Style::default().fg(color),
                 self.pinned.contains(&key),
             );
+            r.current = format!("{:>5.1} mW", p.power_w * 1000.0);
             r.current_style = Style::default().fg(color);
             r
         }));
@@ -2312,6 +2314,8 @@ impl App {
             let fmt_axis = |v: f64| -> String {
                 if is_data {
                     human_rate(v)
+                } else if v.abs() < 0.1 && v.abs() > 0.0 {
+                    format!("{:>3.0}mW", v * 1000.0)
                 } else {
                     format!("{:>5.1}", v)
                 }
@@ -2333,6 +2337,8 @@ impl App {
 
             let title_value = if is_data {
                 human_rate(current)
+            } else if current.abs() < 0.1 && current.abs() > 0.0 {
+                format!("{:.1} mW", current * 1000.0)
             } else {
                 format!("{:.3} W", current)
             };
@@ -2544,7 +2550,10 @@ fn nice_scale(max_val: f64) -> f64 {
     if max_val <= 0.0 {
         return 1.0;
     }
-    let steps = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0];
+    let steps = [
+        0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0,
+        100.0, 200.0,
+    ];
     steps
         .iter()
         .copied()

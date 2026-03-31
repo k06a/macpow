@@ -1097,6 +1097,9 @@ impl Sampler {
                     i32,
                     (String, u64, f64, u64, f64, Instant),
                 > = std::collections::HashMap::new();
+                let mut proc_sma: std::collections::HashMap<i32, crate::sma::TimeSma> =
+                    std::collections::HashMap::new();
+                let mut total_sma = crate::sma::TimeSma::new(5.0);
                 loop {
                     let cur = read_all_process_energy();
                     let now = Instant::now();
@@ -1129,11 +1132,16 @@ impl Sampler {
                         .iter()
                         .filter(|(_, (_, _, mj, _, _, _))| *mj > 0.0)
                         .map(|(&pid, (name, _, session_mj, delta_nj, dt_s, _seen))| {
-                            let power_w = if *dt_s > 0.01 {
+                            let raw_power = if *dt_s > 0.01 {
                                 (*delta_nj as f64 / 1e9 / dt_s) as f32
                             } else {
                                 0.0
                             };
+                            let sma = proc_sma
+                                .entry(pid)
+                                .or_insert_with(|| crate::sma::TimeSma::new(5.0));
+                            sma.push(raw_power);
+                            let power_w = sma.get();
                             let alive = cur.contains_key(&pid);
                             ProcessPower {
                                 pid,
@@ -1144,7 +1152,10 @@ impl Sampler {
                             }
                         })
                         .collect();
-                    let total_power: f32 = procs.iter().map(|p| p.power_w).sum();
+                    proc_sma.retain(|pid, _| known.contains_key(pid));
+                    let total_raw: f32 = procs.iter().map(|p| p.power_w).sum();
+                    total_sma.push(total_raw);
+                    let total_power = total_sma.get();
                     let total_energy: f64 = procs.iter().map(|p| p.energy_mj).sum();
                     procs.sort_by(|a, b| {
                         b.energy_mj
