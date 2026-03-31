@@ -1297,7 +1297,7 @@ impl App {
                 "ecpu",
                 Some("cpu"),
                 &format!("{}│  ├─ ", cp),
-                &format!("E-Cores ({}, {:.0}%)", e_count, e_avg_usage),
+                &format!("E-Cores ({} cores, {:.0}%)", e_count, e_avg_usage),
                 s.ecpu.get(),
                 w.ecpu,
                 &fmt_freq(s.ecpu_freq.get()),
@@ -1349,7 +1349,7 @@ impl App {
                 "pcpu",
                 Some("cpu"),
                 &format!("{}│  └─ ", cp),
-                &format!("P-Cores ({}, {:.0}%)", p_count, p_avg_usage),
+                &format!("P-Cores ({} cores, {:.0}%)", p_count, p_avg_usage),
                 s.pcpu.get(),
                 w.pcpu,
                 &fmt_freq(s.pcpu_freq.get()),
@@ -1390,7 +1390,7 @@ impl App {
                 }
             }
             let gpu_util = m.soc.gpu_util_device;
-            let gpu_name = if m.gpu_cores > 0 {
+            let gpu_label = if m.gpu_cores > 0 {
                 format!("GPU ({} cores, {}%)", m.gpu_cores, gpu_util)
             } else {
                 format!("GPU ({}%)", gpu_util)
@@ -1399,7 +1399,7 @@ impl App {
                 "gpu",
                 Some("soc"),
                 &format!("{}├─ ", cp),
-                &gpu_name,
+                &gpu_label,
                 s.gpu.get(),
                 w.gpu,
                 &fmt_freq(s.gpu_freq.get()),
@@ -1407,7 +1407,6 @@ impl App {
                 Style::default(),
                 pin("gpu"),
             ));
-            // GPU utilization sub-items (collapsed by default)
             {
                 let gpu_cont = format!("{}│  ", cp);
                 rows.push(TreeRow::info(
@@ -1424,12 +1423,30 @@ impl App {
                 ));
                 rows.push(TreeRow::info(
                     Some("gpu"),
-                    &format!("{}└─ ", gpu_cont),
+                    &format!("{}├─ ", gpu_cont),
                     &format!(
                         "Tiler    ({:>3}%) {}",
                         m.soc.gpu_util_tiler,
                         usage_bar(m.soc.gpu_util_tiler as f32)
                     ),
+                    "",
+                    "",
+                    Style::default(),
+                ));
+                let cores_label = if m.gpu_cores > 0 {
+                    format!(
+                        "{} Cores ({:>3}%) {}",
+                        m.gpu_cores,
+                        gpu_util,
+                        usage_bar(gpu_util as f32)
+                    )
+                } else {
+                    format!("Cores    ({:>3}%) {}", gpu_util, usage_bar(gpu_util as f32))
+                };
+                rows.push(TreeRow::info(
+                    Some("gpu"),
+                    &format!("{}└─ ", gpu_cont),
+                    &cores_label,
                     "",
                     "",
                     Style::default(),
