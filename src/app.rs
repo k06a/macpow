@@ -1378,30 +1378,7 @@ impl App {
             ));
             {
                 let gpu_cont = format!("{}│  ", cp);
-                rows.push(TreeRow::info(
-                    Some("gpu"),
-                    &format!("{}├─ ", gpu_cont),
-                    &format!(
-                        "Renderer ({:>3}%) {}",
-                        m.soc.gpu_util_renderer,
-                        usage_bar(m.soc.gpu_util_renderer as f32)
-                    ),
-                    "",
-                    "",
-                    Style::default(),
-                ));
-                rows.push(TreeRow::info(
-                    Some("gpu"),
-                    &format!("{}├─ ", gpu_cont),
-                    &format!(
-                        "Tiler    ({:>3}%) {}",
-                        m.soc.gpu_util_tiler,
-                        usage_bar(m.soc.gpu_util_tiler as f32)
-                    ),
-                    "",
-                    "",
-                    Style::default(),
-                ));
+                let gpu_color = power_color(s.gpu.get().abs());
                 let cores_label = if m.gpu_cores > 0 {
                     format!(
                         "{} Cores ({:>3}%) {}",
@@ -1414,11 +1391,35 @@ impl App {
                 };
                 rows.push(TreeRow::info(
                     Some("gpu"),
-                    &format!("{}└─ ", gpu_cont),
+                    &format!("{}├─ ", gpu_cont),
                     &cores_label,
                     "",
                     "",
-                    Style::default(),
+                    Style::default().fg(gpu_color),
+                ));
+                rows.push(TreeRow::info(
+                    Some("gpu"),
+                    &format!("{}├─ ", gpu_cont),
+                    &format!(
+                        "Renderer ({:>3}%) {}",
+                        m.soc.gpu_util_renderer,
+                        usage_bar(m.soc.gpu_util_renderer as f32)
+                    ),
+                    "",
+                    "",
+                    Style::default().fg(gpu_color),
+                ));
+                rows.push(TreeRow::info(
+                    Some("gpu"),
+                    &format!("{}└─ ", gpu_cont),
+                    &format!(
+                        "Tiler    ({:>3}%) {}",
+                        m.soc.gpu_util_tiler,
+                        usage_bar(m.soc.gpu_util_tiler as f32)
+                    ),
+                    "",
+                    "",
+                    Style::default().fg(gpu_color),
                 ));
             }
             rows.push(TreeRow::pw_full(
