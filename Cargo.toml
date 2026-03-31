@@ -1,6 +1,6 @@
 [package]
 name = "macpow"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Real-time power consumption monitor for Apple Silicon Macs"
 license = "MIT"
