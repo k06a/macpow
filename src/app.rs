@@ -511,7 +511,7 @@ impl App {
                 "usb7",
             ]
             .into_iter()
-            .chain(std::iter::once("ethernet"))
+            .chain(["ethernet", "ssd_nand"].into_iter())
             .collect(),
             total_rows: 0,
             row_keys_cache: Vec::new(),
@@ -1544,7 +1544,37 @@ impl App {
             ));
         }
 
-        // ── SSD
+        // ── SSD with Controller/NAND sub-items
+        // Ts{N}P keys = NAND controllers, other Ts* = NAND flash dies
+        let ssd_temps: Vec<&TempSensor> = m
+            .temperatures
+            .iter()
+            .filter(|t| t.category == "SSD")
+            .collect();
+        let ctrl_temps: Vec<f32> = ssd_temps
+            .iter()
+            .filter(|t| t.key.ends_with('P'))
+            .map(|t| t.value_celsius)
+            .collect();
+        let nand_temps: Vec<f32> = ssd_temps
+            .iter()
+            .filter(|t| !t.key.ends_with('P'))
+            .map(|t| t.value_celsius)
+            .collect();
+        let fmt_temps = |v: &[f32]| -> String {
+            if v.is_empty() {
+                return String::new();
+            }
+            let avg = v.iter().sum::<f32>() / v.len() as f32;
+            let mn = v.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            format!("{:.0}°C ({:.0}–{:.0})", avg, mn, mx)
+        };
+        let ssd_temp_str = if !ctrl_temps.is_empty() {
+            fmt_temps(&ctrl_temps)
+        } else {
+            temp_info("SSD")
+        };
         rows.push(TreeRow::pw_full_est(
             "ssd",
             Some("system"),
@@ -1557,16 +1587,40 @@ impl App {
             s.ssd.get(),
             w.ssd,
             "",
-            &temp_info("SSD"),
+            &ssd_temp_str,
             BOLD,
             pin("ssd"),
         ));
-        // SSD Read/Write counters (collapsed by default)
         {
-            let ssd_cont = c("ssd");
+            let sc = c("ssd");
+            if !ctrl_temps.is_empty() {
+                let mut r = TreeRow::info(
+                    Some("ssd"),
+                    &format!("{}├─ ", sc),
+                    "Controller",
+                    "",
+                    "",
+                    Style::default().fg(Color::Green),
+                );
+                r.temp = fmt_temps(&ctrl_temps);
+                rows.push(r);
+            }
+            rows.push({
+                let mut r = TreeRow::info(
+                    Some("ssd"),
+                    &format!("{}└─ ", sc),
+                    "NAND Flash",
+                    "",
+                    "",
+                    Style::default().fg(Color::Green),
+                );
+                r.temp = fmt_temps(&nand_temps);
+                r.key = Some("ssd_nand");
+                r
+            });
             let mut r = TreeRow::info(
-                Some("ssd"),
-                &format!("{}├─ ", ssd_cont),
+                Some("ssd_nand"),
+                &format!("{}   ├─ ", sc),
                 "Read",
                 &human_rate(m.disk.read_bytes_per_sec),
                 &human_bytes(self.wh.disk_read_bytes),
@@ -1575,8 +1629,8 @@ impl App {
             r.key = Some("disk_read");
             rows.push(r);
             let mut r = TreeRow::info(
-                Some("ssd"),
-                &format!("{}└─ ", ssd_cont),
+                Some("ssd_nand"),
+                &format!("{}   └─ ", sc),
                 "Write",
                 &human_rate(m.disk.write_bytes_per_sec),
                 &human_bytes(self.wh.disk_write_bytes),
