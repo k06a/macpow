@@ -931,13 +931,13 @@ impl App {
                 self.row_parents_cache.get(self.cursor).copied().flatten()
             });
         let chart_keys = self.chart_keys(cursor_key);
-        // Always reserve chart space to prevent tree jumping
-        let min_charts = if self.pinned.is_empty() {
+        let chart_count = if chart_keys.is_empty() {
+            0
+        } else if self.pinned.is_empty() {
             1
         } else {
-            self.pinned.len()
+            self.pinned.len().max(chart_keys.len())
         };
-        let chart_count = chart_keys.len().max(min_charts);
         let chart_h = chart_count as u16 * CHART_HEIGHT;
 
         let chunks = Layout::default()
