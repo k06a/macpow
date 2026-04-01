@@ -490,7 +490,7 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
             let count = name_counts.get(&e.name).copied().unwrap_or(1);
             if count >= 2 {
                 let nth = seen.entry(e.name.clone()).or_insert(0);
-                let side = if *nth == 0 { "Right" } else { "Left" };
+                let side = format!("#{}", *nth + 1);
                 *nth += 1;
                 format!("{} ({})", e.name, side)
             } else {
