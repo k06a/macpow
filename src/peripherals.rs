@@ -452,8 +452,10 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
                     .to_string();
                 if !time.is_empty() && time != "0:00" {
                     status = format!("charging, {} left", time);
-                } else {
+                } else if pct.parse::<u32>().unwrap_or(0) >= 100 {
                     status = "charged".to_string();
+                } else {
+                    status = "charging".to_string();
                 }
             }
 
@@ -488,7 +490,7 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
             let count = name_counts.get(&e.name).copied().unwrap_or(1);
             if count >= 2 {
                 let nth = seen.entry(e.name.clone()).or_insert(0);
-                let side = if *nth == 0 { "Left" } else { "Right" };
+                let side = if *nth == 0 { "Right" } else { "Left" };
                 *nth += 1;
                 format!("{} ({})", e.name, side)
             } else {
