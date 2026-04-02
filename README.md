@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/k06a/macpow/actions/workflows/ci.yml/badge.svg)](https://github.com/k06a/macpow/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/macpow)](https://crates.io/crates/macpow)
-[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.12-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
+[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.13-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](https://github.com/k06a/macpow)
 
