@@ -60,6 +60,14 @@ brew tap k06a/tap
 brew install macpow
 ```
 
+### With pixi (conda-forge)
+
+```bash
+pixi global install macpow
+# execute without installing
+pixi exec macpow
+```
+
 ## Usage
 
 ```
