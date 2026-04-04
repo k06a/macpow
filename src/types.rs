@@ -256,6 +256,9 @@ pub struct TempSensor {
     pub key: String,
     pub category: String,
     pub value_celsius: f32,
+    /// True when the value is from a previous sample (sensor read failed this cycle).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

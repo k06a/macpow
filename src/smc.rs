@@ -98,6 +98,7 @@ pub struct SmcConnection {
     conn: u32,
     temp_keys: Option<Vec<(String, String)>>,
     key_info_cache: std::collections::HashMap<u32, SmcKeyInfoData>,
+    temp_value_cache: std::collections::HashMap<String, (String, f32)>,
 }
 
 unsafe impl Send for SmcConnection {}
@@ -124,6 +125,7 @@ impl SmcConnection {
                 conn,
                 temp_keys: None,
                 key_info_cache: std::collections::HashMap::new(),
+                temp_value_cache: std::collections::HashMap::new(),
             })
         }
     }
@@ -141,6 +143,7 @@ impl SmcConnection {
                 conn: conn2,
                 temp_keys: None,
                 key_info_cache: std::collections::HashMap::new(),
+                temp_value_cache: std::collections::HashMap::new(),
             };
             let keys = tmp.discover_temp_keys();
             // Don't close via Drop — we manually close
@@ -284,16 +287,32 @@ impl SmcConnection {
             Some(k) => k,
             None => return Vec::new(),
         };
-        keys.iter()
-            .filter_map(|(key_str, category)| {
-                let val = self.read_f32(key_str).ok()?;
-                (val > 0.0 && val < 150.0).then(|| TempSensor {
+        let mut result = Vec::with_capacity(keys.len());
+        for (key_str, category) in &keys {
+            if let Ok(val) = self.read_f32(key_str) {
+                if val > 0.0 && val < 150.0 {
+                    self.temp_value_cache
+                        .insert(key_str.clone(), (category.clone(), val));
+                    result.push(TempSensor {
+                        key: key_str.clone(),
+                        category: category.clone(),
+                        value_celsius: val,
+                        stale: false,
+                    });
+                    continue;
+                }
+            }
+            // Read failed or value out of range — use cached value if available
+            if let Some((cached_cat, cached_val)) = self.temp_value_cache.get(key_str) {
+                result.push(TempSensor {
                     key: key_str.clone(),
-                    category: category.clone(),
-                    value_celsius: val,
-                })
-            })
-            .collect()
+                    category: cached_cat.clone(),
+                    value_celsius: *cached_val,
+                    stale: true,
+                });
+            }
+        }
+        result
     }
 
     fn discover_temp_keys(&mut self) -> Vec<(String, String)> {

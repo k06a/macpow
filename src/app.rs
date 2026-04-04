@@ -1154,7 +1154,11 @@ impl App {
         let p_count = m.soc.pcpu_cluster.cores.len();
         let (e_temps, p_temps) = selected_cpu_core_temps(&m.temperatures, e_count, p_count);
         let mut temp_groups = temps_by_category(&m.temperatures);
-        let cpu_display_temps: Vec<f32> = e_temps.iter().chain(p_temps.iter()).copied().collect();
+        let cpu_display_temps: Vec<f32> = e_temps
+            .iter()
+            .chain(p_temps.iter())
+            .map(|(v, _)| *v)
+            .collect();
         if !cpu_display_temps.is_empty() {
             temp_groups.insert("CPU".to_string(), cpu_display_temps);
         }
@@ -1419,17 +1423,19 @@ impl App {
             let e_avg_temp = if e_temps.is_empty() {
                 String::new()
             } else {
-                let avg = e_temps.iter().sum::<f32>() / e_temps.len() as f32;
-                let min = e_temps.iter().copied().fold(f32::INFINITY, f32::min);
-                let max = e_temps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let vals: Vec<f32> = e_temps.iter().map(|(v, _)| *v).collect();
+                let avg = vals.iter().sum::<f32>() / vals.len() as f32;
+                let min = vals.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 format!("{:.0}°C ({:.0}–{:.0})", avg, min, max)
             };
             let p_avg_temp = if p_temps.is_empty() {
                 String::new()
             } else {
-                let avg = p_temps.iter().sum::<f32>() / p_temps.len() as f32;
-                let min = p_temps.iter().copied().fold(f32::INFINITY, f32::min);
-                let max = p_temps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let vals: Vec<f32> = p_temps.iter().map(|(v, _)| *v).collect();
+                let avg = vals.iter().sum::<f32>() / vals.len() as f32;
+                let min = vals.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 format!("{:.0}°C ({:.0}–{:.0})", avg, min, max)
             };
 
@@ -1465,7 +1471,13 @@ impl App {
                     let key = proc_key(&mut self.proc_keys, -(ci as i32 + 1000));
                     let temp = e_temps
                         .get(ci)
-                        .map(|t| format!("{:.0}°C", t))
+                        .map(|(t, stale)| {
+                            if *stale {
+                                format!("~{:.0}°C", t)
+                            } else {
+                                format!("{:.0}°C", t)
+                            }
+                        })
                         .unwrap_or_default();
                     let usage = e_usage
                         .get(ci)
@@ -1509,7 +1521,13 @@ impl App {
                     let key = proc_key(&mut self.proc_keys, -(ci as i32 + 2000));
                     let temp = p_temps
                         .get(ci)
-                        .map(|t| format!("{:.0}°C", t))
+                        .map(|(t, stale)| {
+                            if *stale {
+                                format!("~{:.0}°C", t)
+                            } else {
+                                format!("{:.0}°C", t)
+                            }
+                        })
                         .unwrap_or_default();
                     let usage = p_usage
                         .get(ci)
@@ -2941,64 +2959,277 @@ fn temps_by_category(temps: &[TempSensor]) -> BTreeMap<String, Vec<f32>> {
         })
 }
 
+/// Apple SMC suffixes use a base-62 alphabet: `0-9, A-Z, a-z`.
+/// Returns the ordinal position (0..62) or `None` for non-base-62 chars.
+fn suffix_to_base62(c: char) -> Option<u32> {
+    match c {
+        '0'..='9' => Some(c as u32 - '0' as u32),
+        'A'..='Z' => Some(c as u32 - 'A' as u32 + 10),
+        'a'..='z' => Some(c as u32 - 'a' as u32 + 36),
+        _ => None,
+    }
+}
+
+/// Given a sorted list of `(suffix_char, temperature)` pairs from one SMC bank,
+/// group them into per-core sensor clusters and return the max temp per core.
+///
+/// Grouping uses two passes:
+/// 1. Split at base-62 gaps > 1 → "mega-groups" of consecutive suffixes
+/// 2. Chunk each mega-group into pieces of 3 (last piece may be 1–2)
+/// Each resulting piece = one core's sensors; we take the max as the core temp.
+/// The bool indicates whether ANY sensor in the group was stale.
+fn group_sensor_suffixes(sorted_pairs: &[(char, f32)], stale_suffixes: &[char]) -> Vec<(f32, bool)> {
+    if sorted_pairs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut mega_groups: Vec<Vec<(f32, char)>> = Vec::new();
+    let mut current: Vec<(f32, char)> = vec![(sorted_pairs[0].1, sorted_pairs[0].0)];
+    let mut prev_pos = suffix_to_base62(sorted_pairs[0].0).unwrap_or(0);
+
+    for &(ch, val) in &sorted_pairs[1..] {
+        let pos = suffix_to_base62(ch).unwrap_or(prev_pos + 10);
+        if pos.wrapping_sub(prev_pos) > 1 {
+            mega_groups.push(std::mem::take(&mut current));
+        }
+        current.push((val, ch));
+        prev_pos = pos;
+    }
+    if !current.is_empty() {
+        mega_groups.push(current);
+    }
+
+    let mut core_temps = Vec::new();
+    for mg in &mega_groups {
+        for chunk in mg.chunks(3) {
+            let max_t = chunk.iter().map(|(v, _)| *v).fold(f32::NEG_INFINITY, f32::max);
+            let any_stale = chunk.iter().any(|(_, ch)| stale_suffixes.contains(ch));
+            core_temps.push((max_t, any_stale));
+        }
+    }
+    core_temps
+}
+
+/// Die index derived from the bank character (3rd char of a `Te*`/`Tp*` key).
+/// Digits 0–4 → die 0, digits 5–9 → die 1, letter `x` → die 0.
+fn bank_die(bank: char) -> usize {
+    match bank {
+        '0'..='4' => 0,
+        '5'..='9' => 1,
+        _ => 0,
+    }
+}
+
+/// A bank whose raw sensor values are all within 0.25°C is likely
+/// uninitialized / placeholder data and should be ignored.
+fn bank_is_placeholder(pairs: &[(char, f32)]) -> bool {
+    if pairs.len() < 7 {
+        return false;
+    }
+    let min = pairs.iter().map(|(_, v)| *v).fold(f32::INFINITY, f32::min);
+    let max = pairs.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+    max - min < 0.25
+}
+
+/// Universal mapping of SMC temperature keys to per-core CPU temperatures.
+///
+/// Works on all Apple Silicon: single-die (M1–M4 Pro/Max) and multi-die (Ultra).
+/// Key encoding: `T{type}{bank}{suffix}` where:
+///   type = 'e' (efficiency) | 'p' (performance)
+///   bank digit = die * 5 + cluster_offset; 'x' = single-die E-core
+///   suffix = per-sensor ID within the bank (base-62 alphabet)
 fn selected_cpu_core_temps(
     temps: &[TempSensor],
     e_count: usize,
     p_count: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    let mut e_temps = Vec::new();
-    let mut p_temps = Vec::new();
-
-    let e_candidates = sorted_temp_values(temps, |key| key.starts_with("Tex"));
-    if e_count > 0 && e_candidates.len() == e_count {
-        e_temps = e_candidates;
+) -> (Vec<(f32, bool)>, Vec<(f32, bool)>) {
+    if e_count == 0 && p_count == 0 {
+        return (Vec::new(), Vec::new());
     }
 
-    let p_triplets = sorted_temp_values(temps, |key| {
-        key.starts_with("Tp1") || key.starts_with("Tp2")
-    });
-    if p_count > 0 && p_triplets.len() == p_count * 3 {
-        p_temps = p_triplets
-            .chunks_exact(3)
-            .map(|chunk| chunk.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+    // ── Step 1: parse CPU temp keys into (type, bank, suffix, value) ────────
+    let mut te_banks: BTreeMap<char, Vec<(char, f32)>> = BTreeMap::new();
+    let mut tp_banks: BTreeMap<char, Vec<(char, f32)>> = BTreeMap::new();
+    // Track which (bank, suffix) pairs come from stale sensor readings
+    let mut te_stale: BTreeMap<char, Vec<char>> = BTreeMap::new();
+    let mut tp_stale: BTreeMap<char, Vec<char>> = BTreeMap::new();
+
+    for t in temps.iter().filter(|t| t.category == "CPU") {
+        let bytes = t.key.as_bytes();
+        if bytes.len() != 4 || bytes[0] != b'T' {
+            continue;
+        }
+        let sensor_type = bytes[1] as char;
+        let bank = bytes[2] as char;
+        let suffix = bytes[3] as char;
+        if suffix_to_base62(suffix).is_none() {
+            continue;
+        }
+        let entry = (suffix, t.value_celsius);
+        match sensor_type {
+            'e' => {
+                te_banks.entry(bank).or_default().push(entry);
+                if t.stale {
+                    te_stale.entry(bank).or_default().push(suffix);
+                }
+            }
+            'p' => {
+                tp_banks.entry(bank).or_default().push(entry);
+                if t.stale {
+                    tp_stale.entry(bank).or_default().push(suffix);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Sort each bank by base-62 suffix position
+    let sort_bank = |bank: &mut Vec<(char, f32)>| {
+        bank.sort_by_key(|&(ch, _)| suffix_to_base62(ch).unwrap_or(0));
+    };
+    for bank in te_banks.values_mut() {
+        sort_bank(bank);
+    }
+    for bank in tp_banks.values_mut() {
+        sort_bank(bank);
+    }
+
+    // ── Step 2: determine topology ──────────────────────────────────────────
+    let n_dies = {
+        let has_high_bank = te_banks.keys().chain(tp_banks.keys()).any(|&c| matches!(c, '5'..='9'));
+        if has_high_bank { 2 } else { 1 }
+    };
+    let e_per_die = e_count / n_dies.max(1);
+    let p_per_die = p_count / n_dies.max(1);
+
+    // ── Step 3: per-die temperature extraction ──────────────────────────────
+    let mut all_e_temps: Vec<(f32, bool)> = Vec::new();
+    let mut all_p_temps: Vec<(f32, bool)> = Vec::new();
+    let empty_stale: Vec<char> = Vec::new();
+
+    for die in 0..n_dies {
+        // ── E-core temps from Te banks ──────────────────────────────────────
+        let te_die_pairs: Vec<(char, f32)> = te_banks
+            .iter()
+            .filter(|(&b, pairs)| bank_die(b) == die && !bank_is_placeholder(pairs))
+            .flat_map(|(_, pairs)| pairs.iter().copied())
             .collect();
-    }
+        let te_die_stale: Vec<char> = te_stale
+            .iter()
+            .filter(|(&b, _)| bank_die(b) == die)
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
 
-    if e_temps.len() == e_count && p_temps.len() == p_count {
-        return (e_temps, p_temps);
-    }
-
-    let fallback = sorted_temp_values(temps, |key| key.starts_with("Tp0"));
-    if fallback.len() >= e_count + p_count
-        && !is_placeholder_temp_bank(&fallback, e_count + p_count)
-    {
-        if e_temps.len() != e_count {
-            e_temps = fallback.iter().take(e_count).copied().collect();
-        }
-        if p_temps.len() != p_count {
-            p_temps = fallback
+        let te_die: Vec<(f32, bool)> = if te_die_pairs.len() == e_per_die {
+            let mut sorted = te_die_pairs.clone();
+            sorted.sort_by_key(|&(ch, _)| suffix_to_base62(ch).unwrap_or(0));
+            sorted
+                .into_iter()
+                .map(|(ch, v)| (v, te_die_stale.contains(&ch)))
+                .collect()
+        } else {
+            te_banks
                 .iter()
-                .skip(e_count)
-                .take(p_count)
-                .copied()
-                .collect();
+                .filter(|(&b, pairs)| bank_die(b) == die && !bank_is_placeholder(pairs))
+                .flat_map(|(&b, pairs)| {
+                    let stale = te_stale.get(&b).map(|s| s.as_slice()).unwrap_or(&empty_stale);
+                    group_sensor_suffixes(pairs, stale)
+                })
+                .collect()
+        };
+
+        let e_ok = !te_die.is_empty();
+        all_e_temps.extend(te_die.iter().take(e_per_die));
+
+        // ── P-core temps from Tp banks (direct selection) ───────────────
+        let die_base = (die as u8) * 5;
+        let p_bank_1 = (b'0' + die_base + 1) as char;
+        let p_bank_2 = (b'0' + die_base + 2) as char;
+        let primary_bank = (b'0' + die_base) as char;
+
+        let mut p_groups: Vec<(f32, bool)> = Vec::new();
+        for &target_bank in &[p_bank_1, p_bank_2] {
+            if let Some(pairs) = tp_banks.get(&target_bank) {
+                if !bank_is_placeholder(pairs) {
+                    let stale = tp_stale.get(&target_bank).map(|s| s.as_slice()).unwrap_or(&empty_stale);
+                    p_groups.extend(group_sensor_suffixes(pairs, stale));
+                }
+            }
+        }
+
+        let skip = if p_per_die > 0 && p_groups.len() > p_per_die {
+            e_per_die
+        } else {
+            0
+        };
+        let p_slice: Vec<(f32, bool)> = p_groups.iter().skip(skip).take(p_per_die).copied().collect();
+
+        let split_adequate = e_ok && p_slice.len() >= p_per_die;
+
+        let primary_stale = tp_stale.get(&primary_bank).map(|s| s.as_slice()).unwrap_or(&empty_stale);
+        let primary_groups: Vec<(f32, bool)> = tp_banks
+            .get(&primary_bank)
+            .filter(|pairs| !bank_is_placeholder(pairs))
+            .map(|pairs| group_sensor_suffixes(pairs, primary_stale))
+            .unwrap_or_default();
+        let primary_has_all = primary_groups.len() >= e_per_die + p_per_die;
+
+        if split_adequate {
+            if !e_ok && e_per_die > 0 && skip > 0 {
+                all_e_temps.extend(p_groups.iter().take(e_per_die));
+            }
+            all_p_temps.extend(p_slice);
+        } else if primary_has_all {
+            if !e_ok {
+                all_e_temps.extend(primary_groups.iter().take(e_per_die));
+            }
+            all_p_temps.extend(primary_groups.iter().skip(e_per_die).take(p_per_die));
+        } else if !p_slice.is_empty() {
+            if !e_ok && e_per_die > 0 && skip > 0 {
+                all_e_temps.extend(p_groups.iter().take(e_per_die));
+            }
+            all_p_temps.extend(p_slice);
+        } else if tp_banks.contains_key(&p_bank_1) || tp_banks.contains_key(&p_bank_2) {
+            if !primary_groups.is_empty() {
+                let skip = if e_ok { e_per_die } else { 0 };
+                all_p_temps.extend(primary_groups.iter().skip(skip).take(p_per_die));
+            }
         }
     }
 
-    (e_temps, p_temps)
-}
+    if !all_e_temps.is_empty() || !all_p_temps.is_empty() {
+        return (all_e_temps, all_p_temps);
+    }
 
-fn sorted_temp_values<F>(temps: &[TempSensor], predicate: F) -> Vec<f32>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut vals: Vec<_> = temps
+    // ── Legacy fallback: Tp0 flat list (M1-era / edge cases) ────────────────
+    let tp0_stale: Vec<char> = tp_stale.get(&'0').cloned().unwrap_or_default();
+    let mut fallback_vals: Vec<(u32, f32, bool)> = temps
         .iter()
-        .filter(|t| t.category == "CPU" && predicate(&t.key))
-        .map(|t| (t.key.as_str(), t.value_celsius))
+        .filter(|t| t.category == "CPU" && t.key.starts_with("Tp0"))
+        .filter_map(|t| {
+            let suffix = t.key.as_bytes().get(3).copied()? as char;
+            Some((suffix_to_base62(suffix)?, t.value_celsius, tp0_stale.contains(&suffix)))
+        })
         .collect();
-    vals.sort_by(|a, b| a.0.cmp(b.0));
-    vals.into_iter().map(|(_, temp)| temp).collect()
+    fallback_vals.sort_by_key(|&(pos, _, _)| pos);
+    let flat: Vec<(f32, bool)> = fallback_vals.into_iter().map(|(_, v, s)| (v, s)).collect();
+    let flat_vals: Vec<f32> = flat.iter().map(|(v, _)| *v).collect();
+
+    if flat.len() >= e_count + p_count && !is_placeholder_temp_bank(&flat_vals, e_count + p_count) {
+        let e = if all_e_temps.len() == e_count {
+            all_e_temps
+        } else {
+            flat.iter().take(e_count).copied().collect()
+        };
+        let p = if all_p_temps.len() == p_count {
+            all_p_temps
+        } else {
+            flat.iter().skip(e_count).take(p_count).copied().collect()
+        };
+        return (e, p);
+    }
+
+    (all_e_temps, all_p_temps)
 }
 
 fn is_placeholder_temp_bank(vals: &[f32], expected_count: usize) -> bool {
@@ -3153,11 +3384,101 @@ mod tests {
             key: key.to_string(),
             category: "CPU".to_string(),
             value_celsius: temp,
+            stale: false,
         }
+    }
+
+    const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    fn b62(idx: usize) -> char {
+        B62[idx] as char
+    }
+
+    /// Realistic triplet suffixes used by Apple Silicon per-core sensors.
+    /// Each slice of 3 consecutive chars in the base-62 alphabet represents
+    /// one core's (proximity, junction, peak) readings.
+    const TRIPLET_STARTS: &[usize] = &[
+        4,  // 4,5,6
+        12, // C,D,E
+        20, // K,L,M
+        27, // R,S,T
+        30, // U,V,W
+        36, // a,b,c
+        42, // g,h,i
+        48, // m,n,o
+        56, // u,v,w
+        60, // y,z,(overflow)
+    ];
+
+    fn make_triplet(bank: &str, triplet_idx: usize, peak_temp: f32) -> Vec<TempSensor> {
+        let start = TRIPLET_STARTS[triplet_idx];
+        (0..3)
+            .map(|offset| {
+                let suffix = b62(start + offset);
+                let temp = peak_temp - (2 - offset) as f32 * 5.0;
+                cpu_sensor(&format!("{}{}", bank, suffix), temp)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn base62_conversion() {
+        assert_eq!(suffix_to_base62('0'), Some(0));
+        assert_eq!(suffix_to_base62('9'), Some(9));
+        assert_eq!(suffix_to_base62('A'), Some(10));
+        assert_eq!(suffix_to_base62('Z'), Some(35));
+        assert_eq!(suffix_to_base62('a'), Some(36));
+        assert_eq!(suffix_to_base62('z'), Some(61));
+        assert_eq!(suffix_to_base62('!'), None);
+    }
+
+    #[test]
+    fn groups_triplets_by_base62_gap() {
+        let pairs = vec![
+            ('4', 10.0), ('5', 15.0), ('6', 20.0),
+            ('C', 30.0), ('D', 35.0), ('E', 40.0),
+            ('K', 50.0), ('L', 55.0), ('M', 60.0),
+        ];
+        let result: Vec<f32> = group_sensor_suffixes(&pairs, &[]).iter().map(|(v, _)| *v).collect();
+        assert_eq!(result, vec![20.0, 40.0, 60.0]);
+    }
+
+    #[test]
+    fn groups_consecutive_mega_group_into_triplets() {
+        let pairs = vec![
+            ('R', 10.0), ('S', 20.0), ('T', 30.0),
+            ('U', 40.0), ('V', 50.0), ('W', 60.0),
+        ];
+        let result: Vec<f32> = group_sensor_suffixes(&pairs, &[]).iter().map(|(v, _)| *v).collect();
+        assert_eq!(result, vec![30.0, 60.0]);
+    }
+
+    #[test]
+    fn handles_9_to_a_base62_continuity() {
+        let pairs = vec![('9', 10.0), ('A', 20.0), ('B', 30.0)];
+        let result: Vec<f32> = group_sensor_suffixes(&pairs, &[]).iter().map(|(v, _)| *v).collect();
+        assert_eq!(result, vec![30.0]);
+    }
+
+    #[test]
+    fn stale_flag_propagated_through_grouping() {
+        let pairs = vec![
+            ('4', 10.0), ('5', 15.0), ('6', 20.0),
+            ('C', 30.0), ('D', 35.0), ('E', 40.0),
+        ];
+        // Mark suffix '5' as stale → first group should be stale
+        let result = group_sensor_suffixes(&pairs, &['5']);
+        assert_eq!(result, vec![(20.0, true), (40.0, false)]);
+    }
+
+    /// Extract just the temperature values (drop stale flags) for test assertions.
+    fn vals(temps: &[(f32, bool)]) -> Vec<f32> {
+        temps.iter().map(|(v, _)| *v).collect()
     }
 
     #[test]
     fn selects_modern_cpu_core_temps() {
+        // Single-die: 4E (Tex) + 10P (Tp1 4 cores + Tp2 6 cores)
         let mut temps = vec![
             cpu_sensor("Tex2", 42.0),
             cpu_sensor("Tex0", 40.0),
@@ -3165,34 +3486,34 @@ mod tests {
             cpu_sensor("Tex1", 41.0),
         ];
 
-        for (idx, base) in [50.0, 55.0, 60.0, 65.0].into_iter().enumerate() {
-            temps.push(cpu_sensor(&format!("Tp1{}a", idx), base - 10.0));
-            temps.push(cpu_sensor(&format!("Tp1{}b", idx), base - 5.0));
-            temps.push(cpu_sensor(&format!("Tp1{}c", idx), base));
+        for (i, base) in [50.0, 55.0, 60.0, 65.0].into_iter().enumerate() {
+            temps.extend(make_triplet("Tp1", i, base));
         }
-        for (idx, base) in [70.0, 71.0, 72.0, 73.0, 74.0, 75.0].into_iter().enumerate() {
-            temps.push(cpu_sensor(&format!("Tp2{}a", idx), base - 10.0));
-            temps.push(cpu_sensor(&format!("Tp2{}b", idx), base - 5.0));
-            temps.push(cpu_sensor(&format!("Tp2{}c", idx), base));
+        for (i, base) in [70.0, 71.0, 72.0, 73.0, 74.0, 75.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp2", i, base));
         }
 
         let (e_temps, p_temps) = selected_cpu_core_temps(&temps, 4, 10);
-        assert_eq!(e_temps, vec![40.0, 41.0, 42.0, 43.0]);
+        assert_eq!(vals(&e_temps), vec![40.0, 41.0, 42.0, 43.0]);
         assert_eq!(
-            p_temps,
+            vals(&p_temps),
             vec![50.0, 55.0, 60.0, 65.0, 70.0, 71.0, 72.0, 73.0, 74.0, 75.0]
         );
     }
 
     #[test]
     fn falls_back_to_legacy_tp0_mapping() {
+        // M1-era: 14 individual Tp0 keys (1 reading per core, no triplets)
         let temps: Vec<_> = (0..14)
-            .map(|idx| cpu_sensor(&format!("Tp0{idx:02}"), 35.0 + idx as f32))
+            .map(|idx| cpu_sensor(&format!("Tp0{}", b62(idx)), 35.0 + idx as f32))
             .collect();
         let (e_temps, p_temps) = selected_cpu_core_temps(&temps, 4, 10);
-        assert_eq!(e_temps, vec![35.0, 36.0, 37.0, 38.0]);
+        assert_eq!(vals(&e_temps), vec![35.0, 36.0, 37.0, 38.0]);
         assert_eq!(
-            p_temps,
+            vals(&p_temps),
             vec![39.0, 40.0, 41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 48.0]
         );
     }
@@ -3200,10 +3521,163 @@ mod tests {
     #[test]
     fn ignores_flat_placeholder_tp0_bank() {
         let temps: Vec<_> = (0..40)
-            .map(|idx| cpu_sensor(&format!("Tp0{idx:02}"), 40.0))
+            .map(|idx| cpu_sensor(&format!("Tp0{}", b62(idx)), 40.0))
             .collect();
         let (e_temps, p_temps) = selected_cpu_core_temps(&temps, 4, 10);
         assert!(e_temps.is_empty());
         assert!(p_temps.is_empty());
+    }
+
+    #[test]
+    fn selects_m3_ultra_dual_die_temps() {
+        // M3 Ultra: 2 dies × (4E + 12P) = 8E + 24P
+        // Te0 = die 0 E-cores (4 groups), Te5 = die 1 E-cores (4 groups)
+        // Tp1+Tp2 = die 0 (16 groups = 4E + 12P)
+        // Tp6+Tp7 = die 1 (16 groups = 4E + 12P)
+        let mut temps = Vec::new();
+
+        // Te0: 4 E-core groups for die 0 (using triplet starts 0,1,2,3)
+        for (core, base) in [40.0, 41.0, 42.0, 43.0].into_iter().enumerate() {
+            temps.extend(make_triplet("Te0", core, base));
+        }
+        // Te5: 4 E-core groups for die 1
+        for (core, base) in [38.0, 39.0, 40.0, 41.0].into_iter().enumerate() {
+            temps.extend(make_triplet("Te5", core, base));
+        }
+
+        // Tp1: 7 groups for die 0 (bank offset 1)
+        for (i, base) in [50.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp1", i, base));
+        }
+        // Tp2: 9 groups for die 0 (bank offset 2)
+        for (i, base) in [60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp2", i, base));
+        }
+        // Tp6: 7 groups for die 1 (bank offset 1)
+        for (i, base) in [48.0, 49.0, 50.0, 51.0, 52.0, 53.0, 54.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp6", i, base));
+        }
+        // Tp7: 9 groups for die 1 (bank offset 2)
+        for (i, base) in [58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp7", i, base));
+        }
+
+        let (e_temps, p_temps) = selected_cpu_core_temps(&temps, 8, 24);
+
+        assert_eq!(vals(&e_temps), vec![40.0, 41.0, 42.0, 43.0, 38.0, 39.0, 40.0, 41.0]);
+
+        assert_eq!(p_temps.len(), 24);
+        assert_eq!(
+            &vals(&p_temps)[..12],
+            &[54.0, 55.0, 56.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0]
+        );
+        assert_eq!(
+            &vals(&p_temps)[12..],
+            &[52.0, 53.0, 54.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0]
+        );
+    }
+
+    #[test]
+    fn handles_partial_sensor_loss() {
+        // M3 Ultra with one sensor missing from Tp6 bank (die 1, P-cluster 0).
+        // Should still produce temps for all available cores (just one fewer).
+        let mut temps = Vec::new();
+
+        // Te0 + Te5: full E-core sensors (4 groups each)
+        for (core, base) in [40.0, 41.0, 42.0, 43.0].into_iter().enumerate() {
+            temps.extend(make_triplet("Te0", core, base));
+        }
+        for (core, base) in [38.0, 39.0, 40.0, 41.0].into_iter().enumerate() {
+            temps.extend(make_triplet("Te5", core, base));
+        }
+
+        // Tp1: 7 full triplets for die 0
+        for (i, base) in [50.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp1", i, base));
+        }
+        // Tp2: 9 full triplets for die 0
+        for (i, base) in [60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp2", i, base));
+        }
+
+        // Tp6: only 6 triplets for die 1 (one sensor group lost!)
+        for (i, base) in [48.0, 49.0, 50.0, 51.0, 52.0, 53.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp6", i, base));
+        }
+        // Tp7: 9 full triplets for die 1
+        for (i, base) in [58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0]
+            .into_iter()
+            .enumerate()
+        {
+            temps.extend(make_triplet("Tp7", i, base));
+        }
+
+        let (e_temps, p_temps) = selected_cpu_core_temps(&temps, 8, 24);
+
+        // E-cores still fully available (Te banks unaffected)
+        assert_eq!(e_temps.len(), 8);
+        assert_eq!(vals(&e_temps), vec![40.0, 41.0, 42.0, 43.0, 38.0, 39.0, 40.0, 41.0]);
+
+        assert_eq!(p_temps.len(), 23);
+        assert_eq!(
+            &vals(&p_temps)[..12],
+            &[54.0, 55.0, 56.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0]
+        );
+        assert_eq!(p_temps.len() - 12, 11);
+    }
+
+    #[test]
+    fn selects_m5_max_primary_bank_no_te() {
+        // M5 Max: 12E + 6P, single die, NO Te keys at all.
+        // Tp0 has 18 keys (1 per core, all with gaps > 1 in base-62).
+        // Tp1 has 5 secondary sensors (fewer than p_per_die=6).
+        // The algorithm should use Tp0 as primary bank for ALL cores.
+        let mut temps = Vec::new();
+
+        // Tp0: 18 individual keys (spaced in base-62, no triplets)
+        // Suffixes: 0, 4, 8, C, G, K, O, R, U, X, a, d, g, j, m, p, u, y
+        let tp0_suffixes = [
+            '0', '4', '8', 'C', 'G', 'K', 'O', 'R', 'U', 'X', 'a', 'd', 'g', 'j', 'm', 'p',
+            'u', 'y',
+        ];
+        for (i, &suffix) in tp0_suffixes.iter().enumerate() {
+            let temp = 50.0 + i as f32;
+            temps.push(cpu_sensor(&format!("Tp0{}", suffix), temp));
+        }
+
+        // Tp1: 5 secondary sensors (summary/aggregate, not per-core)
+        for (i, &suffix) in ['E', 'I', 'Q', 'U', 'g'].iter().enumerate() {
+            temps.push(cpu_sensor(&format!("Tp1{}", suffix), 40.0 + i as f32));
+        }
+
+        let (e_temps, p_temps) = selected_cpu_core_temps(&temps, 12, 6);
+
+        // E-temps: first 12 from Tp0 primary bank
+        assert_eq!(e_temps.len(), 12);
+        assert_eq!(vals(&e_temps), (50..62).map(|i| i as f32).collect::<Vec<_>>());
+
+        assert_eq!(p_temps.len(), 6);
+        assert_eq!(vals(&p_temps), (62..68).map(|i| i as f32).collect::<Vec<_>>());
     }
 }

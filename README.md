@@ -12,6 +12,26 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
   <img src="./screenshot.png" width="75%" alt="macpow screenshot">
 </p>
 
+### Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| `0.123 W` | Measured power (direct hardware reading) |
+| `≈0.123 W` | Estimated power (model-based calculation) |
+| `≤0.123 W` | Upper-bound power estimate |
+| `▸` | Pinned resource (sparkline chart visible) |
+| `▓▓▓░░░░░░░` | CPU core utilization bar (filled = busy) |
+| `37°C` | Fresh temperature reading |
+| `~37°C` | Stale temperature (sensor read failed, showing last known value) |
+| `pending…` | Data source still initializing |
+| `[dead]` | Process has exited (energy total preserved) |
+| **Bold white** | Section headers and measured values |
+| <span style="color:green">Green</span> | Low power (< 1W) or info-only rows |
+| <span style="color:goldenrod">Yellow</span> | Moderate power (1–5W) |
+| <span style="color:orange">Orange</span> | High power (5–10W) |
+| <span style="color:red">Red</span> | Very high power (> 10W) |
+| Gray | Dimmed/inactive items |
+
 **macpow** reads directly from macOS hardware interfaces — IOReport, SMC, IORegistry, CoreAudio, and Mach/kernel APIs — to show per-component power draw, temperatures, frequencies, CPU utilization, and per-process energy attribution. No sudo required.
 
 ## Features
@@ -19,7 +39,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **SoC breakdown** — CPU (E/P cores with per-core power, utilization bars, temperatures), GPU, ANE, DRAM, GPU SRAM, Media Engine, Camera (ISP), Fabric — all from IOReport Energy Model
 - **CPU utilization** — per-core usage % with visual bars from Mach `host_processor_info`
 - **Real frequencies** — CPU and GPU MHz from DVFS voltage-states tables, not percentages
-- **Temperatures** — per-component and per-core from SMC sensors (CPU, GPU, ANE, DRAM, SSD, Battery); adaptive key mapping for M1–M3 (`Tp0*`) and M4+ (`Tex*`/`Tp1*`/`Tp2*`)
+- **Temperatures** — per-component and per-core from SMC sensors (CPU, GPU, ANE, DRAM, SSD, Battery); universal bank-based key mapping for all Apple Silicon generations (M1–M5+, including Ultra dual-die); stale value caching with `~` indicator when sensors temporarily read invalid
 - **Memory** — used/total GB via `host_statistics64` Mach API
 - **Display** — brightness estimate + IOReport SoC display controller; external display power via IOReport DISPEXT
 - **Keyboard** — backlight brightness and estimated power via IORegistry PWM
