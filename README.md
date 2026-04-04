@@ -228,6 +228,31 @@ git push origin update-macpow-X.Y.Z
 # publish.yml will upload bottles and merge the PR
 ```
 
+## Contributing
+
+Before submitting a PR, please run:
+
+```bash
+cargo fmt --check          # code formatting
+cargo clippy --release     # lint warnings
+cargo test                 # unit + integration tests
+cargo build --release      # final build check
+```
+
+All four must pass with zero errors and zero warnings in your changed files.
+
+### Collecting diagnostics
+
+If per-core temperatures are missing or incorrect on your Mac, please open an issue with:
+
+```bash
+macpow --dump > dump.txt                       # IOReport channel names
+macpow --json > metrics.json                   # full metrics (Ctrl+C after ~15s)
+system_profiler SPHardwareDataType | head -10   # chip model
+```
+
+This helps add support for new Apple Silicon variants.
+
 ## License
 
 [MIT](LICENSE)
