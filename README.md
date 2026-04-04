@@ -12,6 +12,8 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
   <img src="./screenshot.png" width="75%" alt="macpow screenshot">
 </p>
 
+**macpow** reads directly from macOS hardware interfaces — IOReport, SMC, IORegistry, CoreAudio, and Mach/kernel APIs — to show per-component power draw, temperatures, frequencies, CPU utilization, and per-process energy attribution. No sudo required.
+
 ### Legend
 
 | Symbol | Meaning |
@@ -31,8 +33,6 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 | <span style="color:orange">Orange</span> | High power (5–10W) |
 | <span style="color:red">Red</span> | Very high power (> 10W) |
 | Gray | Dimmed/inactive items |
-
-**macpow** reads directly from macOS hardware interfaces — IOReport, SMC, IORegistry, CoreAudio, and Mach/kernel APIs — to show per-component power draw, temperatures, frequencies, CPU utilization, and per-process energy attribution. No sudo required.
 
 ## Features
 
