@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/k06a/macpow/actions/workflows/ci.yml/badge.svg)](https://github.com/k06a/macpow/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/macpow)](https://crates.io/crates/macpow)
-[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.15-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
+[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.16-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](https://github.com/k06a/macpow)
 
@@ -207,7 +207,8 @@ vim Cargo.toml                        # update version = "X.Y.Z"
 # 2. Build and verify
 cargo build --release
 cargo fmt --check                     # formatting clean
-cargo clippy --release                # no new warnings in bin
+# Clippy: same flags as .github/workflows/ci.yml (plain `cargo clippy -D warnings` is stricter and fails)
+cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
 cargo test                            # all tests pass
 
 # 3. Update Homebrew badge in README.md
@@ -242,12 +243,13 @@ Before submitting a PR, please run:
 
 ```bash
 cargo fmt --check          # code formatting
-cargo clippy --release     # lint warnings
+# Clippy: must match CI (see .github/workflows/ci.yml)
+cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
 cargo test                 # unit + integration tests
 cargo build --release      # final build check
 ```
 
-All four must pass with zero errors and zero warnings in your changed files.
+All four must pass with zero errors. Clippy needs the flags above so local runs match CI; without them, stable Clippy may report project-wide warnings that CI intentionally allows (FFI / Objective-C style).
 
 ### Collecting diagnostics
 
