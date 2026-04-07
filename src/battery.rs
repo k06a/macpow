@@ -52,8 +52,18 @@ unsafe fn read_battery_inner() -> Option<BatteryInfo> {
     let design_capacity_mah = cf_utils::cfdict_get_f64(dict, "DesignCapacity").unwrap_or(0.0);
     let max_capacity_mah =
         cf_utils::cfdict_get_f64(dict, "AppleRawMaxCapacity").unwrap_or(design_capacity_mah);
+
     let health_pct = if design_capacity_mah > 0.0 {
-        max_capacity_mah / design_capacity_mah * 100.0
+        if let Some(battery_data) = cf_utils::cfdict_get_dict(dict, "BatteryData") {
+            let fcc_comp1 = cf_utils::cfdict_get_f64(battery_data, "FccComp1").unwrap_or(0.0);
+            if fcc_comp1 > 0.0 {
+                fcc_comp1 / design_capacity_mah * 100.0
+            } else {
+                max_capacity_mah / design_capacity_mah * 100.0
+            }
+        } else {
+            max_capacity_mah / design_capacity_mah * 100.0
+        }
     } else {
         100.0
     };
