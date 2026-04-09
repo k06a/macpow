@@ -138,9 +138,18 @@ o.objc_getClass.restype=ctypes.c_void_p;o.objc_getClass.argtypes=[ctypes.c_char_
 o.sel_registerName.restype=ctypes.c_void_p;o.sel_registerName.argtypes=[ctypes.c_char_p]
 m=ctypes.CFUNCTYPE(ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p)(ctypes.cast(o.objc_msgSend,ctypes.c_void_p).value)
 f=ctypes.CFUNCTYPE(ctypes.c_double,ctypes.c_void_p,ctypes.c_void_p)(ctypes.cast(o.objc_msgSend,ctypes.c_void_p).value)
-m(o.objc_getClass(b'NSApplication'),o.sel_registerName(b'sharedApplication'))
-s=m(o.objc_getClass(b'NSScreen'),o.sel_registerName(b'mainScreen'))
-print(f(s,o.sel_registerName(b'maximumPotentialExtendedDynamicRangeColorComponentValue')))
+screen_cls=o.objc_getClass(b'NSScreen')
+# Avoid sharedApplication: creating NSApplication makes the subprocess a GUI app
+# and causes Dock flashing when this probe runs periodically.
+s=m(screen_cls,o.sel_registerName(b'mainScreen'))
+if not s:
+    screens=m(screen_cls,o.sel_registerName(b'screens'))
+    if screens:
+        s=m(screens,o.sel_registerName(b'firstObject'))
+if s:
+    print(f(s,o.sel_registerName(b'maximumPotentialExtendedDynamicRangeColorComponentValue')))
+else:
+    print(1.0)
 "#,
         ],
         Duration::from_millis(1000),
