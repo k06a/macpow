@@ -131,10 +131,8 @@ fn parse_cpu_stats_core_key(name: &str) -> Option<CpuCoreKey> {
         (CpuKind::Efficiency, rest)
     } else if let Some(rest) = name.strip_prefix("MCPU") {
         (CpuKind::Efficiency, rest)
-    } else if let Some(rest) = name.strip_prefix("PCPU") {
-        (CpuKind::Performance, rest)
     } else {
-        return None;
+        (CpuKind::Performance, name.strip_prefix("PCPU")?)
     };
 
     // Digit-suffix format: ECPU0, PCPU10 (single-die M1/M2/M3/M4)

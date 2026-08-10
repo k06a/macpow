@@ -450,8 +450,20 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
         &["-g", "accps"],
         std::time::Duration::from_millis(1000),
     ) {
-        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Some(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
+    };
+
+    parse_bluetooth_devices(&output)
+}
+
+fn parse_bluetooth_devices(output: &[u8]) -> Vec<BluetoothDevice> {
+    let output = match std::str::from_utf8(output) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => {
+            let (text, _, _) = encoding_rs::MACINTOSH.decode(output);
+            text
+        }
     };
 
     struct Entry {
@@ -556,4 +568,32 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
     }
 
     devices
+}
+
+#[cfg(test)]
+mod bluetooth_tests {
+    use super::parse_bluetooth_devices;
+
+    #[test]
+    fn parses_mac_roman_bluetooth_device_names_without_replacement_chars() {
+        let output = b"Now drawing from 'AC Power'\n\
+ -Sample\xD5s Magic Keyboard (id=58458112)\t97%; discharging present: true\n";
+
+        let devices = parse_bluetooth_devices(output);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Sample\u{2019}s Magic Keyboard");
+        assert!(!devices[0].name.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn preserves_utf8_bluetooth_device_names() {
+        let output = "Now drawing from 'AC Power'\n\
+ -Sample’s Keyboard (id=58458112)\t97%; discharging present: true\n";
+
+        let devices = parse_bluetooth_devices(output.as_bytes());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Sample’s Keyboard");
+    }
 }
