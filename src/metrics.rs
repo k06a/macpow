@@ -1116,14 +1116,17 @@ impl Sampler {
                     return;
                 };
                 let mut prev = ior.sample().ok();
+                let mut stall = crate::types::StallDetector::default();
                 while running.load(Ordering::Relaxed) {
                     std::thread::sleep(dt);
                     if let Ok(cur) = ior.sample() {
                         let backlight = ior.parse_backlight(&cur);
                         if let Some(ref p) = prev {
                             if let Ok(soc) = ior.parse_power(p, &cur) {
+                                let stalled = stall.update(&soc, dt.as_millis() as u64);
                                 if let Ok(mut mg) = m.lock() {
                                     mg.soc = soc;
+                                    mg.energy_counters_stalled = stalled;
                                     let dpb = backlight.dpb_factor();
                                     mg.display.dpb_factor = dpb;
                                     // Treat anything materially above 1.0 as

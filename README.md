@@ -117,6 +117,21 @@ macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 
 All letter keys work on any keyboard layout (QWERTY, Russian, Dvorak, etc).
 
+## Troubleshooting
+
+### CPU / DRAM / ANE show 0.000 W (macOS 27)
+
+If only the GPU shows power and the footer says "SoC energy counters stalled",
+the IOReport Energy Model counters are not being refreshed by macOS. On at
+least one M5 Pro running macOS 27 they advance only while a privileged sampler
+is running. macpow cannot fix this itself. Workaround:
+
+```
+sudo powermetrics --samplers cpu_power -i 1000 > /dev/null &
+macpow
+# when finished: sudo pkill powermetrics
+```
+
 ## Architecture
 
 Each data source runs in its own thread, updating shared metrics at its own pace. The TUI renders at the configured interval without blocking on slow sources.
