@@ -308,7 +308,6 @@ pub struct ProcessPower {
     pub net_tx_bytes: u64,
 }
 
-
 /// Detects IOReport Energy Model counters that have stopped updating.
 ///
 /// CPU, DRAM and fabric power can never all be exactly 0 W on a running Mac,
