@@ -36,6 +36,12 @@ pub struct Metrics {
     pub mem_used_gb: f32,
     pub cpu_usage_pct: Vec<f32>,
     pub ssd_model: String,
+    /// True when the IOReport Energy Model counters for CPU, DRAM and fabric
+    /// have produced exactly zero power for several seconds in a row. On a
+    /// running Mac that is not physically possible, so it means the counters
+    /// are not being refreshed (observed on macOS 27 unless a privileged
+    /// sampler such as `powermetrics` is running).
+    pub energy_counters_stalled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -300,4 +306,70 @@ pub struct ProcessPower {
     pub phys_mem_bytes: u64,
     pub net_rx_bytes: u64,
     pub net_tx_bytes: u64,
+}
+
+/// Detects IOReport Energy Model counters that have stopped updating.
+///
+/// CPU, DRAM and fabric power can never all be exactly 0 W on a running Mac,
+/// so zero for `STALL_AFTER_MS` of consecutive samples means the counters are
+/// stale rather than the machine being idle.
+#[derive(Debug, Default)]
+pub struct StallDetector {
+    zero_ms: u64,
+}
+
+impl StallDetector {
+    pub const STALL_AFTER_MS: u64 = 4000;
+
+    /// Feed one delta sample covering `dt_ms`; returns true while stalled.
+    pub fn update(&mut self, soc: &SocPower, dt_ms: u64) -> bool {
+        if soc.cpu_w <= 0.0 && soc.dram_w <= 0.0 && soc.fabric_w <= 0.0 {
+            self.zero_ms = self.zero_ms.saturating_add(dt_ms);
+        } else {
+            self.zero_ms = 0;
+        }
+        self.zero_ms >= Self::STALL_AFTER_MS
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    fn soc(cpu: f32, dram: f32, fabric: f32) -> SocPower {
+        SocPower {
+            cpu_w: cpu,
+            dram_w: dram,
+            fabric_w: fabric,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn flags_only_after_sustained_zero() {
+        let mut d = StallDetector::default();
+        assert!(!d.update(&soc(0.0, 0.0, 0.0), 250));
+        for _ in 0..14 {
+            assert!(!d.update(&soc(0.0, 0.0, 0.0), 250));
+        }
+        assert!(d.update(&soc(0.0, 0.0, 0.0), 250)); // 16 x 250 ms = 4 s
+    }
+
+    #[test]
+    fn any_live_reading_resets() {
+        let mut d = StallDetector::default();
+        for _ in 0..20 {
+            d.update(&soc(0.0, 0.0, 0.0), 250);
+        }
+        assert!(!d.update(&soc(0.4, 0.0, 0.0), 250));
+        assert!(!d.update(&soc(0.0, 0.0, 0.0), 250));
+    }
+
+    #[test]
+    fn healthy_machine_never_flags() {
+        let mut d = StallDetector::default();
+        for _ in 0..100 {
+            assert!(!d.update(&soc(0.4, 0.1, 0.2), 250));
+        }
+    }
 }
