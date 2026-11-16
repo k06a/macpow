@@ -326,6 +326,16 @@ impl TreeRow {
         }
     }
 
+    fn without_power_if(mut self, unavailable: bool) -> Self {
+        if unavailable {
+            self.current = "N/A".to_string();
+            self.total.clear();
+            self.label_style = Style::default();
+            self.current_style = DIM;
+        }
+        self
+    }
+
     fn has_children_in(&self, rows: &[TreeRow]) -> bool {
         self.key
             .map(|k| rows.iter().any(|r| r.parent == Some(k)))
@@ -442,8 +452,10 @@ impl MetricsSma {
     fn push_metrics(&mut self, m: &Metrics) {
         self.soc_total.push(m.soc.total_w);
         self.cpu.push(m.soc.cpu_w);
-        self.ecpu.push(m.soc.ecpu_total_w());
-        self.pcpu.push(m.soc.pcpu_total_w());
+        if !m.soc.cpu_breakdown_unavailable {
+            self.ecpu.push(m.soc.ecpu_total_w());
+            self.pcpu.push(m.soc.pcpu_total_w());
+        }
         self.gpu.push(m.soc.gpu_w);
         self.ane.push(m.soc.ane_w);
         self.dram.push(m.soc.dram_w);
@@ -628,8 +640,10 @@ impl App {
         if let Some(prev) = self.last_tick {
             let dt_h = prev.elapsed().as_secs_f64() / 3600.0;
             let dt_s = prev.elapsed().as_secs_f64();
-            self.wh.ecpu += m.soc.ecpu_total_w() as f64 * dt_h;
-            self.wh.pcpu += m.soc.pcpu_total_w() as f64 * dt_h;
+            if !m.soc.cpu_breakdown_unavailable {
+                self.wh.ecpu += m.soc.ecpu_total_w() as f64 * dt_h;
+                self.wh.pcpu += m.soc.pcpu_total_w() as f64 * dt_h;
+            }
             self.wh.cpu += m.soc.cpu_w as f64 * dt_h;
             self.wh.gpu += m.soc.gpu_w as f64 * dt_h;
             self.wh.ane += m.soc.ane_w as f64 * dt_h;
@@ -708,21 +722,23 @@ impl App {
 
         self.push_history("soc", m.soc.total_w as f64);
         self.push_history("cpu", m.soc.cpu_w as f64);
-        self.push_history("ecpu", m.soc.ecpu_total_w() as f64);
-        for (ci, core) in m
-            .soc
-            .ecpu_clusters
-            .iter()
-            .flat_map(|cl| cl.cores.iter())
-            .enumerate()
-        {
-            let key = proc_key(&mut self.proc_keys, -(ci as i32 + 1000));
-            self.push_history(key, core.watts as f64);
-        }
-        self.push_history("pcpu", m.soc.pcpu_total_w() as f64);
-        for (ci, core) in m.soc.pcpu_cluster.cores.iter().enumerate() {
-            let key = proc_key(&mut self.proc_keys, -(ci as i32 + 2000));
-            self.push_history(key, core.watts as f64);
+        if !m.soc.cpu_breakdown_unavailable {
+            self.push_history("ecpu", m.soc.ecpu_total_w() as f64);
+            for (ci, core) in m
+                .soc
+                .ecpu_clusters
+                .iter()
+                .flat_map(|cl| cl.cores.iter())
+                .enumerate()
+            {
+                let key = proc_key(&mut self.proc_keys, -(ci as i32 + 1000));
+                self.push_history(key, core.watts as f64);
+            }
+            self.push_history("pcpu", m.soc.pcpu_total_w() as f64);
+            for (ci, core) in m.soc.pcpu_cluster.cores.iter().enumerate() {
+                let key = proc_key(&mut self.proc_keys, -(ci as i32 + 2000));
+                self.push_history(key, core.watts as f64);
+            }
         }
         self.push_history("gpu", m.soc.gpu_w as f64);
         self.push_history("ane", m.soc.ane_w as f64);
@@ -1124,7 +1140,7 @@ impl App {
 
         self.draw_tree_buf(f, chunks[0], &rows, &all_rows);
         if !chart_keys.is_empty() {
-            self.draw_charts(f, chunks[1], &chart_keys);
+            self.draw_charts(f, chunks[1], &chart_keys, &all_rows);
         }
         self.draw_footer(f, chunks[2]);
     }
@@ -1451,18 +1467,21 @@ impl App {
                 format!("{:.0}°C ({:.0}–{:.0})", avg, min, max)
             };
 
-            rows.push(TreeRow::pw_full(
-                "ecpu",
-                Some("cpu"),
-                &format!("{}│  ├─ ", cp),
-                &format!("E-Cores ({} cores, {:.0}%)", e_count, e_avg_usage),
-                s.ecpu.get(),
-                w.ecpu,
-                &fmt_freq(s.ecpu_freq.get()),
-                &e_avg_temp,
-                Style::default(),
-                pin("ecpu"),
-            ));
+            rows.push(
+                TreeRow::pw_full(
+                    "ecpu",
+                    Some("cpu"),
+                    &format!("{}│  ├─ ", cp),
+                    &format!("E-Cores ({} cores, {:.0}%)", e_count, e_avg_usage),
+                    s.ecpu.get(),
+                    w.ecpu,
+                    &fmt_freq(s.ecpu_freq.get()),
+                    &e_avg_temp,
+                    Style::default(),
+                    pin("ecpu"),
+                )
+                .without_power_if(m.soc.cpu_breakdown_unavailable),
+            );
 
             // Per E-core rows (collapsed by default)
             {
@@ -1495,32 +1514,38 @@ impl App {
                         .get(ci)
                         .map(|u| format!(" ({:>3.0}%) {}", u, usage_bar(*u)))
                         .unwrap_or_default();
-                    rows.push(TreeRow::pw_full(
-                        key,
-                        Some("ecpu"),
-                        &pfx,
-                        &format!("{:<10}{}", core.name, usage),
-                        core.watts,
-                        0.0,
-                        "",
-                        &temp,
-                        Style::default(),
-                        pin(key),
-                    ));
+                    rows.push(
+                        TreeRow::pw_full(
+                            key,
+                            Some("ecpu"),
+                            &pfx,
+                            &format!("{:<10}{}", core.name, usage),
+                            core.watts,
+                            0.0,
+                            "",
+                            &temp,
+                            Style::default(),
+                            pin(key),
+                        )
+                        .without_power_if(m.soc.cpu_breakdown_unavailable),
+                    );
                 }
             }
-            rows.push(TreeRow::pw_full(
-                "pcpu",
-                Some("cpu"),
-                &format!("{}│  └─ ", cp),
-                &format!("P-Cores ({} cores, {:.0}%)", p_count, p_avg_usage),
-                s.pcpu.get(),
-                w.pcpu,
-                &fmt_freq(s.pcpu_freq.get()),
-                &p_avg_temp,
-                Style::default(),
-                pin("pcpu"),
-            ));
+            rows.push(
+                TreeRow::pw_full(
+                    "pcpu",
+                    Some("cpu"),
+                    &format!("{}│  └─ ", cp),
+                    &format!("P-Cores ({} cores, {:.0}%)", p_count, p_avg_usage),
+                    s.pcpu.get(),
+                    w.pcpu,
+                    &fmt_freq(s.pcpu_freq.get()),
+                    &p_avg_temp,
+                    Style::default(),
+                    pin("pcpu"),
+                )
+                .without_power_if(m.soc.cpu_breakdown_unavailable),
+            );
             // Per P-core rows (collapsed by default)
             {
                 let pcpu_cont = format!("{}│     ", cp);
@@ -1545,18 +1570,21 @@ impl App {
                         .get(ci)
                         .map(|u| format!(" ({:>3.0}%) {}", u, usage_bar(*u)))
                         .unwrap_or_default();
-                    rows.push(TreeRow::pw_full(
-                        key,
-                        Some("pcpu"),
-                        &pfx,
-                        &format!("{:<10}{}", core.name, usage),
-                        core.watts,
-                        0.0,
-                        "",
-                        &temp,
-                        Style::default(),
-                        pin(key),
-                    ));
+                    rows.push(
+                        TreeRow::pw_full(
+                            key,
+                            Some("pcpu"),
+                            &pfx,
+                            &format!("{:<10}{}", core.name, usage),
+                            core.watts,
+                            0.0,
+                            "",
+                            &temp,
+                            Style::default(),
+                            pin(key),
+                        )
+                        .without_power_if(m.soc.cpu_breakdown_unavailable),
+                    );
                 }
             }
             let gpu_util = m.soc.gpu_util_device;
@@ -2726,7 +2754,7 @@ impl App {
             }
 
             // Inline sparkline column (1-char height, block chars)
-            if spark_w > 0 {
+            if spark_w > 0 && row.current != "N/A" {
                 if let Some(key) = row.key {
                     if let Some(hist) = self.history.get(key) {
                         let w = spark_w as usize;
@@ -2789,7 +2817,7 @@ impl App {
         f.render_widget(block, area);
     }
 
-    fn draw_charts(&self, f: &mut Frame, area: Rect, keys: &[&'static str]) {
+    fn draw_charts(&self, f: &mut Frame, area: Rect, keys: &[&'static str], rows: &[TreeRow]) {
         if keys.is_empty() || area.height == 0 {
             return;
         }
@@ -2807,7 +2835,14 @@ impl App {
             if i >= chunks.len() {
                 break;
             }
-            let data = self.history.get(key);
+            let unavailable = rows
+                .iter()
+                .any(|row| row.key == Some(key) && row.current == "N/A");
+            let data = if unavailable {
+                None
+            } else {
+                self.history.get(key)
+            };
             let current = data.and_then(|b| b.back().copied()).unwrap_or(0.0);
 
             let is_pinned = self.pinned.contains(&key);
@@ -2876,7 +2911,9 @@ impl App {
                 .collect();
             f.render_widget(Paragraph::new(scale_lines), inner[0]);
 
-            let title_value = if is_data {
+            let title_value = if unavailable {
+                "N/A".to_string()
+            } else if is_data {
                 human_rate(current)
             } else if current.abs() < 0.1 && current.abs() > 0.0 {
                 format!("{:.1} mW", current * 1000.0)

@@ -13,6 +13,7 @@ extern "C" {
     ) -> i32;
     pub fn IOIteratorNext(iterator: u32) -> u32;
     pub fn IORegistryEntryGetName(entry: u32, name: *mut i8) -> i32;
+    pub fn IORegistryEntryGetRegistryEntryID(entry: u32, id: *mut u64) -> i32;
     pub fn IORegistryEntryCreateCFProperties(
         entry: u32,
         properties: *mut CFMutableDictionaryRef,

@@ -32,6 +32,10 @@ struct CliArgs {
     #[arg(long)]
     dump: bool,
 
+    /// Check whether each CPU core's energy counter updates over three seconds
+    #[arg(long, conflicts_with_all = ["dump", "dump_smc", "json"])]
+    check_cpu_cores: bool,
+
     /// Dump every SMC key (name, type, decoded value, raw bytes) and exit.
     /// Output mirrors `iSMC raw` format for cross-reference. Useful for triaging
     /// power readings on new hardware (see GitHub issue #12).
@@ -43,6 +47,10 @@ fn main() -> Result<()> {
     let args = CliArgs::parse();
     let interval = args.interval;
     let json_mode = args.json;
+
+    if args.check_cpu_cores {
+        return macpow::ioreport::IOReportSampler::new()?.check_cpu_core_counters();
+    }
 
     if args.dump {
         match macpow::ioreport::IOReportSampler::new() {
