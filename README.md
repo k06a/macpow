@@ -12,7 +12,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
   <img src="./screenshot.png" width="75%" alt="macpow screenshot">
 </p>
 
-**macpow** reads directly from macOS hardware interfaces — IOReport, SMC, IORegistry, CoreAudio, and Mach/kernel APIs — to show per-component power draw, temperatures, frequencies, CPU utilization, and per-process energy attribution. No sudo required.
+**macpow** reads directly from macOS hardware interfaces — IOReport, SMC, IORegistry, CoreAudio, and Mach/kernel APIs — to show per-component power draw, temperatures, frequencies, CPU utilization, and per-process energy attribution. macpow itself runs as a regular user.
 
 ### Legend
 
@@ -54,7 +54,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **Latency control** — toggle UI refresh rate: 500ms / 2s / 5s
 - **Mouse support** — click to select rows
 - **JSON mode** — pipe structured data for scripts and dashboards
-- **No sudo** — runs entirely with user-level permissions
+- **Per-core power on affected macOS 27 Macs** — the interactive UI can start Apple's power sampler with your approval
 
 ## Install
 
@@ -92,9 +92,11 @@ pixi exec macpow
 
 ```
 macpow                    # TUI mode (default)
+macpow --no-powermetrics  # Open the TUI without starting Apple's sampler
 macpow --json             # JSON output to stdout
 macpow --interval 500     # Set sampling interval in ms (default: 250)
 macpow --dump             # Dump IOReport channel names (diagnostics)
+macpow --check-cpu-cores  # Check each CPU core's energy counter over three seconds
 macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 ```
 
@@ -293,6 +295,32 @@ system_profiler SPHardwareDataType | head -10   # chip model
 ```
 
 This helps add support for new Apple Silicon variants.
+
+On macOS 27, some machines stop updating the IOReport CPU energy counters
+([#20](https://github.com/k06a/macpow/issues/20)). On systems with the
+`AppleT6050CLPC` driver, macpow reads aggregate CPU power from AppleCLPC without
+`sudo`. For per-core and cluster power, macpow uses Apple's Energy Model when
+those counters update. If they are stalled, interactive `macpow` starts Apple's
+`powermetrics` through `sudo` before opening the UI. Approve the terminal prompt
+if asked. macpow runs as a regular user and the sampler it starts exits with it.
+Run `macpow --no-powermetrics` to skip the automatic start.
+
+JSON and diagnostic commands do not start a sampler. To refresh their per-core
+readings, you can run the following in another terminal tab:
+
+```sh
+sudo /usr/bin/powermetrics --samplers cpu_power -i 250 -o /dev/null
+```
+
+Press Ctrl+C in that tab to stop the manual sampler. When the Energy Model
+stops updating, the TUI shows `N/A` for the cluster and core power. In JSON,
+`soc.cpu_breakdown_unavailable` is `true` and the corresponding wattage fields
+contain numeric zeros for compatibility.
+Run `macpow --check-cpu-cores` during a CPU workload to check each named core
+counter directly. The diagnostic averages power between observed updates and
+skips the first increase, which can contain energy from before the test.
+Counters with fewer than two updates show `N/A`. An idle core can also have
+an unchanged counter.
 
 ## License
 

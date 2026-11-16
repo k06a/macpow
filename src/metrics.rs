@@ -526,8 +526,11 @@ fn read_pwm_table(dict: CFDictionaryRef, total_period: f64) -> Vec<f32> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let raw: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_le_bytes)
         .collect();
 
     let max_raw = raw.iter().copied().max().unwrap_or(0);

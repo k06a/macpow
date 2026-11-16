@@ -54,6 +54,9 @@ pub struct CpuCore {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SocPower {
     pub cpu_w: f32,
+    /// True if the cluster and core totals could not be read. Their numeric
+    /// wattage fields are zero in that case.
+    pub cpu_breakdown_unavailable: bool,
     pub ecpu_clusters: Vec<CpuCluster>,
     pub pcpu_cluster: CpuCluster,
     pub gpu_w: f32,

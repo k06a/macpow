@@ -1,16 +1,28 @@
 use crate::cf_utils;
+use crate::iokit_ffi::{
+    IOObjectRelease, IORegistryEntryCreateCFProperties, IORegistryEntryGetRegistryEntryID,
+    IOServiceGetMatchingService, IOServiceMatching,
+};
 use crate::types::SocPower;
 use anyhow::{bail, Result};
+use core_foundation::array::CFArray;
 use core_foundation::base::TCFType;
+use core_foundation::dictionary::{CFDictionary, CFMutableDictionary};
+use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation_sys::array::CFArrayRef;
-use core_foundation_sys::base::CFTypeRef;
-use core_foundation_sys::dictionary::{CFDictionaryRef, CFMutableDictionaryRef};
+use core_foundation_sys::array::{CFArrayAppendValue, CFArrayCreateMutableCopy, CFArrayRef};
+use core_foundation_sys::base::{CFGetTypeID, CFTypeRef};
+use core_foundation_sys::data::{CFDataGetBytePtr, CFDataGetLength, CFDataGetTypeID, CFDataRef};
+use core_foundation_sys::dictionary::{
+    CFDictionaryRef, CFDictionarySetValue, CFMutableDictionaryRef,
+};
 use core_foundation_sys::string::CFStringRef;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::{PhantomData, PhantomPinned};
 use std::ptr;
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 // ── opaque handle ────────────────────────────────────────────────────────────
 
@@ -24,6 +36,17 @@ type IOReportSubscriptionRef = *mut IOReportSubscriptionRaw;
 // ── FFI bindings to /usr/lib/libIOReport.dylib ──────────────────────────────
 
 type CVoidRef = *const libc::c_void;
+
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+}
 
 #[link(name = "IOReport", kind = "dylib")]
 extern "C" {
@@ -89,6 +112,98 @@ fn energy_to_watts(val: i64, unit: &str, dt_ms: u64) -> f32 {
     }
 }
 
+const CLPC_CPU_GROUP: &str = "CLPC";
+const CLPC_CPU_CHANNEL: &str = "CPU Energy";
+
+unsafe fn clpc_cpu_driver() -> Option<u64> {
+    let mut version = [0u8; 32];
+    let mut len = version.len();
+    if libc::sysctlbyname(
+        c"kern.osproductversion".as_ptr(),
+        version.as_mut_ptr().cast(),
+        &mut len,
+        ptr::null_mut(),
+        0,
+    ) != 0
+        || !version.starts_with(b"27.")
+    {
+        return None;
+    }
+
+    // Match the firmware driver, since the opaque report ID varies by driver.
+    let service = IOServiceGetMatchingService(0, IOServiceMatching(c"AppleCLPC".as_ptr()));
+    if service == 0 {
+        return None;
+    }
+    let mut properties = ptr::null_mut();
+    let mut driver_id = 0;
+    let found = IORegistryEntryGetRegistryEntryID(service, &mut driver_id) == 0
+        && IORegistryEntryCreateCFProperties(service, &mut properties, ptr::null(), 0) == 0;
+    IOObjectRelease(service);
+    let bundle = (found && !properties.is_null())
+        .then(|| cf_utils::cfdict_get_string(properties, "CFBundleIdentifier"))
+        .flatten();
+    cf_utils::cf_release(properties as _);
+    (bundle.as_deref() == Some("com.apple.driver.AppleT6050CLPC")).then_some(driver_id)
+}
+
+/// macOS 27 can stop updating the named CPU counter. Request the aggregate
+/// report directly from the M5 Pro/Max CLPC driver when its mapping is known.
+/// Report ID: https://github.com/vladkens/macmon/blob/7df49f5/src/clpc.rs
+/// Channel format: https://github.com/vladkens/macmon/blob/7df49f5/src/sources.rs
+unsafe fn channels_with_clpc_cpu(channels: CFDictionaryRef) -> Option<CFMutableDictionaryRef> {
+    let driver_id = clpc_cpu_driver()?;
+    let key = CFString::new("IOReportChannels");
+    let current = cf_utils::cfdict_get(channels, "IOReportChannels") as CFArrayRef;
+    if current.is_null() {
+        return None;
+    }
+    let selected = CFArrayCreateMutableCopy(ptr::null(), 0, current);
+    if selected.is_null() {
+        return None;
+    }
+    let with_clpc = cf_utils::cfdict_mutable_copy(channels);
+    if with_clpc.is_null() {
+        cf_utils::cf_release(selected as _);
+        return None;
+    }
+
+    // A single integer in the power category, with a nanojoule unit label.
+    let legend = CFArray::from_CFTypes(&[
+        CFNumber::from(0x0000_0010_d3ab_60bb_i64).into_CFType(),
+        CFNumber::from(1i64 | (2 << 16) | (1 << 32)).into_CFType(),
+        CFString::new(CLPC_CPU_CHANNEL).into_CFType(),
+    ]);
+    let info = CFDictionary::from_CFType_pairs(&[(
+        CFString::new("IOReportChannelUnit"),
+        CFNumber::from((3i64 << 56) | (118i64 << 32)),
+    )]);
+    let channel = CFMutableDictionary::from_CFType_pairs(&[
+        (
+            CFString::new("DriverID"),
+            CFNumber::from(driver_id as i64).into_CFType(),
+        ),
+        (
+            CFString::new("DriverName"),
+            CFString::new("AppleCLPC").into_CFType(),
+        ),
+        (
+            CFString::new("IOReportGroupName"),
+            CFString::new(CLPC_CPU_GROUP).into_CFType(),
+        ),
+        (
+            CFString::new("IOReportSubGroupName"),
+            CFString::new("Energy Counters").into_CFType(),
+        ),
+        (CFString::new("IOReportChannelInfo"), info.into_CFType()),
+        (CFString::new("LegendChannel"), legend.into_CFType()),
+    ]);
+    CFArrayAppendValue(selected, channel.as_CFTypeRef());
+    CFDictionarySetValue(with_clpc, key.as_CFTypeRef(), selected as _);
+    cf_utils::cf_release(selected as _);
+    Some(with_clpc)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum CpuKind {
     Efficiency,
@@ -131,10 +246,8 @@ fn parse_cpu_stats_core_key(name: &str) -> Option<CpuCoreKey> {
         (CpuKind::Efficiency, rest)
     } else if let Some(rest) = name.strip_prefix("MCPU") {
         (CpuKind::Efficiency, rest)
-    } else if let Some(rest) = name.strip_prefix("PCPU") {
-        (CpuKind::Performance, rest)
     } else {
-        return None;
+        (CpuKind::Performance, name.strip_prefix("PCPU")?)
     };
 
     // Digit-suffix format: ECPU0, PCPU10 (single-die M1/M2/M3/M4)
@@ -345,7 +458,9 @@ fn read_dvfs_freq_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
                         let bytes = std::slice::from_raw_parts(ptr, len as usize);
 
                         let freqs: Vec<u32> = bytes
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .filter(|&f| f > 0)
                             .collect();
@@ -447,6 +562,7 @@ fn read_dvfs_freq_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 pub struct IOReportSampler {
     subscription: IOReportSubscriptionRef,
     subscribed_channels: CFMutableDictionaryRef,
+    cpu_breakdown: RefCell<CpuEnergyBreakdown>,
     pub ecpu_freqs: Vec<u32>, // MHz, indexed by DVFS state
     pub pcpu_freqs: Vec<u32>,
     pub gpu_freqs: Vec<u32>,
@@ -455,6 +571,39 @@ pub struct IOReportSampler {
 unsafe impl Send for IOReportSampler {}
 
 impl IOReportSampler {
+    /// Check whether the affected CPU can report aggregate watts but its core
+    /// counters need an external sampler to refresh them. Let any already
+    /// running sampler publish before requesting another one.
+    pub fn needs_cpu_power_sampler() -> bool {
+        if unsafe { clpc_cpu_driver() }.is_none() {
+            return false;
+        }
+        let Ok(ior) = Self::new() else {
+            return false;
+        };
+        let Ok(mut prev) = ior.sample() else {
+            return false;
+        };
+        let deadline = prev.ts + Duration::from_millis(1200);
+        let mut breakdown_missing = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(125));
+            let Ok(cur) = ior.sample() else {
+                return false;
+            };
+            if let Ok(power) = ior.parse_power(&prev, &cur) {
+                if !power.pcpu_cluster.cores.is_empty() {
+                    if !power.cpu_breakdown_unavailable {
+                        return false;
+                    }
+                    breakdown_missing = true;
+                }
+            }
+            prev = cur;
+        }
+        breakdown_missing
+    }
+
     /// Create a new sampler subscribing to Energy Model + CPU/GPU Stats.
     pub fn new() -> Result<Self> {
         unsafe {
@@ -502,15 +651,29 @@ impl IOReportSampler {
                 bail!("IOReport: failed to create mutable channels copy");
             }
 
-            let mut subd: CFMutableDictionaryRef = ptr::null_mut();
-            let sub = IOReportCreateSubscription(ptr::null(), desired, &mut subd, 0, ptr::null());
+            let subscribe = |channels| {
+                let mut subd = ptr::null_mut();
+                let sub =
+                    IOReportCreateSubscription(ptr::null(), channels, &mut subd, 0, ptr::null());
+                if sub.is_null() || subd.is_null() {
+                    cf_utils::cf_release(sub as _);
+                    cf_utils::cf_release(subd as _);
+                    None
+                } else {
+                    Some((sub, subd))
+                }
+            };
+            let subscription = channels_with_clpc_cpu(desired)
+                .and_then(|channels| {
+                    let subscription = subscribe(channels);
+                    cf_utils::cf_release(channels as _);
+                    subscription
+                })
+                .or_else(|| subscribe(desired));
             cf_utils::cf_release(desired as _);
-
-            if sub.is_null() || subd.is_null() {
-                cf_utils::cf_release(sub as _);
-                cf_utils::cf_release(subd as _);
+            let Some((sub, subd)) = subscription else {
                 bail!("IOReport: subscription failed");
-            }
+            };
 
             // Read DVFS frequency tables from pmgr
             let (ecpu_freqs, pcpu_freqs, gpu_freqs) = read_dvfs_freq_tables();
@@ -518,6 +681,7 @@ impl IOReportSampler {
             Ok(Self {
                 subscription: sub,
                 subscribed_channels: subd,
+                cpu_breakdown: RefCell::new(CpuEnergyBreakdown::new()),
                 ecpu_freqs,
                 pcpu_freqs,
                 gpu_freqs,
@@ -537,6 +701,65 @@ impl IOReportSampler {
                 ts: Instant::now(),
             })
         }
+    }
+
+    /// Check the named Energy Model counters directly, independently of the
+    /// source selected for the aggregate CPU power row.
+    pub fn check_cpu_core_counters(&self) -> Result<()> {
+        let first = self.sample()?;
+        let mut checks: BTreeMap<_, _> = first
+            .cpu_core_energy()
+            .into_iter()
+            .map(|(name, (unit, value))| {
+                (
+                    name,
+                    (
+                        unit,
+                        CoreCounterCheck {
+                            latest: value,
+                            ..Default::default()
+                        },
+                    ),
+                )
+            })
+            .collect();
+        if checks.is_empty() {
+            bail!("No per-core CPU Energy Model channels found");
+        }
+        while first.ts.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(100));
+            let sample = self.sample()?;
+            let readings = sample.cpu_core_energy();
+            for (name, (unit, check)) in &mut checks {
+                let reading = readings
+                    .get(name)
+                    .filter(|(u, _)| u == unit)
+                    .map(|(_, v)| *v);
+                check.observe(reading, sample.ts);
+            }
+        }
+
+        println!(
+            "Per-core Energy Model counters over {:.3} s:",
+            first.ts.elapsed().as_secs_f64()
+        );
+        let mut advancing = 0;
+        for (name, (unit, check)) in &checks {
+            if check.invalid {
+                println!("{name:<16}      N/A      counter reset or missing");
+            } else if let Some((energy, dt_ms)) = check.measured_delta() {
+                let watts = energy_to_watts(energy, unit, dt_ms);
+                println!("{name:<16} {watts:>8.3} W    +{energy} {unit} over {dt_ms} ms");
+                advancing += 1;
+            } else if check.first_advance.is_some() {
+                println!("{name:<16}      N/A      one update; no confirmed refresh interval");
+                advancing += 1;
+            } else {
+                println!("{name:<16}      N/A      counter unchanged");
+            }
+        }
+        println!("{advancing}/{} core counters advanced.", checks.len());
+        Ok(())
     }
 
     /// Dump all subscribed channel names for diagnostics.
@@ -591,6 +814,7 @@ impl IOReportSampler {
             }
 
             let mut soc = SocPower::default();
+            let mut clpc_cpu_w = None;
 
             let mut ecpu_order: Vec<CpuCoreKey> = Vec::new();
             let mut pcpu_order: Vec<CpuCoreKey> = Vec::new();
@@ -695,6 +919,13 @@ impl IOReportSampler {
                     continue;
                 }
 
+                if group == CLPC_CPU_GROUP && name == CLPC_CPU_CHANNEL {
+                    let val = IOReportSimpleGetIntegerValue(ch, 0);
+                    if val >= 0 {
+                        clpc_cpu_w = Some(energy_to_watts(val, "nJ", dt_ms));
+                    }
+                    continue;
+                }
                 if group != "Energy Model" {
                     continue;
                 }
@@ -881,6 +1112,15 @@ impl IOReportSampler {
                     (gpu_active_res as f64 / total_gpu_res as f64 * 100.0).round() as u32;
             }
 
+            // On affected systems the old counters can stall or update in
+            // bursts. Keep CLPC for the total, and use the named per-core
+            // model only while its publication timestamps are advancing.
+            if let Some(clpc_cpu_w) = clpc_cpu_w {
+                soc.cpu_w = clpc_cpu_w;
+                self.cpu_breakdown
+                    .borrow_mut()
+                    .apply(cur, &mut soc, &pcpu_totals);
+            }
             cf_utils::cf_release(delta as _);
             soc.compute_total();
             Ok(soc)
@@ -970,6 +1210,233 @@ pub struct Sample {
     ts: Instant,
 }
 
+// Allow a few missed 250 ms publications before dropping the last reading.
+const CPU_ENERGY_MAX_AGE: f64 = 2.0;
+
+#[derive(Clone, Copy)]
+struct CpuEnergyReading {
+    ticks: u64,
+    millijoules: i64,
+}
+
+#[derive(Default)]
+struct CpuEnergyCounter {
+    previous: Option<CpuEnergyReading>,
+    watts: Option<f32>,
+}
+
+impl CpuEnergyCounter {
+    fn observe(&mut self, reading: CpuEnergyReading, now: u64, seconds_per_tick: f64) {
+        if now
+            .checked_sub(reading.ticks)
+            .is_none_or(|age| age as f64 * seconds_per_tick > CPU_ENERGY_MAX_AGE)
+        {
+            *self = Self::default();
+            return;
+        }
+        if let Some(previous) = self.previous {
+            if reading.ticks == previous.ticks && reading.millijoules == previous.millijoules {
+                return;
+            }
+            let dt = reading.ticks.saturating_sub(previous.ticks) as f64 * seconds_per_tick;
+            self.watts = if dt > 0.0
+                && dt <= CPU_ENERGY_MAX_AGE
+                && reading.millijoules >= previous.millijoules
+            {
+                Some(((reading.millijoules - previous.millijoules) as f64 / (dt * 1000.0)) as f32)
+            } else {
+                None
+            };
+        }
+        self.previous = Some(reading);
+    }
+}
+
+struct CpuEnergyBreakdown {
+    counters: BTreeMap<String, CpuEnergyCounter>,
+}
+
+impl CpuEnergyBreakdown {
+    fn new() -> Self {
+        Self {
+            counters: BTreeMap::new(),
+        }
+    }
+
+    fn apply(
+        &mut self,
+        sample: &Sample,
+        soc: &mut SocPower,
+        pcpu_totals: &BTreeMap<usize, (String, f32)>,
+    ) {
+        let readings = sample.published_cpu_energy();
+        self.counters.retain(|name, _| readings.contains_key(name));
+        static SECONDS_PER_TICK: OnceLock<Option<f64>> = OnceLock::new();
+        let seconds_per_tick = SECONDS_PER_TICK.get_or_init(|| {
+            let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+            let valid = unsafe { mach_timebase_info(&mut timebase) } == 0
+                && timebase.numer != 0
+                && timebase.denom != 0;
+            valid.then(|| timebase.numer as f64 / timebase.denom as f64 * 1e-9)
+        });
+        if let Some(seconds_per_tick) = *seconds_per_tick {
+            let now = unsafe { mach_absolute_time() };
+            for (name, reading) in readings {
+                self.counters
+                    .entry(name)
+                    .or_default()
+                    .observe(reading, now, seconds_per_tick);
+            }
+        }
+        let watts = |name: &str| self.counters.get(name).and_then(|counter| counter.watts);
+        let mut complete = !soc.ecpu_clusters.is_empty() && !soc.pcpu_cluster.cores.is_empty();
+        let clusters = soc
+            .ecpu_clusters
+            .iter_mut()
+            .chain(std::iter::once(&mut soc.pcpu_cluster));
+        for cluster in clusters {
+            for core in &mut cluster.cores {
+                let power = watts(&core.name);
+                complete &= power.is_some();
+                core.watts = power.unwrap_or_default();
+            }
+        }
+        soc.cpu_breakdown_unavailable = !complete;
+        let pcpu_w = pcpu_totals
+            .values()
+            .map(|(name, _)| watts(name))
+            .sum::<Option<f32>>();
+        for cluster in &mut soc.ecpu_clusters {
+            cluster.total_w = if complete {
+                watts(&cluster.name)
+                    .unwrap_or_else(|| cluster.cores.iter().map(|core| core.watts).sum())
+            } else {
+                0.0
+            };
+        }
+        let performance = &mut soc.pcpu_cluster;
+        performance.total_w = if !complete {
+            0.0
+        } else if let Some(cluster_power) = pcpu_w.filter(|_| !pcpu_totals.is_empty()) {
+            cluster_power
+        } else {
+            performance.cores.iter().map(|core| core.watts).sum()
+        };
+        if !complete {
+            for core in soc
+                .ecpu_clusters
+                .iter_mut()
+                .chain(std::iter::once(performance))
+                .flat_map(|cluster| &mut cluster.cores)
+            {
+                core.watts = 0.0;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CoreCounterCheck {
+    latest: i64,
+    first_advance: Option<(i64, Instant)>,
+    last_advance: Option<Instant>,
+    invalid: bool,
+}
+
+impl CoreCounterCheck {
+    fn observe(&mut self, value: Option<i64>, time: Instant) {
+        let Some(value) = value.filter(|&v| v >= self.latest) else {
+            self.invalid = true;
+            return;
+        };
+        if value > self.latest {
+            if self.first_advance.is_none() {
+                // The first jump can cover time before we started sampling.
+                self.first_advance = Some((value, time));
+            } else {
+                self.last_advance = Some(time);
+            }
+            self.latest = value;
+        }
+    }
+
+    fn measured_delta(&self) -> Option<(i64, u64)> {
+        let (start, time) = self.first_advance?;
+        let ms = self.last_advance?.duration_since(time).as_millis() as u64;
+        (!self.invalid && ms > 0).then_some((self.latest - start, ms))
+    }
+}
+
+impl Sample {
+    fn published_cpu_energy(&self) -> BTreeMap<String, CpuEnergyReading> {
+        unsafe {
+            let channels = cf_utils::cfdict_get(self.inner, "IOReportChannels") as CFArrayRef;
+            (0..cf_utils::cfarray_len(channels))
+                .filter_map(|i| {
+                    let channel = cf_utils::cfarray_get(channels, i) as CFDictionaryRef;
+                    let group = cf_utils::cfstring_to_string(IOReportChannelGetGroup(channel))?;
+                    if group != "Energy Model" {
+                        return None;
+                    }
+                    let name =
+                        cf_utils::cfstring_to_string(IOReportChannelGetChannelName(channel))?;
+                    let base_name = strip_die_prefix(&name).1;
+                    if parse_energy_core_key(base_name).is_none()
+                        && parse_energy_cluster_total(base_name).is_none()
+                    {
+                        return None;
+                    }
+                    let unit = cf_utils::cfstring_to_string(IOReportChannelGetUnitLabel(channel))?;
+                    if unit != "mJ" {
+                        return None;
+                    }
+                    let data = cf_utils::cfdict_get(channel, "RawElements") as CFDataRef;
+                    // IOReportElement: one 64-byte simple report, with the
+                    // Mach publication timestamp and value following its header.
+                    // See DriverKit/IOKernelReportStructs.h in Apple's XNU source.
+                    if data.is_null()
+                        || CFGetTypeID(data as _) != CFDataGetTypeID()
+                        || CFDataGetLength(data) != 64
+                    {
+                        return None;
+                    }
+                    let ptr = CFDataGetBytePtr(data);
+                    if ptr.is_null() {
+                        return None;
+                    }
+                    let bytes = std::slice::from_raw_parts(ptr, 64);
+                    let ticks = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
+                    let millijoules = IOReportSimpleGetIntegerValue(channel, 0);
+                    (ticks != 0 && millijoules >= 0)
+                        .then_some((name, CpuEnergyReading { ticks, millijoules }))
+                })
+                .collect()
+        }
+    }
+
+    fn cpu_core_energy(&self) -> BTreeMap<String, (String, i64)> {
+        unsafe {
+            let channels = cf_utils::cfdict_get(self.inner, "IOReportChannels") as CFArrayRef;
+            (0..cf_utils::cfarray_len(channels))
+                .filter_map(|i| {
+                    let channel = cf_utils::cfarray_get(channels, i) as CFDictionaryRef;
+                    let group = cf_utils::cfstring_to_string(IOReportChannelGetGroup(channel))?;
+                    if group != "Energy Model" {
+                        return None;
+                    }
+                    let name =
+                        cf_utils::cfstring_to_string(IOReportChannelGetChannelName(channel))?;
+                    parse_energy_core_key(strip_die_prefix(&name).1)?;
+                    let unit = cf_utils::cfstring_to_string(IOReportChannelGetUnitLabel(channel))?;
+                    let reading = IOReportSimpleGetIntegerValue(channel, 0);
+                    (matches!(unit.as_str(), "mJ" | "uJ" | "nJ") && reading >= 0)
+                        .then_some((name, (unit, reading)))
+                })
+                .collect()
+        }
+    }
+}
+
 unsafe impl Send for Sample {}
 
 impl Drop for Sample {
@@ -983,6 +1450,41 @@ impl Drop for Sample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_energy_uses_actual_sample_time_and_expires() {
+        let mut counter = CpuEnergyCounter::default();
+        let seconds_per_tick = 0.001;
+        let reading = |ticks, millijoules| CpuEnergyReading { ticks, millijoules };
+        counter.observe(reading(1_000, 3_000), 1_030, seconds_per_tick);
+        assert_eq!(counter.watts, None);
+        counter.observe(reading(1_250, 3_500), 1_400, seconds_per_tick);
+        assert_eq!(counter.watts, Some(2.0));
+        counter.observe(reading(1_250, 3_500), 1_430, seconds_per_tick);
+        assert_eq!(counter.watts, Some(2.0));
+        counter.observe(reading(1_250, 3_500), 3_251, seconds_per_tick);
+        assert_eq!(counter.watts, None);
+        counter.observe(reading(3_300, 100_000), 3_300, seconds_per_tick);
+        assert_eq!(counter.watts, None);
+        counter.observe(reading(3_550, 100_000), 3_560, seconds_per_tick);
+        assert_eq!(counter.watts, Some(0.0));
+    }
+
+    #[test]
+    fn per_core_diagnostic_excludes_the_initial_counter_jump() {
+        let start = Instant::now();
+        let mut check = CoreCounterCheck {
+            latest: 1_000,
+            ..Default::default()
+        };
+        check.observe(Some(90_000), start);
+        assert_eq!(check.measured_delta(), None);
+        check.observe(Some(90_000), start + Duration::from_millis(100));
+        check.observe(Some(90_600), start + Duration::from_millis(500));
+        assert_eq!(check.measured_delta(), Some((600, 500)));
+        check.observe(Some(0), start + Duration::from_secs(1));
+        assert_eq!(check.measured_delta(), None);
+    }
 
     #[test]
     fn parses_modern_cpu_stats_names() {
