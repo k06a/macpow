@@ -246,10 +246,8 @@ fn parse_cpu_stats_core_key(name: &str) -> Option<CpuCoreKey> {
         (CpuKind::Efficiency, rest)
     } else if let Some(rest) = name.strip_prefix("MCPU") {
         (CpuKind::Efficiency, rest)
-    } else if let Some(rest) = name.strip_prefix("PCPU") {
-        (CpuKind::Performance, rest)
     } else {
-        return None;
+        (CpuKind::Performance, name.strip_prefix("PCPU")?)
     };
 
     // Digit-suffix format: ECPU0, PCPU10 (single-die M1/M2/M3/M4)
@@ -460,7 +458,9 @@ fn read_dvfs_freq_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
                         let bytes = std::slice::from_raw_parts(ptr, len as usize);
 
                         let freqs: Vec<u32> = bytes
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .filter(|&f| f > 0)
                             .collect();
