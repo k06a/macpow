@@ -115,11 +115,7 @@ fn energy_to_watts(val: i64, unit: &str, dt_ms: u64) -> f32 {
 const CLPC_CPU_GROUP: &str = "CLPC";
 const CLPC_CPU_CHANNEL: &str = "CPU Energy";
 
-/// macOS 27 can stop updating the named CPU counter. Request the aggregate
-/// report directly from the M5 Pro/Max CLPC driver when its mapping is known.
-/// Report ID: https://github.com/vladkens/macmon/blob/7df49f5/src/clpc.rs
-/// Channel format: https://github.com/vladkens/macmon/blob/7df49f5/src/sources.rs
-unsafe fn channels_with_clpc_cpu(channels: CFDictionaryRef) -> Option<CFMutableDictionaryRef> {
+unsafe fn clpc_cpu_driver() -> Option<u64> {
     let mut version = [0u8; 32];
     let mut len = version.len();
     if libc::sysctlbyname(
@@ -148,10 +144,15 @@ unsafe fn channels_with_clpc_cpu(channels: CFDictionaryRef) -> Option<CFMutableD
         .then(|| cf_utils::cfdict_get_string(properties, "CFBundleIdentifier"))
         .flatten();
     cf_utils::cf_release(properties as _);
-    if bundle.as_deref() != Some("com.apple.driver.AppleT6050CLPC") {
-        return None;
-    }
+    (bundle.as_deref() == Some("com.apple.driver.AppleT6050CLPC")).then_some(driver_id)
+}
 
+/// macOS 27 can stop updating the named CPU counter. Request the aggregate
+/// report directly from the M5 Pro/Max CLPC driver when its mapping is known.
+/// Report ID: https://github.com/vladkens/macmon/blob/7df49f5/src/clpc.rs
+/// Channel format: https://github.com/vladkens/macmon/blob/7df49f5/src/sources.rs
+unsafe fn channels_with_clpc_cpu(channels: CFDictionaryRef) -> Option<CFMutableDictionaryRef> {
+    let driver_id = clpc_cpu_driver()?;
     let key = CFString::new("IOReportChannels");
     let current = cf_utils::cfdict_get(channels, "IOReportChannels") as CFArrayRef;
     if current.is_null() {
@@ -570,6 +571,39 @@ pub struct IOReportSampler {
 unsafe impl Send for IOReportSampler {}
 
 impl IOReportSampler {
+    /// Check whether the affected CPU can report aggregate watts but its core
+    /// counters need an external sampler to refresh them. Let any already
+    /// running sampler publish before requesting another one.
+    pub fn needs_cpu_power_sampler() -> bool {
+        if unsafe { clpc_cpu_driver() }.is_none() {
+            return false;
+        }
+        let Ok(ior) = Self::new() else {
+            return false;
+        };
+        let Ok(mut prev) = ior.sample() else {
+            return false;
+        };
+        let deadline = prev.ts + Duration::from_millis(1200);
+        let mut breakdown_missing = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(125));
+            let Ok(cur) = ior.sample() else {
+                return false;
+            };
+            if let Ok(power) = ior.parse_power(&prev, &cur) {
+                if !power.pcpu_cluster.cores.is_empty() {
+                    if !power.cpu_breakdown_unavailable {
+                        return false;
+                    }
+                    breakdown_missing = true;
+                }
+            }
+            prev = cur;
+        }
+        breakdown_missing
+    }
+
     /// Create a new sampler subscribing to Energy Model + CPU/GPU Stats.
     pub fn new() -> Result<Self> {
         unsafe {

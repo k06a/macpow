@@ -1,5 +1,7 @@
 mod app;
+mod apple_sampler;
 
+use macpow::ioreport::IOReportSampler;
 use macpow::metrics::Sampler;
 use macpow::types::Metrics;
 
@@ -13,7 +15,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::stdout;
+use std::io::{stdin, stdout, IsTerminal};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -27,6 +29,10 @@ struct CliArgs {
     /// Output JSON to stdout instead of TUI
     #[arg(long)]
     json: bool,
+
+    /// Skip starting Apple's per-core CPU power sampler in the terminal UI
+    #[arg(long)]
+    no_powermetrics: bool,
 
     /// Dump all IOReport channel names and exit (for diagnostics)
     #[arg(long)]
@@ -63,6 +69,21 @@ fn main() -> Result<()> {
     if args.dump_smc {
         return run_dump_smc();
     }
+
+    if !json_mode && !stdout().is_terminal() {
+        anyhow::bail!("TUI requires a real terminal. Use --json for piped output.");
+    }
+    let _apple_sampler = if !json_mode
+        && !args.no_powermetrics
+        && stdin().is_terminal()
+        // Only the foreground job may ask for a terminal password.
+        && unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp() }
+        && IOReportSampler::needs_cpu_power_sampler()
+    {
+        apple_sampler::start()
+    } else {
+        None
+    };
 
     let (tx, rx) = mpsc::sync_channel::<Metrics>(2);
 
@@ -110,9 +131,6 @@ fn restore_terminal() {
 }
 
 fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
-    if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
-        anyhow::bail!("TUI requires a real terminal. Use --json for piped output.");
-    }
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     stdout().execute(crossterm::event::EnableMouseCapture)?;
