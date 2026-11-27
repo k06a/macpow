@@ -127,13 +127,13 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 +------------------+---------------------------------------------+
 | IOReport         | SoC power (Energy Model),                   |
 |                  | CPU/GPU frequencies (DVFS residency)        |
-| SMC              | System power (PSTR), display backlight     |
-|                  | (PBwo on M5/Neo, PDBR on M1-M4),         |
-|                  | adapter (PDTR), WiFi (wiPm), temps, fans   |
+| SMC              | System power (PSTR), display backlight      |
+|                  | (PBwo on M5/Neo, PDBR on M1-M4),            |
+|                  | adapter (PDTR), WiFi (wiPm), temps, fans    |
 | IORegistry       | Battery, display brightness, keyboard PWM,  |
 |                  | USB devices, SSD model, disk I/O counters   |
 | CoreAudio        | Volume level, mute state                    |
-| Mach API         | Per-CPU utilization ticks, memory stats      |
+| Mach API         | Per-CPU utilization ticks, memory stats     |
 | proc_pid_rusage  | Per-process billed energy                   |
 | getifaddrs       | Network traffic byte counters               |
 | CoreWLAN/pmset   | WiFi info, Bluetooth devices                |
@@ -183,7 +183,7 @@ Single-die (M1/M2/M3/M4 base/Pro/Max):
 Multi-die (M1/M2/M3 Ultra):
   CPU Stats:    DIE_0_ECPU_CPU0, DIE_1_PCPU1_CPU3   ← DIE_N_ prefix + _CPU suffix
   Energy Model: DIE_0_EACC_CPU0, DIE_1_PACC1_CPU3   ← DIE_N_ prefix + _CPU suffix
-  Blocks:       ISP0_0, DRAM0_1, ANE0_0              ← per-die suffix
+  Blocks:       ISP0_0, DRAM0_1, ANE0_0             ← per-die suffix
 ```
 
 Two design rules keep this forward-compatible with future chips:
@@ -289,7 +289,7 @@ If per-core temperatures are missing or incorrect on your Mac, please open an is
 macpow --dump > dump.txt                       # IOReport channel names
 macpow --dump-smc > smc.txt                    # all SMC keys (incl. power rails)
 macpow --json > metrics.json                   # full metrics (Ctrl+C after ~15s)
-system_profiler SPHardwareDataType | head -10   # chip model
+system_profiler SPHardwareDataType | head -10  # chip model
 ```
 
 This helps add support for new Apple Silicon variants.
