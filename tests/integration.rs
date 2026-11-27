@@ -129,6 +129,61 @@ fn ioreport_cpu_clusters_populated() {
     });
 }
 
+/// On systems where the OS gates the Energy Model (macOS 27+), the figures
+/// come from other sources and must still be self-consistent.
+#[test]
+fn ioreport_gated_sources_are_consistent() {
+    let sampler = IOReportSampler::new().unwrap();
+    let mut estimator = sampler.estimator();
+    let mut prev = sampler.sample().unwrap();
+    estimator.seed_core_shares(sampler.core_share_prior(&prev));
+    let mut soc = SocPower::default();
+    // Long enough for the estimator to notice frozen counters by itself.
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let cur = sampler.sample().unwrap();
+        soc = estimator.assemble(sampler.parse_raw(&prev, &cur).unwrap());
+        prev = cur;
+    }
+    if !soc.energy_model_gated {
+        // Live Energy Model: nothing is estimated.
+        assert!(!soc.cores_estimated && !soc.clusters_estimated && !soc.cpu_estimated);
+        return;
+    }
+    assert!(
+        soc.cores_estimated,
+        "gated systems have no exact per-core source"
+    );
+    assert!(
+        soc.cpu_w >= 0.0 && soc.cpu_w < MAX_CPU_W,
+        "cpu_w {}",
+        soc.cpu_w
+    );
+    if soc.cpu_unavailable {
+        assert_eq!(soc.cpu_w, 0.0);
+        return;
+    }
+    let clusters = soc.ecpu_total_w() + soc.pcpu_total_w();
+    assert!(
+        (clusters - soc.cpu_w).abs() <= 0.05 * soc.cpu_w + 0.05,
+        "clusters ({clusters} W) should add up to the CPU total ({} W)",
+        soc.cpu_w
+    );
+    let cores: f32 = soc
+        .ecpu_clusters
+        .iter()
+        .flat_map(|c| c.cores.iter())
+        .chain(soc.pcpu_cluster.cores.iter())
+        .map(|c| c.watts)
+        .sum();
+    assert!(
+        cores <= clusters + 0.01,
+        "cores ({cores} W) are a share of their clusters ({clusters} W)"
+    );
+    assert!(soc.total_w >= soc.cpu_w + soc.gpu_w - 0.001);
+    assert!(soc.total_w < MAX_SOC_W);
+}
+
 // ── SMC ──────────────────────────────────────────────────────────────────────
 
 #[test]

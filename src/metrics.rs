@@ -526,7 +526,8 @@ fn read_pwm_table(dict: CFDictionaryRef, total_period: f64) -> Vec<f32> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let raw: Vec<u32> = bytes
-        .chunks_exact(4)
+        .chunks(4)
+        .filter(|c| c.len() == 4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -1040,6 +1041,8 @@ struct StaticSnapshot {
     gpu_cores: u32,
     dram_gb: u32,
     ssd_model: String,
+    cpu_tier_names: Vec<String>,
+    cpu_high_tier: Vec<bool>,
 }
 
 fn spawn_periodic(
@@ -1102,6 +1105,8 @@ impl Sampler {
             gpu_cores,
             dram_gb,
             ssd_model,
+            cpu_tier_names: crate::topology::tier_names().to_vec(),
+            cpu_high_tier: crate::topology::CpuTopology::read().high_tier_mask(),
         };
         let running = Arc::new(AtomicBool::new(true));
         let mut handles = Vec::new();
@@ -1116,13 +1121,23 @@ impl Sampler {
                     return;
                 };
                 let mut prev = ior.sample().ok();
+                // Remembers across ticks whether the Energy Model is gated
+                // (macOS 27+) and which live source replaces it.
+                let mut estimator = ior.estimator();
+                if let Some(ref p) = prev {
+                    estimator.seed_core_shares(ior.core_share_prior(p));
+                }
                 while running.load(Ordering::Relaxed) {
                     std::thread::sleep(dt);
                     if let Ok(cur) = ior.sample() {
                         let backlight = ior.parse_backlight(&cur);
                         if let Some(ref p) = prev {
-                            if let Ok(soc) = ior.parse_power(p, &cur) {
+                            if let Ok(raw) = ior.parse_raw(p, &cur) {
+                                let mut soc = estimator.assemble(raw);
                                 if let Ok(mut mg) = m.lock() {
+                                    // The SMC thread owns these two fields.
+                                    soc.gpu_util_renderer = mg.soc.gpu_util_renderer;
+                                    soc.gpu_util_tiler = mg.soc.gpu_util_tiler;
                                     mg.soc = soc;
                                     let dpb = backlight.dpb_factor();
                                     mg.display.dpb_factor = dpb;
@@ -1631,6 +1646,8 @@ impl Sampler {
         m.gpu_cores = self.static_snapshot.gpu_cores;
         m.dram_gb = self.static_snapshot.dram_gb;
         m.ssd_model = self.static_snapshot.ssd_model.clone();
+        m.cpu_tier_names = self.static_snapshot.cpu_tier_names.clone();
+        m.cpu_high_tier = self.static_snapshot.cpu_high_tier.clone();
         m
     }
 }

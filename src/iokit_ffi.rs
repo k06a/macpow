@@ -36,6 +36,10 @@ extern "C" {
         options: u32,
         iterator: *mut u32,
     ) -> i32;
+    pub fn IORegistryEntryFromPath(main_port: u32, path: *const i8) -> u32;
+    pub fn IORegistryEntryGetChildIterator(entry: u32, plane: *const i8, iterator: *mut u32)
+        -> i32;
+    pub fn IORegistryEntryGetRegistryEntryID(entry: u32, entry_id: *mut u64) -> i32;
     pub fn IOPMCopyAssertionsByProcess(
         assertions_by_pid: *mut core_foundation_sys::dictionary::CFDictionaryRef,
     ) -> i32;
