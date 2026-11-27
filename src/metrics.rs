@@ -1451,10 +1451,32 @@ impl Sampler {
         {
             let m = shared.clone();
             let running = running.clone();
+            // Per-port last measured watts (+ timestamp) for hysteresis.
+            let mut last_port_w: std::collections::HashMap<u32, (f32, Instant)> =
+                std::collections::HashMap::new();
+            const PORT_W_GRACE: Duration = Duration::from_secs(8);
             spawn_periodic(&mut handles, &running, dt, move || {
                 let usb = peripherals::list_usb_devices();
                 let asserts = peripherals::list_power_assertions();
-                let usb_ports = battery::read_usb_power_out_per_port();
+                let mut usb_ports = battery::read_usb_power_out_per_port();
+                // Bridge transient PowerOutDetails gaps: hold the last measured
+                // watts for a short grace window so a still-sourcing port doesn't
+                // flicker to 0 W while USB-PD renegotiates. Presence itself is
+                // governed by the sourcing flag, so an unplugged port (dropped
+                // from PortControllerInfo) disappears immediately regardless.
+                let now = Instant::now();
+                let live: std::collections::HashSet<u32> =
+                    usb_ports.iter().map(|p| p.port_index).collect();
+                last_port_w.retain(|k, _| live.contains(k));
+                for p in usb_ports.iter_mut() {
+                    if p.power_w > 0.0 {
+                        last_port_w.insert(p.port_index, (p.power_w, now));
+                    } else if let Some(&(w, t)) = last_port_w.get(&p.port_index) {
+                        if now.duration_since(t) <= PORT_W_GRACE {
+                            p.power_w = w;
+                        }
+                    }
+                }
                 if let Ok(mut mg) = m.lock() {
                     mg.usb_devices = usb;
                     mg.power_assertions = asserts;

@@ -177,31 +177,77 @@ unsafe fn read_usb_power_per_port_inner() -> Option<Vec<UsbPortPower>> {
     }
 
     let dict = props as CFDictionaryRef;
-    let arr_ref = cf_utils::cfdict_get(dict, "PowerOutDetails");
-    if arr_ref.is_null() {
-        cf_utils::cf_release(props as _);
-        return None;
-    }
 
-    let arr = arr_ref as CFArrayRef;
-    let count = cf_utils::cfarray_len(arr);
-    let mut ports = Vec::new();
-    for i in 0..count {
-        let entry = cf_utils::cfarray_get(arr, i);
-        if !entry.is_null() {
+    // PowerOutDetails carries the measured watts per port, but the battery
+    // firmware only lists the port(s) currently winning USB-PD negotiation —
+    // a low-power charger drops out the instant another port ramps up. We read
+    // it for watts, then fuse with PortControllerInfo (below) for presence.
+    let mut watts_by_port: std::collections::HashMap<u32, (f32, u32)> =
+        std::collections::HashMap::new();
+    let arr_ref = cf_utils::cfdict_get(dict, "PowerOutDetails");
+    if !arr_ref.is_null() {
+        let arr = arr_ref as CFArrayRef;
+        let count = cf_utils::cfarray_len(arr);
+        for i in 0..count {
+            let entry = cf_utils::cfarray_get(arr, i);
+            if entry.is_null() {
+                continue;
+            }
             let d = entry as CFDictionaryRef;
             let port_idx = cf_utils::cfdict_get_i64(d, "PortIndex").unwrap_or(-1);
+            if port_idx < 0 {
+                continue;
+            }
             let watts_mw = cf_utils::cfdict_get_i64(d, "Watts").unwrap_or(0);
             let pd_mw = cf_utils::cfdict_get_i64(d, "PDPowermW").unwrap_or(0);
             let power_mw = if watts_mw > 0 { watts_mw } else { pd_mw };
             let loc_id = cf_utils::cfdict_get_i64(d, "LocationID").unwrap_or(0) as u32;
-            if port_idx >= 0 {
-                ports.push(UsbPortPower {
-                    port_index: port_idx as u32,
-                    power_w: power_mw as f32 / 1000.0,
-                    location_id: loc_id,
-                });
+            watts_by_port.insert(port_idx as u32, (power_mw as f32 / 1000.0, loc_id));
+        }
+    }
+
+    // PortControllerInfo lists every physical port every poll. The FetStatus
+    // high bit (0x80) means the Mac is sourcing power out of that port, which
+    // is the reliable "a device is charging here" signal independent of the
+    // PowerOutDetails prioritization. Index in this array == PortIndex above.
+    let mut ports: Vec<UsbPortPower> = Vec::new();
+    let mut sourced_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let pci_ref = cf_utils::cfdict_get(dict, "PortControllerInfo");
+    if !pci_ref.is_null() {
+        let pci = pci_ref as CFArrayRef;
+        let pci_count = cf_utils::cfarray_len(pci);
+        for i in 0..pci_count {
+            let entry = cf_utils::cfarray_get(pci, i);
+            if entry.is_null() {
+                continue;
             }
+            let d = entry as CFDictionaryRef;
+            let fet = cf_utils::cfdict_get_i64(d, "PortControllerFetStatus").unwrap_or(0);
+            if fet & 0x80 == 0 {
+                continue; // not sourcing power out of this port
+            }
+            let idx = i as u32;
+            sourced_indices.insert(idx);
+            let (power_w, location_id) = watts_by_port.get(&idx).copied().unwrap_or((0.0, 0));
+            ports.push(UsbPortPower {
+                port_index: idx,
+                power_w,
+                location_id,
+                sourcing: true,
+            });
+        }
+    }
+
+    // Defensive fallback: if PortControllerInfo is unavailable (older Macs),
+    // fall back to whatever PowerOutDetails reported so we don't regress.
+    for (idx, (power_w, location_id)) in watts_by_port {
+        if !sourced_indices.contains(&idx) {
+            ports.push(UsbPortPower {
+                port_index: idx,
+                power_w,
+                location_id,
+                sourcing: true,
+            });
         }
     }
 

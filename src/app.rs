@@ -538,6 +538,7 @@ pub struct App {
     proc_net_rates: std::collections::HashMap<i32, (f64, f64)>,
     fan_wh: Vec<f64>,
     usb_wh: Vec<f64>,
+    usb_orphan_wh: std::collections::HashMap<u32, f64>,
     usb_prev_bytes: Vec<(u64, u64)>,
     usb_rates: Vec<(f64, f64)>,
     machine_name: String,
@@ -601,6 +602,7 @@ impl App {
             proc_net_rates: std::collections::HashMap::new(),
             fan_wh: Vec::new(),
             usb_wh: Vec::new(),
+            usb_orphan_wh: std::collections::HashMap::new(),
             usb_prev_bytes: Vec::new(),
             usb_rates: Vec::new(),
             machine_name,
@@ -665,7 +667,8 @@ impl App {
             self.usb_wh.resize(m.usb_devices.len(), 0.0);
             self.usb_rates.resize(m.usb_devices.len(), (0.0, 0.0));
             self.usb_prev_bytes.resize(m.usb_devices.len(), (0, 0));
-            let port_power = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
+            let (port_power, orphan_ports) =
+                assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
             for (i, d) in m.usb_devices.iter().enumerate() {
                 let watts =
                     port_power[i].unwrap_or(d.power_ma.unwrap_or(0) as f32 * 5.0 / 1000.0) as f64;
@@ -678,6 +681,13 @@ impl App {
                     );
                 }
                 self.usb_prev_bytes[i] = (d.bytes_read, d.bytes_written);
+            }
+            // Accumulate Wh for charging-only ports that matched no device,
+            // keyed by stable PortIndex so reordering doesn't lose energy.
+            for &pi in &orphan_ports {
+                let port = &m.usb_power_per_port[pi];
+                *self.usb_orphan_wh.entry(port.port_index).or_insert(0.0) +=
+                    port.power_w as f64 * dt_h;
             }
             self.wh.wifi += if m.wifi_power_w > 0.0 {
                 m.wifi_power_w as f64 * dt_h
@@ -757,10 +767,14 @@ impl App {
             self.push_history(fan_key(i), fan.estimated_power_w as f64);
         }
         {
-            let pp = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
+            let (pp, orphan_ports) = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
             for (i, d) in m.usb_devices.iter().enumerate() {
                 let watts = pp[i].unwrap_or(d.power_ma.unwrap_or(0) as f32 * 5.0 / 1000.0);
                 self.push_history(usb_key(i), watts as f64);
+            }
+            for &pi in &orphan_ports {
+                let port = &m.usb_power_per_port[pi];
+                self.push_history(usb_port_key(port.port_index), port.power_w as f64);
             }
         }
         self.push_history(
@@ -1027,6 +1041,7 @@ impl App {
         self.history.clear();
         self.fan_wh.iter_mut().for_each(|v| *v = 0.0);
         self.usb_wh.iter_mut().for_each(|v| *v = 0.0);
+        self.usb_orphan_wh.clear();
         self.usb_prev_bytes.clear();
         self.usb_rates.clear();
         self.proc_baseline = self
@@ -2170,7 +2185,8 @@ impl App {
         } else {
             (descriptor_sum, false)
         };
-        let usb_total_wh: f64 = self.usb_wh.iter().sum();
+        let usb_total_wh: f64 =
+            self.usb_wh.iter().sum::<f64>() + self.usb_orphan_wh.values().sum::<f64>();
         rows.push(TreeRow::pw_est(
             "peripherals",
             Some("system"),
@@ -2390,7 +2406,8 @@ impl App {
             )
         }));
 
-        if m.usb_devices.is_empty() {
+        let (pp, orphan_ports) = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
+        if m.usb_devices.is_empty() && usb_total_w <= 0.0 && orphan_ports.is_empty() {
             rows.push(TreeRow::info(
                 Some("peripherals"),
                 &format!("{}└─ ", pc),
@@ -2405,17 +2422,24 @@ impl App {
             } else {
                 TreeRow::pw_max
             };
+            // When IOKit enumerates nothing but power is measured, the draw
+            // comes from charging-only device(s) on a port (issue #15).
+            let usb_label = if m.usb_devices.is_empty() {
+                "USB (unidentified draw)".to_string()
+            } else {
+                let n = m.usb_devices.len() + orphan_ports.len();
+                format!("USB ({} {})", n, if n == 1 { "device" } else { "devices" })
+            };
             rows.push(usb_row_fn(
                 "usb",
                 Some("peripherals"),
                 &format!("{}└─ ", pc),
-                &format!("USB ({} devices)", m.usb_devices.len()),
+                &usb_label,
                 usb_total_w,
                 usb_total_wh,
                 Style::default(),
                 pin("usb"),
             ));
-            let pp = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
 
             // Build children map for hierarchical rendering
             let mut children_of: std::collections::HashMap<u32, Vec<usize>> =
@@ -2429,10 +2453,19 @@ impl App {
                 }
             }
 
+            // Orphan ports render as extra top-level siblings after enumerated
+            // devices, so the last real device uses ├─ when orphans follow.
+            let orphan_count = orphan_ports.len();
+
             // DFS stack: (device_index, parent_key, base_continuation, siblings_after)
             let mut stack: Vec<(usize, &'static str, String, usize)> = Vec::new();
             for (pos, &i) in top_level.iter().enumerate().rev() {
-                stack.push((i, "usb", format!("{}   ", pc), top_level.len() - 1 - pos));
+                stack.push((
+                    i,
+                    "usb",
+                    format!("{}   ", pc),
+                    (top_level.len() - 1 - pos) + orphan_count,
+                ));
             }
 
             while let Some((i, parent_key, base, siblings_after)) = stack.pop() {
@@ -2509,6 +2542,38 @@ impl App {
                         stack.push((ci, key, cont.clone(), kids.len() - 1 - pos));
                     }
                 }
+            }
+
+            // Charging-only ports with no enumerated device (issue #15).
+            let orphan_base = format!("{}   ", pc);
+            let orphan_style = Style::new().add_modifier(Modifier::ITALIC);
+            for (j, &pi) in orphan_ports.iter().enumerate() {
+                let port = &m.usb_power_per_port[pi];
+                let is_last = j + 1 == orphan_ports.len();
+                let pfx = if is_last {
+                    format!("{}└─ ", orphan_base)
+                } else {
+                    format!("{}├─ ", orphan_base)
+                };
+                // Stable key by PortIndex so the row identity (history, pin,
+                // collapse state) doesn't shift when enumerated devices come
+                // and go on other ports (issue #15 follow-up).
+                let key = usb_port_key(port.port_index);
+                let orphan_wh = self
+                    .usb_orphan_wh
+                    .get(&port.port_index)
+                    .copied()
+                    .unwrap_or(0.0);
+                rows.push(TreeRow::pw(
+                    key,
+                    Some("usb"),
+                    &pfx,
+                    &format!("Port {} (unidentified)", port.port_index),
+                    port.power_w,
+                    orphan_wh,
+                    orphan_style,
+                    pin(key),
+                ));
             }
         }
 
@@ -3496,12 +3561,23 @@ fn tier_label(name: Option<&str>, fallback: &str) -> String {
 }
 
 /// Assign PowerOutDetails entries to USB devices without duplicates.
-/// Returns one Option<f32> per device. Priority: exact location_id match,
-/// then port_idx_b (upper byte — root hub / controller), then port_idx_a.
-fn assign_usb_port_power(ports: &[UsbPortPower], devices: &[UsbDevice]) -> Vec<Option<f32>> {
+/// Returns one Option<f32> per device (matched only by exact location_id or by
+/// controller id — the two signals that actually tie a port to a device) plus
+/// the indices of ports that carry power but matched no enumerated device.
+///
+/// We deliberately do NOT greedily pair leftover devices with leftover ports:
+/// PowerOutDetails ports carry location_id == 0, so a greedy guess would let an
+/// enumerated device (e.g. an idle, fully-charged iPhone whose own port dropped
+/// out of PowerOutDetails) steal the port of a charging-only device and hide it.
+/// Unmatched devices instead fall back to their bMaxPower descriptor estimate,
+/// and unmatched powered ports surface as "unidentified" rows (issue #15).
+fn assign_usb_port_power(
+    ports: &[UsbPortPower],
+    devices: &[UsbDevice],
+) -> (Vec<Option<f32>>, Vec<usize>) {
     let mut result = vec![None; devices.len()];
     if ports.is_empty() {
-        return result;
+        return (result, Vec::new());
     }
     let mut claimed = vec![false; ports.len()];
 
@@ -3531,28 +3607,25 @@ fn assign_usb_port_power(ports: &[UsbPortPower], devices: &[UsbDevice]) -> Vec<O
         let controller_id = (dev.location_id >> 24) & 0xFF;
         let expected_port = controller_id + 1;
         for (pi, port) in ports.iter().enumerate() {
-            if !claimed[pi] && port.port_index == expected_port && port.power_w > 0.0 {
-                result[di] = Some(port.power_w);
+            if !claimed[pi] && port.port_index == expected_port {
+                if port.power_w > 0.0 {
+                    result[di] = Some(port.power_w);
+                }
                 claimed[pi] = true;
                 break;
             }
         }
     }
 
-    // Pass 4: pair remaining unmatched devices with remaining unclaimed ports
-    let mut unclaimed: Vec<usize> = (0..ports.len())
-        .filter(|pi| !claimed[*pi] && ports[*pi].power_w > 0.0)
+    // Any sourcing port not claimed by an enumerated device is an orphan
+    // (issue #15): a device charging without a USB data handshake, invisible to
+    // IOKit. Presence is the sourcing flag, not the instantaneous wattage, so
+    // the row stays put even when PowerOutDetails momentarily reports 0 W.
+    let orphans: Vec<usize> = (0..ports.len())
+        .filter(|pi| !claimed[*pi] && ports[*pi].sourcing)
         .collect();
-    for di in 0..devices.len() {
-        if result[di].is_some() || unclaimed.is_empty() {
-            continue;
-        }
-        let pi = unclaimed.remove(0);
-        result[di] = Some(ports[pi].power_w);
-        claimed[pi] = true;
-    }
 
-    result
+    (result, orphans)
 }
 
 fn usb_key(index: usize) -> &'static str {
@@ -3561,6 +3634,30 @@ fn usb_key(index: usize) -> &'static str {
         "usb11", "usb12", "usb13", "usb14", "usb15",
     ];
     KEYS.get(index).copied().unwrap_or("usb0")
+}
+
+/// Stable key for an unidentified USB port row, keyed by its PortIndex so the
+/// row identity stays put when enumerated devices appear/disappear elsewhere.
+fn usb_port_key(port_index: u32) -> &'static str {
+    const KEYS: [&str; 16] = [
+        "usbport0",
+        "usbport1",
+        "usbport2",
+        "usbport3",
+        "usbport4",
+        "usbport5",
+        "usbport6",
+        "usbport7",
+        "usbport8",
+        "usbport9",
+        "usbport10",
+        "usbport11",
+        "usbport12",
+        "usbport13",
+        "usbport14",
+        "usbport15",
+    ];
+    KEYS.get(port_index as usize).copied().unwrap_or("usbport0")
 }
 
 // Intentional Box::leak: history/charts require &'static str keys. Dead PIDs stay

@@ -265,6 +265,12 @@ pub struct UsbPortPower {
     pub port_index: u32,
     pub power_w: f32,
     pub location_id: u32,
+    /// True when the port controller reports the Mac is actively sourcing power
+    /// out of this port (PortControllerInfo FetStatus high bit). This is the
+    /// authoritative presence signal: PowerOutDetails transiently drops a port
+    /// during USB-PD renegotiation, but the controller keeps reporting it, so
+    /// we surface the port whenever it is sourcing — even at zero measured W.
+    pub sourcing: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
