@@ -1237,7 +1237,7 @@ impl Sampler {
                             if let Ok(raw) = ior.parse_raw(p, &cur) {
                                 let mut soc = estimator.assemble(raw);
                                 if let Ok(mut mg) = m.lock() {
-                                    // The SMC thread owns these two fields.
+                                    // The system-stats source owns these two fields.
                                     soc.gpu_util_renderer = mg.soc.gpu_util_renderer;
                                     soc.gpu_util_tiler = mg.soc.gpu_util_tiler;
                                     mg.soc = soc;
