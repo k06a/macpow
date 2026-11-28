@@ -380,9 +380,10 @@ fn dt_u32(bytes: &[u8]) -> Option<u32> {
 /// differ in voltage only, so the first table is read. Its 0 Hz entry is the
 /// powered-off state, which IOReport lists as `OFF` rather than as a P-state.
 ///
-/// `None` when the blob isn't a whole number of such tables, or doesn't hold
-/// the `active_states` (`gpu-num-perf-states`) the node announces: better to
-/// fall back to guessing among the pmgr tables than to trust a misread one.
+/// `None` when the blob isn't a whole number of such tables, doesn't hold the
+/// `active_states` (`gpu-num-perf-states`) the node announces, or doesn't read
+/// as a GPU's frequencies: better to fall back to guessing among the pmgr
+/// tables than to trust a misread one.
 fn gpu_freqs_from_sgx(
     perf_states: &[u8],
     state_count: usize,
@@ -401,7 +402,14 @@ fn gpu_freqs_from_sgx(
         .filter(|&f| f > 0)
         .collect();
     let as_announced = active_states.unwrap_or(hz.len()) == hz.len();
-    (!hz.is_empty() && as_announced).then(|| to_mhz(&hz))
+    // A node needn't announce its states, and the length alone proves little:
+    // a blob in another layout can have it too. So the numbers must read as
+    // GPU states as well, rising from a whole MHz to a top inside the range
+    // the pmgr guess accepts.
+    let mhz = to_mhz(&hz);
+    let rising = mhz.first().is_some_and(|&low| low > 0) && mhz.windows(2).all(|w| w[0] < w[1]);
+    let top_plausible = mhz.last().is_some_and(|top| (300..=5000).contains(top));
+    (as_announced && rising && top_plausible).then_some(mhz)
 }
 
 /// Pick the E-CPU, P-CPU and GPU tables out of every pmgr `voltage-states*`
@@ -583,7 +591,9 @@ fn read_dvfs_tables() -> DvfsTables {
 
                     cf_utils::cf_release(props as _);
                 }
-            } else if name == "sgx" {
+            } else if name == "sgx" && sgx_gpu.is_none() {
+                // (One node is expected. Should there be another, it mustn't
+                // replace a table already read with one that doesn't parse.)
                 let mut props = std::ptr::null_mut();
                 if IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null(), 0) == 0
                     && !props.is_null()
@@ -2424,6 +2434,41 @@ mod tests {
         assert_eq!(gpu_freqs_from_sgx(&[], 14, None), None);
         // Nothing but off states.
         assert_eq!(gpu_freqs_from_sgx(&[0; 14 * 8], 14, None), None);
+    }
+
+    /// What [`gpu_freqs_from_sgx`] makes of four states given as raw words, on
+    /// a node that announces no count of its own.
+    fn four_states(words: &[u32]) -> Option<Vec<u32>> {
+        let blob: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        gpu_freqs_from_sgx(&blob, 4, None)
+    }
+
+    #[test]
+    fn sgx_perf_states_that_are_no_gpu_frequencies_are_not_trusted() {
+        const M: u32 = 1_000_000;
+        // Without `gpu-num-perf-states` the shape proves little, so the
+        // numbers have to look like GPU states too. These do:
+        let table = [0, 125, 338 * M, 595, 486 * M, 635, 636 * M, 660];
+        assert_eq!(four_states(&table), Some(vec![338, 486, 636]));
+
+        // Out of order, or one state twice.
+        let unordered = [0, 125, 486 * M, 635, 338 * M, 595, 636 * M, 660];
+        assert_eq!(four_states(&unordered), None);
+        let repeated = [0, 125, 338 * M, 595, 338 * M, 635, 636 * M, 660];
+        assert_eq!(four_states(&repeated), None);
+        // A top frequency no GPU has: 3 MHz, 6 GHz (given in kHz).
+        assert_eq!(four_states(&[0, 0, 1, 0, 2, 0, 3, 0]), None);
+        let too_fast = [0, 125, 338_000, 595, 486_000, 635, 6_000_000, 660];
+        assert_eq!(four_states(&too_fast), None);
+        // A first word that is no frequency (7 Hz) would be taken for a state
+        // and shift every P-state by one.
+        let odd_off_state = [7, 125, 338 * M, 595, 486 * M, 635, 636 * M, 660];
+        assert_eq!(four_states(&odd_off_state), None);
+        // Three-word entries read as pairs. Two such tables are as long as
+        // three tables of pairs, so the length fits; the first "table" reads
+        // 0, 7 Hz, 595 Hz, 486 MHz.
+        let wider: Vec<u32> = table.chunks(2).flat_map(|p| [p[0], p[1], 7]).collect();
+        assert_eq!(four_states(&[wider.clone(), wider].concat()), None);
     }
 
     /// The M5 Max layout: `-sram` tables carry MHz and the SRAM rail voltage,
