@@ -1,11 +1,7 @@
 use crate::cf_utils;
 use crate::iokit_ffi::*;
 use crate::types::{AdapterInfo, BatteryInfo, UsbPortPower};
-use core_foundation::base::TCFType;
-use core_foundation::number::CFNumber;
-use core_foundation_sys::base::CFGetTypeID;
-use core_foundation_sys::dictionary::{CFDictionaryGetTypeID, CFDictionaryRef};
-use core_foundation_sys::number::{CFNumberGetTypeID, CFNumberRef};
+use core_foundation_sys::dictionary::CFDictionaryRef;
 use std::ffi::CStr;
 
 pub fn read_battery() -> BatteryInfo {
@@ -193,13 +189,15 @@ unsafe fn readings_from(
         cycle_count: cf_utils::cfdict_get_i64(battery, "CycleCount"),
         gauge_places: [
             gauge_values(Some(battery)),
-            gauge_values(dict_in(battery, "BatteryData")),
-            gauge_values(pack.and_then(|pack| dict_in(pack, "BatteryData"))),
+            gauge_values(cf_utils::cfdict_get_dict(battery, "BatteryData")),
+            gauge_values(pack.and_then(|pack| cf_utils::cfdict_get_dict(pack, "BatteryData"))),
         ],
     }
 }
 
 /// Reads the gauge keys of one dictionary; all `None` without a dictionary.
+/// These keys have already moved between macOS releases; the cf_utils getters
+/// read one that comes back with a different type as missing.
 ///
 /// # Safety
 /// `dict`, when given, must be a valid CFDictionary reference.
@@ -208,40 +206,12 @@ unsafe fn gauge_values(dict: Option<CFDictionaryRef>) -> GaugeValues {
         return GaugeValues::default();
     };
     GaugeValues {
-        nominal_charge_mah: number_in(dict, "NominalChargeCapacity"),
-        design_capacity_mah: number_in(dict, "DesignCapacity"),
-        raw_max_capacity_mah: number_in(dict, "AppleRawMaxCapacity"),
-        fcc_comp1_mah: number_in(dict, "FccComp1"),
-        temperature_centi_c: number_in(dict, "Temperature"),
+        nominal_charge_mah: cf_utils::cfdict_get_f64(dict, "NominalChargeCapacity"),
+        design_capacity_mah: cf_utils::cfdict_get_f64(dict, "DesignCapacity"),
+        raw_max_capacity_mah: cf_utils::cfdict_get_f64(dict, "AppleRawMaxCapacity"),
+        fcc_comp1_mah: cf_utils::cfdict_get_f64(dict, "FccComp1"),
+        temperature_centi_c: cf_utils::cfdict_get_f64(dict, "Temperature"),
     }
-}
-
-// The two getters below check the type of a value before casting it. These
-// keys have already moved between macOS releases; one that comes back with a
-// different type has to read as missing, not reach the wrong CF function.
-
-/// `dict[key]` as a dictionary; `None` when absent or of another type.
-///
-/// # Safety
-/// `dict` must be a valid CFDictionary reference; the result borrows from it.
-unsafe fn dict_in(dict: CFDictionaryRef, key: &str) -> Option<CFDictionaryRef> {
-    let value = cf_utils::cfdict_get(dict, key);
-    if value.is_null() || CFGetTypeID(value) != CFDictionaryGetTypeID() {
-        return None;
-    }
-    Some(value as CFDictionaryRef)
-}
-
-/// `dict[key]` as a number; `None` when absent or of another type.
-///
-/// # Safety
-/// `dict` must be a valid CFDictionary reference.
-unsafe fn number_in(dict: CFDictionaryRef, key: &str) -> Option<f64> {
-    let value = cf_utils::cfdict_get(dict, key);
-    if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
-        return None;
-    }
-    CFNumber::wrap_under_get_rule(value as CFNumberRef).to_f64()
 }
 
 unsafe fn read_adapter_inner() -> Option<AdapterInfo> {
@@ -365,6 +335,10 @@ unsafe fn read_usb_power_per_port_inner() -> Option<Vec<UsbPortPower>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
 
     const NO_GAUGE: GaugeValues = GaugeValues {
         nominal_charge_mah: None,
@@ -573,5 +547,43 @@ mod tests {
             assert_close(value, 0.0);
         }
         assert_eq!(b.time_remaining_min, -1);
+    }
+
+    fn cf_dict(pairs: &[(&str, CFType)]) -> CFDictionary<CFString, CFType> {
+        let pairs: Vec<(CFString, CFType)> = pairs
+            .iter()
+            .map(|(key, value)| (CFString::new(key), value.clone()))
+            .collect();
+        CFDictionary::from_CFType_pairs(&pairs)
+    }
+
+    #[test]
+    fn registry_values_of_another_type_read_as_missing() {
+        let gauge = cf_dict(&[
+            ("DesignCapacity", CFNumber::from(6249i64).as_CFType()),
+            ("NominalChargeCapacity", CFString::new("5726").as_CFType()),
+        ]);
+        let battery = cf_dict(&[
+            ("CycleCount", CFNumber::from(241i64).as_CFType()),
+            ("BatteryData", gauge.as_CFType()),
+        ]);
+        let pack = cf_dict(&[("BatteryData", CFString::new("not a dict").as_CFType())]);
+        // SAFETY: both dictionaries are valid and outlive the call.
+        let r = unsafe {
+            readings_from(
+                battery.as_concrete_TypeRef(),
+                Some(pack.as_concrete_TypeRef()),
+            )
+        };
+        assert_eq!(r.cycle_count, Some(241));
+        assert_eq!(r.gauge_places[0], NO_GAUGE);
+        assert_eq!(
+            r.gauge_places[1],
+            GaugeValues {
+                design_capacity_mah: Some(6249.0),
+                ..NO_GAUGE
+            }
+        );
+        assert_eq!(r.gauge_places[2], NO_GAUGE);
     }
 }

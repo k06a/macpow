@@ -731,17 +731,10 @@ fn read_gpu_core_count() -> u32 {
     }
 }
 
-/// `gpu-core-count` from the properties of one accelerator service.
+/// `gpu-core-count` from the properties of one accelerator service. The value
+/// is whatever the driver published; `cfdict_get_i64` reads anything but a
+/// CFNumber as missing.
 unsafe fn gpu_core_count_prop(props: CFDictionaryRef) -> Option<u32> {
-    let value = cf_utils::cfdict_get(props, "gpu-core-count");
-    // The value is whatever the driver published, and reading anything but a
-    // CFNumber as a number is undefined behaviour, so check the type first.
-    if value.is_null()
-        || core_foundation_sys::base::CFGetTypeID(value)
-            != core_foundation_sys::number::CFNumberGetTypeID()
-    {
-        return None;
-    }
     cf_utils::cfdict_get_i64(props, "gpu-core-count").and_then(|n| u32::try_from(n).ok())
 }
 
@@ -942,14 +935,10 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
         && !props.is_null()
     {
         let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
-        let stats = cf_utils::cfdict_get(dict, "PerformanceStatistics");
         // Any IOAccelerator can match, so do not take it on trust that the
-        // property is the dictionary the Apple GPU drivers publish.
-        if !stats.is_null()
-            && core_foundation_sys::base::CFGetTypeID(stats)
-                == core_foundation_sys::dictionary::CFDictionaryGetTypeID()
-        {
-            let sd = stats as core_foundation_sys::dictionary::CFDictionaryRef;
+        // property is the dictionary the Apple GPU drivers publish:
+        // `cfdict_get_dict` reads anything else as missing.
+        if let Some(sd) = cf_utils::cfdict_get_dict(dict, "PerformanceStatistics") {
             let dev = cf_utils::cfdict_get_i64(sd, "Device Utilization %").unwrap_or(0) as u32;
             let ren = cf_utils::cfdict_get_i64(sd, "Renderer Utilization %").unwrap_or(0) as u32;
             let til = cf_utils::cfdict_get_i64(sd, "Tiler Utilization %").unwrap_or(0) as u32;
