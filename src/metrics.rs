@@ -958,6 +958,38 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
     result
 }
 
+// ── System stats: CPU usage, memory, GPU utilisation ─────────────────────────
+
+/// One reading of the metrics that come from Mach and the IORegistry alone.
+/// They need neither the SMC nor IOReport, so they also work in a virtual
+/// machine or a sandbox where those are missing.
+struct SystemStats {
+    /// One value per logical CPU. Empty on a reader's first reading, which
+    /// has no earlier tick counts to measure an interval against.
+    cpu_usage_pct: Vec<f32>,
+    mem_used_gb: f32,
+    /// (device, renderer, tiler) as the GPU driver reported them.
+    gpu_util: (u32, u32, u32),
+}
+
+#[derive(Default)]
+struct SystemStatsReader {
+    prev_cpu_ticks: Vec<(u64, u64)>,
+}
+
+impl SystemStatsReader {
+    fn read(&mut self) -> SystemStats {
+        let cpu_ticks = read_cpu_ticks();
+        let cpu_usage_pct = compute_cpu_usage(&self.prev_cpu_ticks, &cpu_ticks);
+        self.prev_cpu_ticks = cpu_ticks;
+        SystemStats {
+            cpu_usage_pct,
+            mem_used_gb: read_mem_used_gb(),
+            gpu_util: read_gpu_utilization(),
+        }
+    }
+}
+
 // ── Per-CPU utilization via Mach host_processor_info ─────────────────────────
 
 extern "C" {
@@ -1170,7 +1202,6 @@ impl Sampler {
                 };
                 let mut disc_handle: Option<std::thread::JoinHandle<Vec<(String, String)>>> =
                     Some(smc.start_temp_discovery());
-                let mut prev_ticks = read_cpu_ticks();
                 while running.load(Ordering::Relaxed) {
                     // Non-blocking: check if temp discovery finished
                     if let Some(ref h) = disc_handle {
@@ -1194,9 +1225,6 @@ impl Sampler {
                     let adapter_power = smc.read_f32("PDTR").unwrap_or(0.0);
                     let wifi_power = smc.read_f32("wiPm").unwrap_or(0.0);
                     let usb_power_smc = smc.read_f32("PUSB").unwrap_or(0.0);
-                    let cur_ticks = read_cpu_ticks();
-                    let cpu_usage = compute_cpu_usage(&prev_ticks, &cur_ticks);
-                    prev_ticks = cur_ticks;
                     if let Ok(mut mg) = m.lock() {
                         mg.temperatures = temps;
                         mg.fans = fans;
@@ -1209,11 +1237,6 @@ impl Sampler {
                         mg.adapter_power_w = adapter_power;
                         mg.wifi_power_w = wifi_power;
                         mg.usb_power_smc_w = usb_power_smc;
-                        mg.mem_used_gb = read_mem_used_gb();
-                        mg.cpu_usage_pct = cpu_usage;
-                        let (_, gr, gt) = read_gpu_utilization();
-                        mg.soc.gpu_util_renderer = gr;
-                        mg.soc.gpu_util_tiler = gt;
                     }
                     std::thread::sleep(dt);
                 }
@@ -1223,6 +1246,25 @@ impl Sampler {
                     }
                 }
             }));
+        }
+
+        // ── System stats (CPU usage, memory, GPU utilisation) ────────────
+        // Kept apart from the SMC source: that one ends at once where the SMC
+        // cannot be opened, and none of these values depends on it.
+        {
+            let m = shared.clone();
+            let mut reader = SystemStatsReader::default();
+            spawn_periodic(&mut handles, &running, dt, move || {
+                // Every system call is made here, before the lock is taken.
+                let stats = reader.read();
+                if let Ok(mut mg) = m.lock() {
+                    mg.cpu_usage_pct = stats.cpu_usage_pct;
+                    mg.mem_used_gb = stats.mem_used_gb;
+                    let (_, renderer, tiler) = stats.gpu_util;
+                    mg.soc.gpu_util_renderer = renderer;
+                    mg.soc.gpu_util_tiler = tiler;
+                }
+            });
         }
 
         // ── Battery ──────────────────────────────────────────────────────
@@ -1686,6 +1728,31 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Needs neither the SMC nor IOReport, so it has to pass in a VM too.
+    #[test]
+    fn system_stats_reader_covers_every_logical_cpu_and_used_memory() {
+        // SAFETY: sysconf takes no pointers and has no preconditions.
+        let logical_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+        assert!(logical_cpus > 0);
+
+        let mut reader = SystemStatsReader::default();
+        let first = reader.read();
+        assert!(
+            first.cpu_usage_pct.is_empty(),
+            "usage needs two tick readings, got {:?}",
+            first.cpu_usage_pct
+        );
+        assert!(first.mem_used_gb > 0.0, "used memory {}", first.mem_used_gb);
+
+        let second = reader.read();
+        assert_eq!(second.cpu_usage_pct.len(), logical_cpus as usize);
+        assert!(second
+            .cpu_usage_pct
+            .iter()
+            .all(|pct| (0.0..=100.0).contains(pct)));
+        assert!(second.mem_used_gb > 0.0);
+    }
 
     #[test]
     fn compute_cpu_usage_returns_expected_percentages() {
