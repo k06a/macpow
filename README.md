@@ -94,7 +94,7 @@ pixi exec macpow
 macpow                    # TUI mode (default)
 macpow --json             # JSON Lines on stdout: one compact object per line
 macpow --json | jq .      # the same stream, pretty-printed
-macpow --interval 500     # Set sampling interval in ms (default: 250)
+macpow --interval 500     # Sampling interval in ms, 100 to 60000 (default: 250)
 macpow --dump             # Dump IOReport channel names (diagnostics)
 macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 ```

@@ -1110,7 +1110,9 @@ impl Sampler {
         };
         let running = Arc::new(AtomicBool::new(true));
         let mut handles = Vec::new();
-        let dt = Duration::from_millis(interval_ms.max(100));
+        // Used exactly as given. The CLI validates `--interval` once (100 ms
+        // to 60 s); a second, silent floor here made the two disagree.
+        let dt = Duration::from_millis(interval_ms);
 
         // ── IOReport (SoC power + frequencies) ───────────────────────────
         {

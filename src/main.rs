@@ -17,11 +17,17 @@ use std::io::{self, stdout, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Accepted `--interval` values, in milliseconds. The sources do not change
+/// faster than every 100 ms, so anything lower only repeats the same numbers
+/// (unlimited, `--json --interval 0` wrote about 190 MB/s of duplicates). The
+/// upper bound keeps a typo from looking like a hung program.
+const INTERVAL_MS: std::ops::RangeInclusive<u64> = 100..=60_000;
+
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_PKG_NAME"), version, about = "Apple Silicon Power Monitor TUI")]
 struct CliArgs {
-    /// Sampling interval in milliseconds
-    #[arg(long, default_value_t = 250)]
+    /// Sampling interval in milliseconds (100 to 60000)
+    #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u64).range(INTERVAL_MS))]
     interval: u64,
 
     /// Output JSON to stdout instead of TUI
@@ -193,6 +199,29 @@ mod tests {
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    fn parse_interval(value: &str) -> Result<u64, clap::Error> {
+        CliArgs::try_parse_from(["macpow", "--interval", value]).map(|args| args.interval)
+    }
+
+    #[test]
+    fn interval_defaults_to_250_and_accepts_100_ms_to_one_minute() {
+        assert_eq!(CliArgs::try_parse_from(["macpow"]).unwrap().interval, 250);
+        assert_eq!(parse_interval("100").unwrap(), 100);
+        assert_eq!(parse_interval("60000").unwrap(), 60_000);
+    }
+
+    #[test]
+    fn interval_outside_the_range_is_a_usage_error() {
+        for value in ["0", "1", "99", "60001", "18446744073709551615"] {
+            let err = parse_interval(value).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "--interval {value}"
+            );
         }
     }
 

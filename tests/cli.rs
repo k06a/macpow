@@ -98,6 +98,24 @@ fn version_prints_the_package_version() {
     );
 }
 
+/// Unvalidated, `--interval 0` made `--json` write duplicates as fast as the
+/// pipe took them, while the samplers silently ran at 100 ms.
+#[test]
+fn interval_outside_100_to_60000_ms_is_rejected() {
+    for value in ["0", "99", "60001"] {
+        // No --json and no terminal: even without the validation this run
+        // could not get as far as producing output.
+        let mut child = spawn(&["--interval", value]);
+        let status = wait(&mut child);
+        let stderr = stderr_of(&mut child);
+        assert_eq!(status.code(), Some(2), "--interval {value}: {stderr}");
+        assert!(
+            stderr.contains("100..=60000"),
+            "--interval {value}: {stderr}"
+        );
+    }
+}
+
 /// Ctrl+C while the reader is not keeping up used to run `process::exit` in
 /// the signal handler and abort with "RefCell already borrowed" (exit 134).
 #[test]
