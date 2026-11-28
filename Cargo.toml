@@ -84,5 +84,6 @@ harness = false
 strip = true      # -531 KB: no symbol table (panic messages keep their file:line)
 lto = true        # -379 KB: inlining and dead-code removal across crates
 codegen-units = 1 # -83 KB: LLVM optimises the whole program as one unit
-# `panic` stays "unwind": run_tui() needs catch_unwind to restore the terminal after a
-# panic, and Sampler::new() needs it to survive a start-up probe that panics.
+# `panic` stays "unwind": a panic in one sampler thread then ends only that thread, not
+# the whole monitor; Sampler::new() survives a start-up probe that panics (catch_unwind);
+# and the TUI's terminal guard still runs its Drop on the way out.
