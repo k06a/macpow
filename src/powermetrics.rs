@@ -2,8 +2,10 @@ use crate::process_utils::command_output_timeout;
 use crate::types::{DiskInfo, NetworkInfo};
 use std::collections::HashMap;
 
-/// Parsed cumulative byte counters per network interface.
-pub type NetCounters = HashMap<String, (u64, u64)>; // iface → (bytes_in, bytes_out)
+/// Cumulative byte counters per network interface, as `getifaddrs` reports
+/// them: only the low 32 bits of the kernel's 64-bit counters, so each one
+/// wraps every 4 GiB.
+pub type NetCounters = HashMap<String, (u32, u32)>; // iface → (bytes_in, bytes_out)
 
 #[repr(C)]
 struct IfData {
@@ -59,8 +61,8 @@ pub fn read_net_counters() -> NetCounters {
                 continue;
             }
             let data = &*(entry.ifa_data as *const IfData);
-            let ib = data.ifi_ibytes as u64;
-            let ob = data.ifi_obytes as u64;
+            let ib = data.ifi_ibytes;
+            let ob = data.ifi_obytes;
             if ib > 0 || ob > 0 {
                 let e = result.entry(name.into_owned()).or_insert((0, 0));
                 e.0 = e.0.max(ib);
@@ -101,8 +103,14 @@ fn compute_net_rates_for(
         .iter()
         .filter(|(iface, _)| filter(iface))
         .filter_map(|(iface, &(ci, co))| {
+            // The counters wrap every 4 GiB, and a saturating difference would
+            // turn each wrap into a 0 B/s sample. Wrapping subtraction is the
+            // true delta as long as an interface moves less than 4 GiB per
+            // sample. The price: an interface re-created under the same name
+            // between two samples counts from zero again and reads as one
+            // bogus burst.
             prev.get(iface)
-                .map(|&(pi, po)| (ci.saturating_sub(pi), co.saturating_sub(po)))
+                .map(|&(pi, po)| (ci.wrapping_sub(pi) as u64, co.wrapping_sub(po) as u64))
         })
         .fold((0u64, 0u64), |(ai, ao), (di, do_)| (ai + di, ao + do_));
     NetworkInfo {
@@ -220,12 +228,12 @@ mod tests {
     #[test]
     fn compute_net_rates_aggregates_interfaces() {
         let prev = HashMap::from([
-            ("en0".to_string(), (100u64, 200u64)),
-            ("en1".to_string(), (50u64, 100u64)),
+            ("en0".to_string(), (100u32, 200u32)),
+            ("en1".to_string(), (50u32, 100u32)),
         ]);
         let cur = HashMap::from([
-            ("en0".to_string(), (300u64, 500u64)),
-            ("en1".to_string(), (100u64, 160u64)),
+            ("en0".to_string(), (300u32, 500u32)),
+            ("en1".to_string(), (100u32, 160u32)),
         ]);
         let rates = compute_net_rates(&prev, &cur, 2.0);
         assert_eq!(rates.bytes_in_per_sec, 125.0);
@@ -235,16 +243,51 @@ mod tests {
     #[test]
     fn compute_net_rates_iface_filters_target_only() {
         let prev = HashMap::from([
-            ("en0".to_string(), (100u64, 200u64)),
-            ("en1".to_string(), (10u64, 20u64)),
+            ("en0".to_string(), (100u32, 200u32)),
+            ("en1".to_string(), (10u32, 20u32)),
         ]);
         let cur = HashMap::from([
-            ("en0".to_string(), (160u64, 260u64)),
-            ("en1".to_string(), (110u64, 220u64)),
+            ("en0".to_string(), (160u32, 260u32)),
+            ("en1".to_string(), (110u32, 220u32)),
         ]);
         let rates = compute_net_rates_iface(&prev, &cur, 2.0, "en0");
         assert_eq!(rates.bytes_in_per_sec, 30.0);
         assert_eq!(rates.bytes_out_per_sec, 30.0);
+    }
+
+    #[test]
+    fn compute_net_rates_counts_across_32bit_wrap() {
+        // en0 wraps in both directions between the two samples, en1 does not.
+        let prev = HashMap::from([
+            ("en0".to_string(), (u32::MAX - 999, u32::MAX - 1_999)),
+            ("en1".to_string(), (10u32, 20u32)),
+        ]);
+        let cur = HashMap::from([
+            ("en0".to_string(), (1_000u32, 2_000u32)),
+            ("en1".to_string(), (110u32, 220u32)),
+        ]);
+        let en0 = compute_net_rates_iface(&prev, &cur, 2.0, "en0");
+        assert_eq!(en0.bytes_in_per_sec, 1_000.0);
+        assert_eq!(en0.bytes_out_per_sec, 2_000.0);
+        let all = compute_net_rates(&prev, &cur, 2.0);
+        assert_eq!(all.bytes_in_per_sec, 1_050.0);
+        assert_eq!(all.bytes_out_per_sec, 2_100.0);
+    }
+
+    #[test]
+    fn compute_net_rates_total_may_exceed_32_bits() {
+        // 3 GB on each of two interfaces: the sum does not fit the counter type.
+        let prev = HashMap::from([
+            ("en0".to_string(), (1u32, 1u32)),
+            ("en1".to_string(), (1u32, 1u32)),
+        ]);
+        let cur = HashMap::from([
+            ("en0".to_string(), (3_000_000_001u32, 1u32)),
+            ("en1".to_string(), (3_000_000_001u32, 1u32)),
+        ]);
+        let rates = compute_net_rates(&prev, &cur, 1.0);
+        assert_eq!(rates.bytes_in_per_sec, 6_000_000_000.0);
+        assert_eq!(rates.bytes_out_per_sec, 0.0);
     }
 
     #[test]
