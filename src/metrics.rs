@@ -840,92 +840,92 @@ fn read_ssd_model() -> String {
 
 extern "C" {
     fn host_statistics64(host: u32, flavor: i32, info: *mut u8, count: *mut u32) -> i32;
+    fn host_page_size(host: u32, out_page_size: *mut usize) -> i32;
 }
 const HOST_VM_INFO64: i32 = 4;
-const HOST_VM_INFO64_COUNT: u32 = 38; // sizeof(vm_statistics64_data_t) / sizeof(integer_t)
-const PAGE_SIZE: u64 = 16384;
+const HOST_VM_INFO64_COUNT: u32 = 38; // HOST_VM_INFO64_REV1_COUNT: VmStats64 in integer_t units
 
-pub fn read_mem_used_gb() -> f32 {
-    #[repr(C)]
-    struct VmStats64 {
-        free_count: u32,
-        active_count: u32,
-        inactive_count: u32,
-        wire_count: u32,
-        zero_fill_count: u64,
-        reactivations: u64,
-        pageins: u64,
-        pageouts: u64,
-        faults: u64,
-        cow_faults: u64,
-        lookups: u64,
-        hits: u64,
-        purges: u64,
-        purgeable_count: u32,
-        speculative_count: u32,
-        decompressions: u64,
-        compressions: u64,
-        swapins: u64,
-        swapouts: u64,
-        compressor_page_count: u32,
-        throttled_count: u32,
-        external_page_count: u32,
-        internal_page_count: u32,
-        total_uncompressed_pages_in_compressor: u64,
-    }
-    unsafe {
-        let mut info = std::mem::zeroed::<VmStats64>();
-        let mut count = HOST_VM_INFO64_COUNT;
-        let kr = host_statistics64(
-            mach_host_self(),
-            HOST_VM_INFO64,
-            &mut info as *mut VmStats64 as *mut u8,
-            &mut count,
-        );
-        if kr != 0 {
-            return 0.0;
-        }
-        let used_pages = info.active_count as u64
-            + info.inactive_count as u64
-            + info.wire_count as u64
-            + info.compressor_page_count as u64;
-        (used_pages * PAGE_SIZE) as f32 / (1024.0 * 1024.0 * 1024.0)
-    }
+/// `vm_statistics64` from <mach/vm_statistics.h> up to its revision 1, which
+/// is all the kernel fills in for HOST_VM_INFO64_COUNT. The `*_count` fields
+/// are numbers of pages.
+#[repr(C)]
+#[derive(Default)]
+struct VmStats64 {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
 }
 
-pub fn read_gpu_utilization() -> (u32, u32, u32) {
-    static GPU_CLASS: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+// host_statistics64 writes HOST_VM_INFO64_COUNT integers into a VmStats64.
+const _: () = assert!(
+    std::mem::size_of::<VmStats64>() == HOST_VM_INFO64_COUNT as usize * std::mem::size_of::<i32>()
+);
 
-    let cached = GPU_CLASS.get_or_init(|| {
-        for gen in (13..=19).rev() {
-            for suffix in &["X\0", "G\0", "P\0"] {
-                let name = format!("AGXAcceleratorG{}{}", gen, suffix);
-                let matched = unsafe {
-                    let m = IOServiceMatching(name.as_ptr() as *const i8);
-                    if m.is_null() {
-                        false
-                    } else {
-                        let s = IOServiceGetMatchingService(0, m);
-                        if s != 0 {
-                            IOObjectRelease(s);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                };
-                if matched {
-                    return Some(name.into_bytes());
-                }
-            }
-        }
-        None
-    });
+/// Pages behind Activity Monitor's "Memory Used": app memory (anonymous pages
+/// that are not purgeable) + wired + compressor. File cache and purgeable
+/// pages are left out because the kernel gives them up on demand; counting
+/// them (active + inactive) made the figure creep up to the whole RAM on any
+/// Mac with some uptime.
+fn mem_used_pages(vm: &VmStats64) -> u64 {
+    let app = (vm.internal_page_count as u64).saturating_sub(vm.purgeable_count as u64);
+    app + vm.wire_count as u64 + vm.compressor_page_count as u64
+}
 
-    match cached {
-        Some(name) => unsafe { try_gpu_util_class(name) },
-        None => (0, 0, 0),
+pub fn read_mem_used_gb() -> f32 {
+    let mut vm = VmStats64::default();
+    let mut count = HOST_VM_INFO64_COUNT;
+    // The kernel counts in its own page size (16 KiB on Apple Silicon, 4 KiB
+    // on Intel), which host_page_size reports.
+    let mut page_size: usize = 0;
+    // SAFETY: `vm` is exactly `count` integers long (asserted above), so the
+    // kernel cannot write past it, and any bit pattern is a valid VmStats64.
+    // `page_size` is a valid out-pointer for the vm_size_t the call returns.
+    let ok = unsafe {
+        let host = mach_host_self();
+        host_statistics64(
+            host,
+            HOST_VM_INFO64,
+            &mut vm as *mut VmStats64 as *mut u8,
+            &mut count,
+        ) == 0
+            && host_page_size(host, &mut page_size) == 0
+    };
+    if !ok {
+        return 0.0;
     }
+    (mem_used_pages(&vm) * page_size as u64) as f32 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// (device, renderer, tiler) utilisation in percent as the GPU driver reports
+/// them; all zero when there is no such driver (virtual machines).
+pub fn read_gpu_utilization() -> (u32, u32, u32) {
+    // Every Apple GPU driver (AGXAcceleratorG13G ... AGXAcceleratorG17X) is a
+    // subclass of IOAccelerator, so matching the base class also finds the
+    // generations that do not exist yet.
+    // SAFETY: the class name is NUL-terminated, the only thing
+    // try_gpu_util_class requires of its argument.
+    unsafe { try_gpu_util_class(b"IOAccelerator\0") }
 }
 
 unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
@@ -943,7 +943,12 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
     {
         let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
         let stats = cf_utils::cfdict_get(dict, "PerformanceStatistics");
-        if !stats.is_null() {
+        // Any IOAccelerator can match, so do not take it on trust that the
+        // property is the dictionary the Apple GPU drivers publish.
+        if !stats.is_null()
+            && core_foundation_sys::base::CFGetTypeID(stats)
+                == core_foundation_sys::dictionary::CFDictionaryGetTypeID()
+        {
             let sd = stats as core_foundation_sys::dictionary::CFDictionaryRef;
             let dev = cf_utils::cfdict_get_i64(sd, "Device Utilization %").unwrap_or(0) as u32;
             let ren = cf_utils::cfdict_get_i64(sd, "Renderer Utilization %").unwrap_or(0) as u32;
@@ -960,6 +965,79 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
     }
     IOObjectRelease(service);
     result
+}
+
+/// IOReport GPU residency (percent) from which all zeros from the driver
+/// cannot be a GPU that had nothing to do.
+const GPU_BUSY_MIN_PCT: u32 = 5;
+/// Collided readings in a row that keep the last good values. After that the
+/// values would be too old to pass for a measurement and the zeros go out.
+const GPU_MAX_BRIDGED_READS: u32 = 5;
+
+/// Tells driver readings that lost a race from real ones.
+///
+/// The GPU driver refreshes its utilisation figures only every 130-270 ms
+/// (measured on an M5 Max) and a read clears them until the next refresh.
+/// Whoever reads second in between gets 0/0/0: another macpow, Activity
+/// Monitor, ioreg, or this process itself at a short sampling interval.
+/// IOReport's GPU residency is not affected, so all zeros while IOReport
+/// shows a busy GPU mean "no data", not "idle". Reading again would not
+/// help: it takes the next refresh away from the other reader.
+#[derive(Default)]
+struct GpuCollisionFilter {
+    bridged_reads: u32,
+}
+
+impl GpuCollisionFilter {
+    /// The (renderer, tiler) pair to publish for a driver reading, or `None`
+    /// when the reading collided and the last published pair should stay.
+    fn accept(
+        &mut self,
+        (device, renderer, tiler): (u32, u32, u32),
+        ioreport_device_pct: u32,
+    ) -> Option<(u32, u32)> {
+        let collided =
+            (device, renderer, tiler) == (0, 0, 0) && ioreport_device_pct >= GPU_BUSY_MIN_PCT;
+        if !collided {
+            self.bridged_reads = 0;
+        } else if self.bridged_reads < GPU_MAX_BRIDGED_READS {
+            self.bridged_reads += 1;
+            return None;
+        }
+        Some((renderer, tiler))
+    }
+}
+
+// ── System stats: CPU usage, memory, GPU utilisation ─────────────────────────
+
+/// One reading of the metrics that come from Mach and the IORegistry alone.
+/// They need neither the SMC nor IOReport, so they also work in a virtual
+/// machine or a sandbox where those are missing.
+struct SystemStats {
+    /// One value per logical CPU. Empty on a reader's first reading, which
+    /// has no earlier tick counts to measure an interval against.
+    cpu_usage_pct: Vec<f32>,
+    mem_used_gb: f32,
+    /// (device, renderer, tiler) as the GPU driver reported them.
+    gpu_util: (u32, u32, u32),
+}
+
+#[derive(Default)]
+struct SystemStatsReader {
+    prev_cpu_ticks: Vec<(u64, u64)>,
+}
+
+impl SystemStatsReader {
+    fn read(&mut self) -> SystemStats {
+        let cpu_ticks = read_cpu_ticks();
+        let cpu_usage_pct = compute_cpu_usage(&self.prev_cpu_ticks, &cpu_ticks);
+        self.prev_cpu_ticks = cpu_ticks;
+        SystemStats {
+            cpu_usage_pct,
+            mem_used_gb: read_mem_used_gb(),
+            gpu_util: read_gpu_utilization(),
+        }
+    }
 }
 
 // ── Per-CPU utilization via Mach host_processor_info ─────────────────────────
@@ -1176,7 +1254,6 @@ impl Sampler {
                 };
                 let mut disc_handle: Option<std::thread::JoinHandle<Vec<(String, String)>>> =
                     Some(smc.start_temp_discovery());
-                let mut prev_ticks = read_cpu_ticks();
                 while running.load(Ordering::Relaxed) {
                     // Non-blocking: check if temp discovery finished
                     if let Some(ref h) = disc_handle {
@@ -1200,9 +1277,6 @@ impl Sampler {
                     let adapter_power = smc.read_f32("PDTR").unwrap_or(0.0);
                     let wifi_power = smc.read_f32("wiPm").unwrap_or(0.0);
                     let usb_power_smc = smc.read_f32("PUSB").unwrap_or(0.0);
-                    let cur_ticks = read_cpu_ticks();
-                    let cpu_usage = compute_cpu_usage(&prev_ticks, &cur_ticks);
-                    prev_ticks = cur_ticks;
                     if let Ok(mut mg) = m.lock() {
                         mg.temperatures = temps;
                         mg.fans = fans;
@@ -1215,11 +1289,6 @@ impl Sampler {
                         mg.adapter_power_w = adapter_power;
                         mg.wifi_power_w = wifi_power;
                         mg.usb_power_smc_w = usb_power_smc;
-                        mg.mem_used_gb = read_mem_used_gb();
-                        mg.cpu_usage_pct = cpu_usage;
-                        let (_, gr, gt) = read_gpu_utilization();
-                        mg.soc.gpu_util_renderer = gr;
-                        mg.soc.gpu_util_tiler = gt;
                     }
                     std::thread::sleep(dt);
                 }
@@ -1229,6 +1298,29 @@ impl Sampler {
                     }
                 }
             }));
+        }
+
+        // ── System stats (CPU usage, memory, GPU utilisation) ────────────
+        // Kept apart from the SMC source: that one ends at once where the SMC
+        // cannot be opened, and none of these values depends on it.
+        {
+            let m = shared.clone();
+            let mut reader = SystemStatsReader::default();
+            let mut gpu_filter = GpuCollisionFilter::default();
+            spawn_periodic(&mut handles, &running, dt, move || {
+                // Every system call is made here, before the lock is taken.
+                let stats = reader.read();
+                if let Ok(mut mg) = m.lock() {
+                    mg.cpu_usage_pct = stats.cpu_usage_pct;
+                    mg.mem_used_gb = stats.mem_used_gb;
+                    if let Some((renderer, tiler)) =
+                        gpu_filter.accept(stats.gpu_util, mg.soc.gpu_util_device)
+                    {
+                        mg.soc.gpu_util_renderer = renderer;
+                        mg.soc.gpu_util_tiler = tiler;
+                    }
+                }
+            });
         }
 
         // ── Battery ──────────────────────────────────────────────────────
@@ -1632,6 +1724,117 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_filter_publishes_real_readings() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((24, 17, 10), 22), Some((17, 10)));
+        // Busy device with an idle renderer and tiler is a reading too.
+        assert_eq!(filter.accept((30, 0, 0), 30), Some((0, 0)));
+    }
+
+    #[test]
+    fn gpu_filter_keeps_last_values_when_a_read_collides() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((0, 0, 0), 22), None);
+        assert_eq!(filter.accept((0, 0, 0), GPU_BUSY_MIN_PCT), None);
+    }
+
+    #[test]
+    fn gpu_filter_publishes_zeros_of_an_idle_gpu() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((0, 0, 0), 0), Some((0, 0)));
+        assert_eq!(filter.accept((0, 0, 0), GPU_BUSY_MIN_PCT - 1), Some((0, 0)));
+    }
+
+    #[test]
+    fn gpu_filter_gives_up_on_a_long_run_of_collisions() {
+        let mut filter = GpuCollisionFilter::default();
+        for _ in 0..GPU_MAX_BRIDGED_READS {
+            assert_eq!(filter.accept((0, 0, 0), 40), None);
+        }
+        // The kept values are too old by now: say "no data" instead.
+        assert_eq!(filter.accept((0, 0, 0), 40), Some((0, 0)));
+        assert_eq!(filter.accept((0, 0, 0), 40), Some((0, 0)));
+        // A real reading starts a fresh run.
+        assert_eq!(filter.accept((41, 35, 6), 40), Some((35, 6)));
+        assert_eq!(filter.accept((0, 0, 0), 40), None);
+    }
+
+    // Counters of an M5 Max with 128 GB as vm_stat printed them, in pages of
+    // 16 KiB: Activity Monitor showed 82.3 GiB used while active + inactive +
+    // wired + compressor came to 126.3 GiB.
+    fn vm_stats_with_file_cache() -> VmStats64 {
+        VmStats64 {
+            active_count: 3_112_965,
+            inactive_count: 3_158_230,
+            wire_count: 552_682,
+            compressor_page_count: 1_456_189,
+            internal_page_count: 3_655_584,
+            external_page_count: 2_615_920,
+            purgeable_count: 272_722,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mem_used_pages_is_app_memory_plus_wired_plus_compressor() {
+        let vm = vm_stats_with_file_cache();
+        assert_eq!(
+            mem_used_pages(&vm),
+            3_655_584 - 272_722 + 552_682 + 1_456_189
+        );
+        assert_eq!(mem_used_pages(&vm) * 16384 / (1 << 30), 82);
+    }
+
+    #[test]
+    fn mem_used_pages_does_not_count_file_cache() {
+        let mut vm = vm_stats_with_file_cache();
+        let used = mem_used_pages(&vm);
+        // A large file is read: its pages are file-backed and sit on the
+        // active and inactive queues until the kernel needs them back.
+        vm.external_page_count += 1_000_000;
+        vm.active_count += 400_000;
+        vm.inactive_count += 600_000;
+        assert_eq!(mem_used_pages(&vm), used);
+    }
+
+    #[test]
+    fn mem_used_pages_survives_more_purgeable_than_anonymous_pages() {
+        let vm = VmStats64 {
+            internal_page_count: 10,
+            purgeable_count: 25,
+            wire_count: 3,
+            compressor_page_count: 4,
+            ..Default::default()
+        };
+        assert_eq!(mem_used_pages(&vm), 7);
+    }
+
+    // Needs neither the SMC nor IOReport, so it has to pass in a VM too.
+    #[test]
+    fn system_stats_reader_covers_every_logical_cpu_and_used_memory() {
+        // SAFETY: sysconf takes no pointers and has no preconditions.
+        let logical_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+        assert!(logical_cpus > 0);
+
+        let mut reader = SystemStatsReader::default();
+        let first = reader.read();
+        assert!(
+            first.cpu_usage_pct.is_empty(),
+            "usage needs two tick readings, got {:?}",
+            first.cpu_usage_pct
+        );
+        assert!(first.mem_used_gb > 0.0, "used memory {}", first.mem_used_gb);
+
+        let second = reader.read();
+        assert_eq!(second.cpu_usage_pct.len(), logical_cpus as usize);
+        assert!(second
+            .cpu_usage_pct
+            .iter()
+            .all(|pct| (0.0..=100.0).contains(pct)));
+        assert!(second.mem_used_gb > 0.0);
+    }
 
     #[test]
     fn compute_cpu_usage_returns_expected_percentages() {
