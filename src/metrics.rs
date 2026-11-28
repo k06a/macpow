@@ -39,6 +39,7 @@ extern "C" {
     fn CGDisplayIsBuiltin(display: u32) -> libc::boolean_t;
     fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
     fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetIOFlags(mode: CGDisplayModeRef) -> u32;
     fn CGDisplayScreenSize(display: u32) -> CGSize;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayCopyAllDisplayModes(
@@ -306,33 +307,108 @@ pub fn read_display_refresh_hz() -> f32 {
     }
 }
 
-/// Width and height of the main display's current mode in pixels: the size the
-/// frame is rendered at. At default scaling that is the panel's native
-/// resolution (3024 x 1964 on a 14" MacBook Pro, the "Resolution" line of
-/// `system_profiler`); a "More Space" mode is rendered larger than the panel
-/// (3600 x 2338) and scaled down to it.
+/// `kDisplayModeNativeFlag` (IOKit/graphics/IOGraphicsTypes.h): the mode maps
+/// one-to-one onto the panel's own pixel grid.
+const DISPLAY_MODE_NATIVE_FLAG: u32 = 0x0200_0000;
+
+/// Pixel size and IOKit flags of one display mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModePixels {
+    width: u32,
+    height: u32,
+    io_flags: u32,
+}
+
+impl ModePixels {
+    fn is_native(&self) -> bool {
+        self.io_flags & DISPLAY_MODE_NATIVE_FLAG != 0
+    }
+
+    /// # Safety
+    /// `mode` must be null or point to a live display mode.
+    unsafe fn read(mode: CGDisplayModeRef) -> Self {
+        // SAFETY: the getters only read the mode, which the caller keeps
+        // alive for the call, and all three are declared to accept null.
+        unsafe {
+            ModePixels {
+                width: CGDisplayModeGetPixelWidth(mode) as u32,
+                height: CGDisplayModeGetPixelHeight(mode) as u32,
+                io_flags: CGDisplayModeGetIOFlags(mode),
+            }
+        }
+    }
+}
+
+/// Pick the panel's own pixel grid out of a display's modes.
+///
+/// A mode's pixel size is the size its frame is rendered at. That is the
+/// panel's size only in the modes the driver flags as native; every scaled
+/// mode is rendered at another size and resampled to the panel. On a
+/// 3024 x 1964 panel the "More Space" mode renders 3600 x 2338 and a
+/// larger-text mode 2294 x 1490, so the current mode alone cannot be trusted.
+///
+/// The current mode is taken when it is flagged native. Otherwise the first
+/// flagged mode of the display is, and `all_modes` is only asked for in that
+/// case, because listing the modes costs more than reading one. A display
+/// that flags no mode at all falls back to the current mode's size, the best
+/// that is known about it.
+fn native_pixel_size(
+    current: Option<ModePixels>,
+    all_modes: impl FnOnce() -> Vec<ModePixels>,
+) -> Option<(u32, u32)> {
+    current
+        .filter(ModePixels::is_native)
+        .or_else(|| all_modes().into_iter().find(ModePixels::is_native))
+        .or(current)
+        .map(|mode| (mode.width, mode.height))
+}
+
+/// Every mode the main display offers.
+fn read_all_display_modes() -> Vec<ModePixels> {
+    // SAFETY: `CGDisplayCopyAllDisplayModes` returns null or an array we own
+    // (Copy rule), released exactly once below. Its elements are display
+    // modes that stay alive as long as the array does.
+    unsafe {
+        let modes = CGDisplayCopyAllDisplayModes(CGMainDisplayID(), std::ptr::null());
+        if modes.is_null() {
+            return Vec::new();
+        }
+        let all = (0..core_foundation_sys::array::CFArrayGetCount(modes))
+            .map(|i| {
+                let mode = core_foundation_sys::array::CFArrayGetValueAtIndex(modes, i);
+                ModePixels::read(mode as CGDisplayModeRef)
+            })
+            .collect();
+        cf_utils::cf_release(modes as _);
+        all
+    }
+}
+
+/// Width and height of the main display's panel in physical pixels
+/// (3024 x 1964 on a 14" MacBook Pro), whatever scaling the user has chosen:
+/// see [`native_pixel_size`]. This is the "Resolution" that `system_profiler`
+/// prints for an Apple panel.
 ///
 /// `CGDisplayPixelsWide/High` must not be used for this: despite the name they
-/// return the mode's size in points, which on a HiDPI ("Retina") mode is half
-/// the pixel size in each direction (1512 x 982 on the same panel).
+/// return the current mode's size in points, which on a HiDPI ("Retina") mode
+/// is half the pixel size in each direction (1512 x 982 on the same panel).
 ///
-/// `None` if the display has no current mode.
-pub fn read_display_pixel_size() -> Option<(u32, u32)> {
+/// `None` if the display has neither a current mode nor a native one.
+pub fn read_display_native_pixel_size() -> Option<(u32, u32)> {
     // SAFETY: `CGDisplayCopyDisplayMode` returns either null or a mode we own
     // (Copy rule). It is null-checked, only read while we hold it, and
     // released exactly once.
-    unsafe {
+    let current = unsafe {
         let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
         if mode.is_null() {
-            return None;
+            None
+        } else {
+            let pixels = ModePixels::read(mode);
+            CGDisplayModeRelease(mode);
+            Some(pixels)
         }
-        let size = (
-            CGDisplayModeGetPixelWidth(mode) as u32,
-            CGDisplayModeGetPixelHeight(mode) as u32,
-        );
-        CGDisplayModeRelease(mode);
-        Some(size)
-    }
+    };
+    native_pixel_size(current, read_all_display_modes)
 }
 
 /// Detect ProMotion support by checking if any available display mode reports a
@@ -678,6 +754,84 @@ mod display_tests {
     fn nits_are_unknown_without_any_input() {
         assert_eq!(display_nits(None, None, SDR_CAP, HDR_CAP, None), None);
         assert_eq!(display_nits(None, None, SDR_CAP, HDR_CAP, Some(2.0)), None);
+    }
+
+    // IO flags as CoreGraphics reports them on a 14" MacBook Pro (M5 Max):
+    // valid + safe, plus the native bit on the modes that match the panel,
+    // plus the default bit on the mode macOS picks out of the box.
+    const SCALED: u32 = 0x0000_0003;
+    const NATIVE: u32 = 0x0200_0003;
+    const NATIVE_DEFAULT: u32 = 0x0200_0007;
+
+    fn mode(width: u32, height: u32, io_flags: u32) -> ModePixels {
+        ModePixels {
+            width,
+            height,
+            io_flags,
+        }
+    }
+
+    /// Pixel sizes of that Mac's mode list (`CGDisplayCopyAllDisplayModes`
+    /// with no options), one entry per size, in the order it is returned.
+    fn macbook_pro_14_modes() -> Vec<ModePixels> {
+        vec![
+            mode(1920, 1200, SCALED),
+            mode(2048, 1330, SCALED),
+            mode(2294, 1490, SCALED),
+            mode(2560, 1600, SCALED),
+            mode(2704, 1756, SCALED),
+            mode(3024, 1890, SCALED),
+            mode(3024, 1964, NATIVE),
+        ]
+    }
+
+    #[test]
+    fn native_current_mode_is_the_panel_size() {
+        // Default scaling: 1512 x 982 points rendered at 3024 x 1964. The
+        // mode list is not needed and must not be fetched.
+        let current = mode(3024, 1964, NATIVE_DEFAULT);
+        assert_eq!(
+            native_pixel_size(Some(current), || panic!("mode list was fetched")),
+            Some((3024, 1964))
+        );
+    }
+
+    #[test]
+    fn scaled_current_mode_yields_the_native_mode_of_the_list() {
+        // "More Space": 1800 x 1169 points rendered at 3600 x 2338 and
+        // resampled to the panel. Reporting the rendered size would describe
+        // a panel that does not exist.
+        let more_space = mode(3600, 2338, SCALED);
+        assert_eq!(
+            native_pixel_size(Some(more_space), macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+        // The same from the other side: 1147 x 745 points at 2294 x 1490.
+        let larger_text = mode(2294, 1490, SCALED);
+        assert_eq!(
+            native_pixel_size(Some(larger_text), macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+        // No current mode at all, but the list still knows the panel.
+        assert_eq!(
+            native_pixel_size(None, macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+    }
+
+    #[test]
+    fn without_a_native_mode_the_current_mode_is_reported() {
+        let unflagged = || vec![mode(1920, 1080, SCALED), mode(3840, 2160, SCALED)];
+        assert_eq!(
+            native_pixel_size(Some(mode(3840, 2160, SCALED)), unflagged),
+            Some((3840, 2160))
+        );
+        assert_eq!(
+            native_pixel_size(Some(mode(1920, 1080, SCALED)), Vec::new),
+            Some((1920, 1080))
+        );
+        assert_eq!(native_pixel_size(None, unflagged), None);
+        assert_eq!(native_pixel_size(None, Vec::new), None);
     }
 }
 
@@ -1525,7 +1679,7 @@ impl Sampler {
                     };
                     let backlight_current = read_backlight_current();
                     let refresh_hz = read_display_refresh_hz();
-                    let pixel_size = read_display_pixel_size();
+                    let pixel_size = read_display_native_pixel_size();
                     let preset = read_display_preset();
                     if let Ok(mut mg) = m.lock() {
                         if let Some(br) = brightness {
@@ -1592,12 +1746,12 @@ impl Sampler {
                                     br * MAX_DISPLAY_W
                                 };
                             let display = unsafe { CGMainDisplayID() };
-                            // 0 x 0 = unknown (no current mode).
+                            // The panel's native pixels; 0 x 0 = unknown.
                             (mg.display.width_px, mg.display.height_px) =
                                 pixel_size.unwrap_or_default();
                             // The diagonal is derived from the panel's physical
-                            // size in millimetres, so it is the same whether the
-                            // mode is counted in pixels or in points.
+                            // size in millimetres, so it does not depend on
+                            // the display mode either.
                             let size_mm = unsafe { CGDisplayScreenSize(display) };
                             let diag_mm = (size_mm.width.powi(2) + size_mm.height.powi(2)).sqrt();
                             mg.display.diagonal_inches =
