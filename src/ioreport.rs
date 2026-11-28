@@ -1436,7 +1436,7 @@ unsafe fn probe_clpc(
 /// flags its zeros can't be told from an idle chip.
 ///
 /// Only the flags are set: other sources own some of the other fields.
-pub fn mark_unavailable(soc: &mut SocPower) {
+pub(crate) fn mark_unavailable(soc: &mut SocPower) {
     soc.cpu_unavailable = true;
     soc.rails_unavailable = true;
 }
