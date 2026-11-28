@@ -6,7 +6,7 @@ use macpow::types::Metrics;
 use anyhow::Result;
 use app::App;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -15,6 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, stdout, Write};
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Accepted `--interval` values, in milliseconds. The sources do not change
@@ -73,7 +74,7 @@ fn main() -> Result<()> {
 // every `--interval` and publishes the result into shared state, and
 // `Sampler::snapshot` copies that state without waiting for any of them. The
 // front end owns the Sampler and takes a snapshot at the moment it is about to
-// use one, so what it shows is never older than one sampling interval:
+// use one, so it always shows the newest published state, never a queued one:
 //
 // - `--json` prints one snapshot every `--interval`;
 // - the TUI takes one snapshot per refresh. The refresh interval starts at
@@ -122,58 +123,132 @@ fn write_json_line(out: &mut impl Write, m: &Metrics) -> io::Result<()> {
 }
 
 fn restore_terminal() {
-    let _ = stdout().execute(crossterm::event::DisableMouseCapture);
+    let _ = stdout().execute(DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = stdout().execute(LeaveAlternateScreen);
+}
+
+/// The terminal in TUI mode: raw input, alternate screen, mouse reporting.
+/// Dropping it gives the terminal back, so every way out of `run_tui` (quit
+/// key, signal, `?` on an error) leaves a usable shell.
+struct TuiMode;
+
+impl TuiMode {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        // Raw mode is on: from here an early return has to undo it.
+        let mode = TuiMode;
+        stdout().execute(EnterAlternateScreen)?;
+        stdout().execute(EnableMouseCapture)?;
+        Ok(mode)
+    }
+}
+
+impl Drop for TuiMode {
+    fn drop(&mut self) {
+        // While unwinding, the panic hook has already restored the terminal
+        // and the message is on the normal screen. Leaving the alternate
+        // screen a second time would move the cursor back on top of it.
+        if !std::thread::panicking() {
+            restore_terminal();
+        }
+    }
+}
+
+/// Makes a panic of the UI thread readable: the terminal is given back first,
+/// then the previous hook prints. Printed while the alternate screen is up,
+/// the message would disappear together with that screen.
+fn install_panic_hook() {
+    let ui_thread = std::thread::current().id();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A sampler thread can panic as well, and the TUI keeps running then.
+        // Only a panic on the UI thread ends it.
+        if std::thread::current().id() == ui_thread {
+            restore_terminal();
+        }
+        previous(info);
+    }));
+}
+
+/// Set by the signal handler when the process is asked to stop. The TUI loop
+/// polls it and leaves through its normal exit, which restores the terminal.
+static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+/// How long the TUI waits for input before it looks at `TERMINATE` again.
+/// crossterm restarts its poll when a signal interrupts it, so the signal by
+/// itself does not end the wait.
+const SIGNAL_CHECK: Duration = Duration::from_millis(100);
+
+extern "C" fn request_terminate(_signal: libc::c_int) {
+    TERMINATE.store(true, Ordering::Relaxed);
+}
+
+/// Routes SIGINT, SIGTERM and SIGHUP to `TERMINATE`. Their default action
+/// kills the process on the spot and leaves the shell in raw mode, on the
+/// alternate screen and with mouse reporting on.
+fn install_terminate_handlers() {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: `request_terminate` has the signature signal(2) expects and
+        // only stores to an atomic, which is async-signal-safe.
+        unsafe {
+            libc::signal(signal, request_terminate as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+/// Waits for terminal input until `deadline`. Returns `None` when the deadline
+/// passes or a termination signal arrives first.
+fn next_event(deadline: Instant) -> io::Result<Option<Event>> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Polled at least once even when the deadline has already passed, so
+        // that slow frames cannot starve the keyboard.
+        if event::poll(left.min(SIGNAL_CHECK))? {
+            return event::read().map(Some);
+        }
+        // `left <= SIGNAL_CHECK` means the whole remainder has been waited out.
+        if left <= SIGNAL_CHECK || TERMINATE.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+    }
 }
 
 fn run_tui(interval_ms: u64) -> Result<()> {
     if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
         anyhow::bail!("TUI requires a real terminal. Use --json for piped output.");
     }
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    stdout().execute(crossterm::event::EnableMouseCapture)?;
+    // Before the terminal is touched, so that there is no moment in which a
+    // signal still kills the process with the terminal in TUI mode.
+    install_terminate_handlers();
+    let _tui_mode = TuiMode::enter()?;
+    install_panic_hook();
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-        let backend = CrosstermBackend::new(stdout());
-        let mut terminal = Terminal::new(backend)?;
-        let mut app = App::new(interval_ms);
-        // Show the still empty screen before starting the sampler: its
-        // start-up reads take several hundred milliseconds.
-        terminal.draw(|f| app.draw(f))?;
-        let sampler = start_sampler(interval_ms);
-        let mut last_update = Instant::now();
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut app = App::new(interval_ms);
+    // Show the still empty screen before starting the sampler: its start-up
+    // reads take several hundred milliseconds.
+    terminal.draw(|f| app.draw(f))?;
+    let sampler = start_sampler(interval_ms);
+    let mut last_update = Instant::now();
 
-        loop {
-            let refresh = app.refresh_interval();
-            if last_update.elapsed() >= refresh {
-                app.update(sampler.snapshot());
-                last_update = Instant::now();
-            }
-            terminal.draw(|f| app.draw(f))?;
-            // Wait for input only until the next frame is due.
-            if event::poll(refresh.saturating_sub(last_update.elapsed()))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press && app.handle_key(key) => {
-                        break;
-                    }
-                    Event::Mouse(mouse) => {
-                        app.handle_mouse(mouse);
-                    }
-                    _ => {}
-                }
-            }
+    while !TERMINATE.load(Ordering::Relaxed) {
+        let refresh = app.refresh_interval();
+        if last_update.elapsed() >= refresh {
+            app.update(sampler.snapshot());
+            last_update = Instant::now();
         }
-        Ok(())
-    }));
-
-    restore_terminal();
-
-    match result {
-        Ok(inner) => inner,
-        Err(_) => anyhow::bail!("TUI panicked unexpectedly. Terminal has been restored."),
+        terminal.draw(|f| app.draw(f))?;
+        // Wait for input only until the next frame is due.
+        match next_event(last_update + refresh)? {
+            Some(Event::Key(key)) if key.kind == KeyEventKind::Press && app.handle_key(key) => {
+                break;
+            }
+            Some(Event::Mouse(mouse)) => app.handle_mouse(mouse),
+            _ => {}
+        }
     }
+    Ok(())
 }
 
 /// Dump every SMC key in the same format as `iSMC raw`, so the output can be

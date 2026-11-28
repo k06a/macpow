@@ -1,12 +1,14 @@
 //! End-to-end checks of the command-line contract: how the real binary parses
-//! its arguments, what it writes and how it ends. The `--json` tests start the
-//! samplers, so they need a Mac; every wait is bounded, so a regression fails
-//! the test instead of hanging it.
+//! its arguments, what it writes and how it ends. The `--json` and TUI tests
+//! start the samplers, so they need a Mac; every wait is bounded, so a
+//! regression fails the test instead of hanging it.
 
-use std::io::{BufRead, BufReader, Read};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_macpow");
@@ -148,4 +150,127 @@ fn json_is_one_object_per_line_and_a_closed_pipe_ends_cleanly() {
     assert!(value.is_object(), "first line: {line:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
     assert_eq!(status.code(), Some(0), "status: {status:?}");
+}
+
+const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
+const MOUSE_REPORTING_OFF: &[u8] = b"\x1b[?1000l";
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The TUI running on a pseudo-terminal, with everything it writes recorded.
+struct Tui {
+    child: Child,
+    /// Our end of the pseudo-terminal; writing to it types into the TUI.
+    keyboard: File,
+    screen: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Tui {
+    fn start() -> Self {
+        let (mut master, mut slave) = (0, 0);
+        let mut size = libc::winsize {
+            ws_row: 50,
+            ws_col: 160,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty(3) stores two new descriptors in the out-parameters
+        // and reads the window size; it accepts null for the name and termios.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // SAFETY: both descriptors were just created and have no other owner.
+        let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+
+        // The Command is a temporary, so our copies of the terminal side are
+        // closed as soon as the child has them.
+        let child = Command::new(BIN)
+            .stdin(slave.try_clone().expect("dup"))
+            .stdout(slave.try_clone().expect("dup"))
+            .stderr(slave)
+            .spawn()
+            .expect("failed to start macpow");
+
+        let screen = Arc::new(Mutex::new(Vec::new()));
+        let recording = Arc::clone(&screen);
+        let mut output = master.try_clone().expect("dup");
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            // Ends with EOF or an error once macpow has closed its side.
+            while let Ok(n @ 1..) = output.read(&mut chunk) {
+                recording.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+        Tui {
+            child,
+            keyboard: master,
+            screen,
+        }
+    }
+
+    /// Polls the recording until `done` accepts it; fails after `LIMIT`.
+    fn wait_until(&self, what: &str, done: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + LIMIT;
+        while !done(&self.screen.lock().unwrap()) {
+            assert!(Instant::now() < deadline, "the TUI never {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_first_frame(&self) {
+        self.wait_until("drew its footer", |screen| contains(screen, b"quit"));
+    }
+
+    /// The terminal must end up the way a shell needs it: the very last thing
+    /// written is "leave the alternate screen", after mouse reporting is off.
+    fn assert_terminal_restored(&self) {
+        self.wait_until("left the alternate screen", |screen| {
+            screen.ends_with(LEAVE_ALTERNATE_SCREEN)
+        });
+        assert!(contains(&self.screen.lock().unwrap(), MOUSE_REPORTING_OFF));
+    }
+}
+
+impl Drop for Tui {
+    /// A failed assertion must not leave a TUI process behind.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// SIGTERM (`kill`, a supervisor, `brew upgrade`) used to end the TUI on the
+/// spot and leave the shell in raw mode on the alternate screen.
+#[test]
+fn tui_sigterm_restores_the_terminal() {
+    let mut tui = Tui::start();
+    tui.wait_for_first_frame();
+    // SAFETY: kill(2) on the PID of a child we spawned and have not reaped.
+    unsafe { libc::kill(tui.child.id() as libc::pid_t, libc::SIGTERM) };
+
+    let status = wait(&mut tui.child);
+    assert_eq!(status.code(), Some(0), "status: {status:?}");
+    tui.assert_terminal_restored();
+}
+
+#[test]
+fn tui_quit_key_restores_the_terminal_and_exits_0() {
+    let mut tui = Tui::start();
+    tui.wait_for_first_frame();
+    tui.keyboard.write_all(b"q").expect("typing into the TUI");
+
+    let status = wait(&mut tui.child);
+    assert_eq!(status.code(), Some(0), "status: {status:?}");
+    tui.assert_terminal_restored();
 }
