@@ -118,6 +118,34 @@ fn interval_outside_100_to_60000_ms_is_rejected() {
     }
 }
 
+/// `--dump` used to print the failure and still exit 0, so a script could not
+/// tell a failed dump from a successful one.
+#[test]
+fn dump_exits_non_zero_when_ioreport_is_unavailable() {
+    // IOReport reaches the kernel through an IOKit user client; deny those.
+    const PROFILE: &str = "(version 1)(allow default)(deny iokit-open)";
+    let sandboxed = |program: &str, args: &[&str]| {
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", PROFILE, program])
+            .args(args)
+            .output()
+    };
+    // sandbox-exec does not nest, so it fails when the tests themselves run
+    // inside a sandbox. Nothing can be checked then.
+    if !matches!(sandboxed("/usr/bin/true", &[]), Ok(out) if out.status.success()) {
+        eprintln!("skipped: sandbox-exec is not usable here");
+        return;
+    }
+
+    let out = sandboxed(BIN, &["--dump"]).expect("failed to start sandbox-exec");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Failed to initialize IOReport"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+}
+
 /// Ctrl+C while the reader is not keeping up used to run `process::exit` in
 /// the signal handler and abort with "RefCell already borrowed" (exit 134).
 #[test]

@@ -50,10 +50,15 @@ fn main() -> Result<()> {
     let args = CliArgs::parse();
 
     if args.dump {
-        match macpow::ioreport::IOReportSampler::new() {
-            Ok(ior) => ior.dump_channels(),
-            Err(e) => eprintln!("Failed to initialize IOReport: {e}\nThis Mac may not support the required IOReport channels."),
-        }
+        // An error, not just a message: a script that collects diagnostics
+        // must be able to tell a failed dump from a successful one.
+        let ior = macpow::ioreport::IOReportSampler::new().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to initialize IOReport: {e}\n\
+                 This Mac may not support the required IOReport channels."
+            )
+        })?;
+        ior.dump_channels();
         return Ok(());
     }
 
