@@ -436,18 +436,15 @@ fn phy_mode_str(mode: i64) -> &'static str {
     }
 }
 
-fn read_wifi_ssid_ipconfig(iface_name: &str) -> Option<String> {
-    let output = command_output_timeout(
-        "ipconfig",
-        &["getsummary", iface_name],
-        std::time::Duration::from_millis(1000),
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
+/// The network name in the output of `ipconfig getsummary`, if it has one.
+fn parse_ipconfig_ssid(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(ssid) = trimmed.strip_prefix("SSID : ") {
             let s = ssid.trim().to_string();
-            if !s.is_empty() {
+            // macOS prints this placeholder instead of the name to callers
+            // without Location permission. It means "unknown".
+            if !s.is_empty() && s != "<redacted>" {
                 return Some(s);
             }
         }
@@ -455,7 +452,78 @@ fn read_wifi_ssid_ipconfig(iface_name: &str) -> Option<String> {
     None
 }
 
+fn read_wifi_ssid_ipconfig(iface_name: &str) -> Option<String> {
+    // Absolute path, so the answer does not depend on the caller's PATH.
+    let output = command_output_timeout(
+        "/usr/sbin/ipconfig",
+        &["getsummary", iface_name],
+        std::time::Duration::from_millis(1000),
+    )?;
+    parse_ipconfig_ssid(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// How long one `ipconfig` answer is reused. The SSID only goes into the JSON
+/// output, so a stale name for half a minute after a silent roam is harmless,
+/// while asking on every tick meant about four process spawns a second.
+const SSID_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wi-Fi source for the periodic sampler. It holds the one thing the reads
+/// have to remember between ticks: the last `ipconfig` SSID answer.
+#[derive(Default)]
+pub struct WifiReader {
+    /// When `ipconfig` was last asked and what it answered ("" = unknown).
+    ssid_lookup: Option<(std::time::Instant, String)>,
+}
+
+impl WifiReader {
+    /// The current Wi-Fi state.
+    pub fn read(&mut self) -> WifiInfo {
+        let mut info = read_wifi_corewlan();
+        self.fill_ssid(
+            &mut info,
+            std::time::Instant::now(),
+            read_wifi_ssid_ipconfig,
+        );
+        info
+    }
+
+    /// Completes `info.ssid` when CoreWLAN withheld it, running `lookup` at
+    /// most once per `SSID_REFRESH` for as long as the link stays up.
+    fn fill_ssid(
+        &mut self,
+        info: &mut WifiInfo,
+        now: std::time::Instant,
+        lookup: impl FnOnce(&str) -> Option<String>,
+    ) {
+        if !info.connected {
+            // The next association may be with another network: ask again then.
+            self.ssid_lookup = None;
+        } else if info.ssid.is_empty() {
+            match &self.ssid_lookup {
+                Some((asked, answer)) if now.duration_since(*asked) < SSID_REFRESH => {
+                    info.ssid = answer.clone();
+                }
+                _ => {
+                    info.ssid = lookup(&info.interface_name).unwrap_or_default();
+                    self.ssid_lookup = Some((now, info.ssid.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// One-off Wi-Fi snapshot. A periodic caller should keep a `WifiReader`
+/// instead, so that the SSID fallback is not run again on every call.
 pub fn read_wifi_info() -> WifiInfo {
+    WifiReader::default().read()
+}
+
+/// What CoreWLAN and the link state say. `ssid` stays empty when macOS
+/// withholds it.
+fn read_wifi_corewlan() -> WifiInfo {
+    // SAFETY: every message goes to a class or object that was just obtained
+    // and checked for nil, through the helper matching the return type the
+    // CoreWLAN headers declare for that method (object, NSInteger or double).
     unsafe {
         let no_hardware = WifiInfo {
             phy_mode: "none".into(),
@@ -475,8 +543,7 @@ pub fn read_wifi_info() -> WifiInfo {
             return no_hardware;
         }
 
-        // Get the actual interface name (e.g. en0 on laptops, en1 on Mac Studio)
-        // so the ipconfig fallback queries the right interface.
+        // Get the actual interface name (e.g. en0 on laptops, en1 on Mac Studio).
         let iface_name_ns = send_obj(iface, c"interfaceName");
         let iface_name = if !iface_name_ns.is_null() {
             cf_utils::cfstring_to_string(iface_name_ns as _).unwrap_or_default()
@@ -484,24 +551,19 @@ pub fn read_wifi_info() -> WifiInfo {
             String::new()
         };
 
-        // ssid requires location permission (nil for unsigned binaries since Sonoma)
-        // Fall back to ipconfig getsummary for SSID
-        let ssid_ns = send_obj(iface, c"ssid");
-        let ssid = if !ssid_ns.is_null() {
-            cf_utils::cfstring_to_string(ssid_ns as _).unwrap_or_default()
-        } else if !iface_name.is_empty() {
-            read_wifi_ssid_ipconfig(&iface_name).unwrap_or_default()
-        } else {
-            read_wifi_ssid_ipconfig("en0").unwrap_or_default()
-        };
-
-        let connected = !ssid.is_empty();
-        if !connected {
+        // Associated or not is a property of the link, not of the name: the
+        // SSID is withheld without Location permission while the link is up.
+        if !link_is_active(&iface_name) {
             return WifiInfo {
                 interface_name: iface_name,
                 ..Default::default()
             };
         }
+
+        // ssid requires location permission (nil for unsigned binaries since
+        // Sonoma); `WifiReader` then falls back to ipconfig getsummary.
+        let ssid_ns = send_obj(iface, c"ssid");
+        let ssid = cf_utils::cfstring_to_string(ssid_ns as _).unwrap_or_default();
 
         let mut info = WifiInfo {
             connected: true,
@@ -564,6 +626,109 @@ mod network_tests {
         // IFNAMSIZ bytes leave no room for the terminating NUL.
         assert!(!link_is_active(&"e".repeat(libc::IFNAMSIZ)));
         assert!(!link_is_active("no-such-if0"));
+    }
+
+    /// `ipconfig getsummary` output, cut down to its top-level Wi-Fi keys.
+    fn ipconfig_summary(bssid: &str, ssid: &str) -> String {
+        format!(
+            "<dictionary> {{\n  BSSID : {bssid}\n  InterfaceType : WiFi\n  \
+             LinkStatusActive : TRUE\n  SSID : {ssid}\n  Security : WPA3_SAE\n}}\n"
+        )
+    }
+
+    #[test]
+    fn ipconfig_ssid_is_parsed() {
+        let summary = ipconfig_summary("11:22:33:44:55:66", "Home Network");
+        assert_eq!(
+            parse_ipconfig_ssid(&summary).as_deref(),
+            Some("Home Network")
+        );
+        assert_eq!(parse_ipconfig_ssid(&ipconfig_summary("", "")), None);
+        assert_eq!(parse_ipconfig_ssid("  InterfaceType : WiFi\n"), None);
+    }
+
+    #[test]
+    fn redacted_ipconfig_ssid_is_unknown() {
+        // What macOS 27 answers to a caller without Location permission.
+        let summary = ipconfig_summary("<redacted>", "<redacted>");
+        assert_eq!(parse_ipconfig_ssid(&summary), None);
+    }
+
+    fn connected_wifi(ssid: &str) -> WifiInfo {
+        WifiInfo {
+            connected: true,
+            interface_name: "en0".into(),
+            ssid: ssid.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ssid_lookup_runs_once_per_refresh_period() {
+        let mut reader = WifiReader::default();
+        let start = std::time::Instant::now();
+        let mut lookups = 0;
+        // One minute of sampling at the default 250 ms interval.
+        for tick in 0..240 {
+            let mut info = connected_wifi("");
+            let now = start + std::time::Duration::from_millis(250 * tick);
+            reader.fill_ssid(&mut info, now, |iface| {
+                assert_eq!(iface, "en0");
+                lookups += 1;
+                Some("Home Network".into())
+            });
+            assert_eq!(info.ssid, "Home Network", "tick {tick}");
+        }
+        // At 0 s and at 30 s; it used to be once per tick.
+        assert_eq!(lookups, 2);
+    }
+
+    #[test]
+    fn unknown_ssid_is_remembered_too() {
+        let mut reader = WifiReader::default();
+        let start = std::time::Instant::now();
+        let mut lookups = 0;
+        for tick in 0..100 {
+            let mut info = connected_wifi("");
+            let now = start + std::time::Duration::from_millis(250 * tick);
+            reader.fill_ssid(&mut info, now, |_| {
+                lookups += 1;
+                None
+            });
+            // No name is not "disconnected".
+            assert!(info.connected);
+            assert_eq!(info.ssid, "");
+        }
+        assert_eq!(lookups, 1);
+    }
+
+    #[test]
+    fn ssid_is_looked_up_again_after_the_link_drops() {
+        let mut reader = WifiReader::default();
+        let now = std::time::Instant::now();
+
+        let mut info = connected_wifi("");
+        reader.fill_ssid(&mut info, now, |_| Some("Home Network".into()));
+        assert_eq!(info.ssid, "Home Network");
+
+        let mut down = WifiInfo::default();
+        reader.fill_ssid(&mut down, now, |_| panic!("no lookup without a link"));
+        assert_eq!(down.ssid, "");
+
+        // Well inside the refresh period, but it may be another network now.
+        let mut info = connected_wifi("");
+        reader.fill_ssid(&mut info, now, |_| Some("Office".into()));
+        assert_eq!(info.ssid, "Office");
+    }
+
+    #[test]
+    fn ssid_from_corewlan_needs_no_lookup() {
+        let mut reader = WifiReader::default();
+        let mut info = connected_wifi("Home Network");
+        reader.fill_ssid(&mut info, std::time::Instant::now(), |_| {
+            panic!("CoreWLAN already answered")
+        });
+        assert_eq!(info.ssid, "Home Network");
     }
 }
 

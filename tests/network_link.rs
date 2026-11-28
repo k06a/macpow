@@ -59,6 +59,33 @@ fn assert_ethernet_matches_ifconfig(excluded: &str) {
 }
 
 #[test]
+fn wifi_connected_follows_the_link() {
+    let wifi = read_wifi_info();
+    if wifi.interface_name.is_empty() {
+        // No Wi-Fi hardware, e.g. in a VM.
+        assert!(!wifi.connected);
+        return;
+    }
+    // Whether the network name is known must not matter: macOS withholds it
+    // from processes without Location permission.
+    assert_eq!(
+        wifi.connected,
+        ifconfig_says_active(&wifi.interface_name),
+        "connected must equal `ifconfig {}` saying \"status: active\"",
+        wifi.interface_name
+    );
+}
+
+#[test]
+fn wifi_ssid_is_a_name_or_empty() {
+    let wifi = read_wifi_info();
+    assert_ne!(wifi.ssid, "<redacted>", "the placeholder is not a name");
+    if !wifi.connected {
+        assert!(wifi.ssid.is_empty());
+    }
+}
+
+#[test]
 fn ethernet_is_connected_only_with_carrier() {
     // Idle Thunderbolt and USB-C (NCM) ports are UP and RUNNING without
     // carrier; they must not show up as an Ethernet link.
