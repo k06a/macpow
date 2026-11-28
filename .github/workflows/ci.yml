@@ -7,75 +7,101 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only unless a job asks for more. Only the release job does.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces the run in progress.
+# A tag run is a release and always runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    # Named explicitly so that GitHub runs it as `bash -eo pipefail`.
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check
+  ci:
+    name: fmt, clippy, test, build
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --release
-
-  clippy:
-    name: Clippy
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
-
-  fmt:
-    name: Format
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      # rustup is preinstalled on the runner. Without arguments it installs what
+      # rust-toolchain.toml names: the Rust release with rustfmt and clippy.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          components: rustfmt
+          # Only main writes the cache. Pull requests and tags restore it read-only.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
-
-  test:
-    name: Test (unit tests only)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --lib
-
-  build:
-    name: Build Release
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macpow-aarch64-apple-darwin
-          path: target/release/macpow
+      # The lints the project allows are listed in Cargo.toml under [lints.clippy], so this
+      # is also the command to run locally. --all-targets keeps tests/, benches/ and
+      # examples/ compiling and linted.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # The hermetic tests of the library and of the binary. tests/integration.rs reads
+      # IOReport and the SMC, which a hosted runner (a virtual machine) does not have.
+      - run: cargo test --locked --lib --bins
+      # The library must build without the TUI, that is without the `cli` feature.
+      - run: cargo check --locked --no-default-features --lib
+      - run: cargo build --release --locked
+      # Fails if the crate cannot be packaged and prints the file list `cargo publish` uploads.
+      - run: cargo package --locked --list
 
   release:
-    name: Create GitHub Release
+    name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, clippy, fmt, test, build]
+    needs: ci
     runs-on: macos-latest
+    timeout-minutes: 30
     permissions:
-      contents: write
+      contents: write # create the GitHub release
+      id-token: write # identity that signs the build provenance
+      attestations: write # store the build provenance
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: macpow-aarch64-apple-darwin
-      - run: chmod +x macpow && tar czf macpow-aarch64-apple-darwin.tar.gz macpow
-      - uses: softprops/action-gh-release@v2
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Tag must be "v" + the Cargo.toml version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version"
+            exit 1
+          fi
+      # No cache is restored in this job, on purpose: the published binary is compiled
+      # from the tagged sources and the locked dependencies, nothing else.
+      - run: cargo build --release --locked
+      - run: ./target/release/macpow --version
+      - name: Package
+        run: |
+          # File name and layout are what [package.metadata.binstall] in Cargo.toml
+          # promises: macpow-<target>.tar.gz with the binary at the top level.
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          asset="macpow-$target.tar.gz"
+          # Without the two flags macOS tar also stores the files' extended attributes,
+          # as hidden "._macpow" and "._LICENSE" entries and as pax headers.
+          tar --no-mac-metadata --no-xattrs -czf "$asset" \
+            -C target/release macpow -C "$GITHUB_WORKSPACE" LICENSE
+          shasum -a 256 "$asset" > "$asset.sha256"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+      # Lets a user check where the tarball was built:
+      #   gh attestation verify macpow-aarch64-apple-darwin.tar.gz --repo k06a/macpow
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          files: macpow-aarch64-apple-darwin.tar.gz
-          generate_release_notes: true
+          subject-path: ${{ env.ASSET }}
+      # The preinstalled gh CLI, so that no third-party action holds the write token.
+      # It refuses to overwrite a release that already exists for the tag.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "$ASSET" "$ASSET.sha256"

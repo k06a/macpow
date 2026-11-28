@@ -350,7 +350,7 @@ fn sampler_audio_power_in_range() {
     );
     if let Some(vol) = m.audio.volume_pct {
         assert!(
-            vol >= 0.0 && vol <= 100.0,
+            (0.0..=100.0).contains(&vol),
             "Audio volume {} out of range",
             vol
         );

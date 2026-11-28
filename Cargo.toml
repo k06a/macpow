@@ -50,6 +50,17 @@ core-foundation-sys = "0.8"
 libc = "0.2"
 unicode-width = { version = "0.2.0", optional = true }
 
+# Clippy lints the project allows on purpose (FFI and Objective-C style code). They are
+# listed here, not on a command line, so that `cargo clippy` judges the code by the same
+# rules locally, in an editor and in CI.
+[lints.clippy]
+field_reassign_with_default = "allow"
+manual_c_str_literals = "allow"
+manual_clamp = "allow"
+manual_range_contains = "allow"
+missing_safety_doc = "allow"
+needless_range_loop = "allow"
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 bin-dir = "{ bin }{ binary-ext }"
