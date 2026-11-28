@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 /// Accepted `--interval` values, in milliseconds. The sources do not change
 /// faster than every 100 ms, so anything lower only repeats the same numbers
 /// (unlimited, `--json --interval 0` wrote about 190 MB/s of duplicates). The
+/// lower bound is the Sampler's own floor, so the two cannot disagree. The
 /// upper bound keeps a typo from looking like a hung program.
-const INTERVAL_MS: std::ops::RangeInclusive<u64> = 100..=60_000;
+const INTERVAL_MS: std::ops::RangeInclusive<u64> = macpow::metrics::MIN_INTERVAL_MS..=60_000;
 
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_PKG_NAME"), version, about = "Apple Silicon Power Monitor TUI")]

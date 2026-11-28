@@ -1118,6 +1118,17 @@ fn compute_cpu_usage(prev: &[(u64, u64)], cur: &[(u64, u64)]) -> Vec<f32> {
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The shortest sampling period, in milliseconds. The sources do not change
+/// faster, and a shorter period only makes every source thread spin. The CLI
+/// builds its `--interval` range from this, so the two cannot disagree.
+pub const MIN_INTERVAL_MS: u64 = 100;
+
+/// The period every source thread sleeps between reads: `interval_ms`, raised
+/// to `MIN_INTERVAL_MS`.
+fn sampling_period(interval_ms: u64) -> Duration {
+    Duration::from_millis(interval_ms.max(MIN_INTERVAL_MS))
+}
+
 #[derive(Clone, Default)]
 struct StaticSnapshot {
     gpu_cores: u32,
@@ -1153,6 +1164,9 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// Starts one thread per source. Each wakes every `interval_ms`, raised to
+    /// `MIN_INTERVAL_MS`; the slow sources (Bluetooth batteries, per-process
+    /// network counters, the Wi-Fi SSID) refresh only every few wake-ups.
     pub fn new(interval_ms: u64) -> Self {
         // Parallelize init reads — all independent
         let (gpu_cores, dram_gb, ssd_model, max_nits) = std::thread::scope(|s| {
@@ -1192,9 +1206,7 @@ impl Sampler {
         };
         let running = Arc::new(AtomicBool::new(true));
         let mut handles = Vec::new();
-        // Used exactly as given. The CLI validates `--interval` once (100 ms
-        // to 60 s); a second, silent floor here made the two disagree.
-        let dt = Duration::from_millis(interval_ms);
+        let dt = sampling_period(interval_ms);
 
         // ── IOReport (SoC power + frequencies) ───────────────────────────
         {
@@ -1732,6 +1744,15 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_period_never_goes_below_the_floor() {
+        // 0 used to reach `thread::sleep(ZERO)` and spin every source thread.
+        assert_eq!(sampling_period(0), Duration::from_millis(MIN_INTERVAL_MS));
+        assert_eq!(sampling_period(99), Duration::from_millis(MIN_INTERVAL_MS));
+        assert_eq!(sampling_period(100), Duration::from_millis(100));
+        assert_eq!(sampling_period(1000), Duration::from_millis(1000));
+    }
 
     #[test]
     fn gpu_filter_publishes_real_readings() {
