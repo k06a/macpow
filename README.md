@@ -231,7 +231,7 @@ If a new chip isn't detected correctly, run `macpow --dump` to see the raw IORep
 
 - macOS 12+ (Monterey or later)
 - Apple Silicon (M1, M2, M3, M4, M5 — any variant)
-- Rust 1.70+
+- Rust 1.88+ for `cargo install` or building from source (declared as `rust-version` in `Cargo.toml`)
 
 ## Release checklist
 
