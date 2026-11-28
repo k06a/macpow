@@ -836,57 +836,81 @@ fn read_ssd_model() -> String {
 
 extern "C" {
     fn host_statistics64(host: u32, flavor: i32, info: *mut u8, count: *mut u32) -> i32;
+    fn host_page_size(host: u32, out_page_size: *mut usize) -> i32;
 }
 const HOST_VM_INFO64: i32 = 4;
-const HOST_VM_INFO64_COUNT: u32 = 38; // sizeof(vm_statistics64_data_t) / sizeof(integer_t)
-const PAGE_SIZE: u64 = 16384;
+const HOST_VM_INFO64_COUNT: u32 = 38; // HOST_VM_INFO64_REV1_COUNT: VmStats64 in integer_t units
+
+/// `vm_statistics64` from <mach/vm_statistics.h> up to its revision 1, which
+/// is all the kernel fills in for HOST_VM_INFO64_COUNT. The `*_count` fields
+/// are numbers of pages.
+#[repr(C)]
+#[derive(Default)]
+struct VmStats64 {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
+}
+
+// host_statistics64 writes HOST_VM_INFO64_COUNT integers into a VmStats64.
+const _: () = assert!(
+    std::mem::size_of::<VmStats64>() == HOST_VM_INFO64_COUNT as usize * std::mem::size_of::<i32>()
+);
+
+/// Pages behind Activity Monitor's "Memory Used": app memory (anonymous pages
+/// that are not purgeable) + wired + compressor. File cache and purgeable
+/// pages are left out because the kernel gives them up on demand; counting
+/// them (active + inactive) made the figure creep up to the whole RAM on any
+/// Mac with some uptime.
+fn mem_used_pages(vm: &VmStats64) -> u64 {
+    let app = (vm.internal_page_count as u64).saturating_sub(vm.purgeable_count as u64);
+    app + vm.wire_count as u64 + vm.compressor_page_count as u64
+}
 
 pub fn read_mem_used_gb() -> f32 {
-    #[repr(C)]
-    struct VmStats64 {
-        free_count: u32,
-        active_count: u32,
-        inactive_count: u32,
-        wire_count: u32,
-        zero_fill_count: u64,
-        reactivations: u64,
-        pageins: u64,
-        pageouts: u64,
-        faults: u64,
-        cow_faults: u64,
-        lookups: u64,
-        hits: u64,
-        purges: u64,
-        purgeable_count: u32,
-        speculative_count: u32,
-        decompressions: u64,
-        compressions: u64,
-        swapins: u64,
-        swapouts: u64,
-        compressor_page_count: u32,
-        throttled_count: u32,
-        external_page_count: u32,
-        internal_page_count: u32,
-        total_uncompressed_pages_in_compressor: u64,
-    }
-    unsafe {
-        let mut info = std::mem::zeroed::<VmStats64>();
-        let mut count = HOST_VM_INFO64_COUNT;
-        let kr = host_statistics64(
-            mach_host_self(),
+    let mut vm = VmStats64::default();
+    let mut count = HOST_VM_INFO64_COUNT;
+    // The kernel counts in its own page size (16 KiB on Apple Silicon, 4 KiB
+    // on Intel), which host_page_size reports.
+    let mut page_size: usize = 0;
+    // SAFETY: `vm` is exactly `count` integers long (asserted above), so the
+    // kernel cannot write past it, and any bit pattern is a valid VmStats64.
+    // `page_size` is a valid out-pointer for the vm_size_t the call returns.
+    let ok = unsafe {
+        let host = mach_host_self();
+        host_statistics64(
+            host,
             HOST_VM_INFO64,
-            &mut info as *mut VmStats64 as *mut u8,
+            &mut vm as *mut VmStats64 as *mut u8,
             &mut count,
-        );
-        if kr != 0 {
-            return 0.0;
-        }
-        let used_pages = info.active_count as u64
-            + info.inactive_count as u64
-            + info.wire_count as u64
-            + info.compressor_page_count as u64;
-        (used_pages * PAGE_SIZE) as f32 / (1024.0 * 1024.0 * 1024.0)
+        ) == 0
+            && host_page_size(host, &mut page_size) == 0
+    };
+    if !ok {
+        return 0.0;
     }
+    (mem_used_pages(&vm) * page_size as u64) as f32 / (1024.0 * 1024.0 * 1024.0)
 }
 
 pub fn read_gpu_utilization() -> (u32, u32, u32) {
@@ -1728,6 +1752,56 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Counters of an M5 Max with 128 GB as vm_stat printed them, in pages of
+    // 16 KiB: Activity Monitor showed 82.3 GiB used while active + inactive +
+    // wired + compressor came to 126.3 GiB.
+    fn vm_stats_with_file_cache() -> VmStats64 {
+        VmStats64 {
+            active_count: 3_112_965,
+            inactive_count: 3_158_230,
+            wire_count: 552_682,
+            compressor_page_count: 1_456_189,
+            internal_page_count: 3_655_584,
+            external_page_count: 2_615_920,
+            purgeable_count: 272_722,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mem_used_pages_is_app_memory_plus_wired_plus_compressor() {
+        let vm = vm_stats_with_file_cache();
+        assert_eq!(
+            mem_used_pages(&vm),
+            3_655_584 - 272_722 + 552_682 + 1_456_189
+        );
+        assert_eq!(mem_used_pages(&vm) * 16384 / (1 << 30), 82);
+    }
+
+    #[test]
+    fn mem_used_pages_does_not_count_file_cache() {
+        let mut vm = vm_stats_with_file_cache();
+        let used = mem_used_pages(&vm);
+        // A large file is read: its pages are file-backed and sit on the
+        // active and inactive queues until the kernel needs them back.
+        vm.external_page_count += 1_000_000;
+        vm.active_count += 400_000;
+        vm.inactive_count += 600_000;
+        assert_eq!(mem_used_pages(&vm), used);
+    }
+
+    #[test]
+    fn mem_used_pages_survives_more_purgeable_than_anonymous_pages() {
+        let vm = VmStats64 {
+            internal_page_count: 10,
+            purgeable_count: 25,
+            wire_count: 3,
+            compressor_page_count: 4,
+            ..Default::default()
+        };
+        assert_eq!(mem_used_pages(&vm), 7);
+    }
 
     // Needs neither the SMC nor IOReport, so it has to pass in a VM too.
     #[test]
