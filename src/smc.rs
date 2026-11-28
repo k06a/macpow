@@ -128,11 +128,42 @@ impl RawSmcEntry {
     }
 
     /// Decode the payload to a human-readable string for the well-known SMC types.
-    /// Mirrors iSMC's decoding for cross-reference with their `reports/` dumps.
+    /// Mirrors iSMC's decoding for cross-reference with their `reports/` dumps,
+    /// except for the byte order of integers (see [`decode_smc_value`]).
     /// Returns an empty string for types we don't understand — the caller can
     /// still show the raw hex.
     pub fn decoded(&self) -> String {
-        decode_smc_value(&self.data_type, &self.bytes, self.data_size)
+        let mut bytes = self.bytes;
+        if is_big_endian_key(&self.key) {
+            // Reversed, a big-endian integer is the little-endian one that
+            // decode_smc_value reads.
+            let n = (self.data_size as usize).min(32);
+            bytes[..n].reverse();
+        }
+        decode_smc_value(&self.data_type, &bytes, self.data_size)
+    }
+}
+
+/// Whether an integer key is big-endian, unlike most Apple Silicon SMC
+/// integers. The byte order is a property of the key, not of its type, so
+/// this lists the keys that were checked on a Mac17,7 (M5 Max) against a
+/// source outside the SMC:
+/// * `#KEY` – the count the key enumeration walks.
+/// * `RBID`, `RCID`, `RCRV` – `board-id`, `chip-id` and `chip-revision` of
+///   the device tree. `RBRV` (board revision) has nothing to compare with and
+///   is listed as the fourth key of that boot-identity group.
+/// * `D<n>CF`, `D<n>CR`, `D<n>Rc`, `D<n>FV`, `D<n>Ac` – `SrdyCount`,
+///   `SrdoCount`, `HardResetCount`, `FwVersion` and `ActiveContractRdo` of
+///   USB-C port controller n in the registry (`PortController…` properties).
+///   Their neighbours `D<n>CA`/`D<n>CD` (attach/detach count) are
+///   little-endian.
+fn is_big_endian_key(key: &str) -> bool {
+    match key.as_bytes() {
+        b"#KEY" | b"RBID" | b"RBRV" | b"RCID" | b"RCRV" => true,
+        [b'D', b'1'..=b'9', field @ ..] => {
+            matches!(field, b"CF" | b"CR" | b"Rc" | b"FV" | b"Ac")
+        }
+        _ => false,
     }
 }
 
@@ -143,10 +174,17 @@ impl RawSmcEntry {
 /// * `ioft`     – 48.16 unsigned fixed-point, little-endian
 /// * `fp1f`–`fpe2` – unsigned fixed-point Q*.* (big-endian)
 /// * `sp1e`–`spf0` – signed fixed-point Q*.* (big-endian)
-/// * `ui8`/`ui16`/`ui32`/`hex_` – big-endian unsigned integer
-/// * `si8`/`si16`/`si32` – big-endian signed integer
+/// * `ui8`/`ui16`/`ui32`/`hex_` – little-endian unsigned integer (payloads of
+///   up to 4 bytes; a longer `hex_` blob has no single value)
+/// * `si8`/`si16`/`si32` – little-endian signed integer
 /// * `flag`     – 0/1 boolean (rendered as "true"/"false")
 /// * `pwm`      – 16-bit big-endian percentage of 0xFFFF
+///
+/// iSMC reads integers big-endian, the Intel SMC convention. On Apple Silicon
+/// most are little-endian: `B0CT` (battery cycle count, `ui16`) with bytes
+/// `f1 00` is 241, as the battery registry entry confirms. The keys known to
+/// be big-endian anyway are handled by [`RawSmcEntry::decoded`]; for any other
+/// key the raw bytes printed next to the value remain the reference.
 pub fn decode_smc_value(data_type: &str, bytes: &[u8; 32], size: u32) -> String {
     if size == 0 {
         return String::new();
@@ -172,23 +210,24 @@ pub fn decode_smc_value(data_type: &str, bytes: &[u8; 32], size: u32) -> String 
             ]);
             format!("{}", raw as f32 / 65536.0)
         }
-        "ui8" | "ui16" | "ui32" | "hex_" => {
-            format!("{}", be_uint(buf))
-        }
+        "ui8" | "ui16" | "ui32" | "hex_" => match le_uint(buf) {
+            Some(v) => format!("{}", v),
+            None => String::new(),
+        },
         "si8" => format!("{}", buf[0] as i8),
         "si16" => {
             if n < 2 {
                 return String::new();
             }
-            format!("{}", i16::from_be_bytes([buf[0], buf[1]]))
+            format!("{}", i16::from_le_bytes([buf[0], buf[1]]))
         }
         "si32" => {
             if n < 4 {
                 return String::new();
             }
-            format!("{}", i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]))
+            format!("{}", i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
         }
-        "flag" => format!("{}", be_uint(buf) == 1),
+        "flag" => format!("{}", le_uint(buf) == Some(1)),
         "pwm" => {
             if n < 2 {
                 return String::new();
@@ -214,13 +253,18 @@ pub fn decode_smc_value(data_type: &str, bytes: &[u8; 32], size: u32) -> String 
     }
 }
 
-fn be_uint(buf: &[u8]) -> u32 {
-    let n = buf.len().min(4);
-    let mut total: u32 = 0;
-    for (i, b) in buf[..n].iter().enumerate() {
-        total |= (*b as u32) << ((n - 1 - i) * 8);
+/// Little-endian unsigned integer made of the whole payload.
+///
+/// `None` when the payload is empty or longer than 4 bytes: a `hex_` blob can
+/// be up to 32 bytes of packed fields, and a number built from its first four
+/// would be an invented value.
+fn le_uint(buf: &[u8]) -> Option<u32> {
+    if buf.is_empty() || buf.len() > 4 {
+        return None;
     }
-    total
+    let mut le = [0u8; 4];
+    le[..buf.len()].copy_from_slice(buf);
+    Some(u32::from_le_bytes(le))
 }
 
 /// Returns `(divisor, signed)` for fixed-point fp/sp type tags.
@@ -691,5 +735,129 @@ mod tests {
         assert_eq!(decode_f32(TYPE_IOFT, &[0x33, 0x33, 0x23, 0x00]), None);
         assert_eq!(decode_f32(TYPE_SP78, &[0x1e]), None);
         assert_eq!(decode_f32(TYPE_FLT, &[]), None);
+    }
+
+    /// The decoded column of `--dump-smc` for one key, built the way
+    /// `dump_all` builds its entries.
+    fn dumped(key: &str, data_type: &str, payload: &[u8]) -> String {
+        let mut bytes = [0u8; 32];
+        bytes[..payload.len()].copy_from_slice(payload);
+        RawSmcEntry {
+            key: key.into(),
+            data_type: data_type.into(),
+            data_size: payload.len() as u32,
+            bytes,
+        }
+        .decoded()
+    }
+
+    #[test]
+    fn dump_decodes_integers_little_endian() {
+        // The battery registry entry showed CycleCount 241 and DesignCapacity
+        // 6249 next to these two payloads.
+        assert_eq!(dumped("B0CT", "ui16", &[0xf1, 0x00]), "241");
+        assert_eq!(dumped("B0DC", "ui16", &[0x69, 0x18]), "6249");
+        // Battery voltage in mV and current in mA (negative: discharging).
+        assert_eq!(dumped("B0AV", "ui16", &[0x54, 0x30]), "12372");
+        assert_eq!(dumped("B0AC", "si16", &[0x51, 0xf9]), "-1711");
+        assert_eq!(dumped("CHBV", "ui32", &[0x20, 0x11, 0x00, 0x00]), "4384");
+        assert_eq!(dumped("TVDi", "si32", &[0x02, 0x00, 0x00, 0x00]), "2");
+        assert_eq!(dumped("B0AP", "si32", &[0xd4, 0x83, 0xff, 0xff]), "-31788");
+    }
+
+    #[test]
+    fn dump_decodes_single_byte_types() {
+        assert_eq!(dumped("BRSC", "ui8 ", &[0x46]), "70");
+        assert_eq!(dumped("AC-B", "si8 ", &[0xff]), "-1");
+        assert_eq!(dumped("AC-S", "flag", &[0x01]), "true");
+        assert_eq!(dumped("AC-E", "flag", &[0x00]), "false");
+    }
+
+    #[test]
+    fn dump_decodes_short_hex_and_leaves_longer_blobs_as_raw_bytes() {
+        // The battery registry entry showed ChemID 29795 and GaugeFlagRaw 192.
+        assert_eq!(dumped("B0CI", "hex_", &[0x63, 0x74, 0x00, 0x00]), "29795");
+        assert_eq!(dumped("B0FI", "hex_", &[0xc0, 0x00]), "192");
+        // BTTA packs four 16-bit fields; it has no single value.
+        assert_eq!(
+            dumped("BTTA", "hex_", &[0x0c, 0, 0x0f, 0, 0x14, 0, 0x2d, 0]),
+            ""
+        );
+    }
+
+    #[test]
+    fn dump_keeps_big_endian_keys_big_endian() {
+        // 3864 keys; chip-id 0x6050, board-id 10 and chip-revision 0x11 in
+        // the device tree.
+        assert_eq!(dumped("#KEY", "ui32", &[0x00, 0x00, 0x0f, 0x18]), "3864");
+        assert_eq!(dumped("RCID", "ui32", &[0x00, 0x00, 0x60, 0x50]), "24656");
+        assert_eq!(dumped("RBID", "ui32", &[0x00, 0x00, 0x00, 0x0a]), "10");
+        assert_eq!(dumped("RCRV", "ui32", &[0x00, 0x00, 0x00, 0x11]), "17");
+        // The same bytes under any other key are little-endian.
+        assert_eq!(
+            dumped("CHBV", "ui32", &[0x00, 0x00, 0x0f, 0x18]),
+            "403636224"
+        );
+    }
+
+    #[test]
+    fn dump_follows_the_byte_order_of_each_port_controller_key() {
+        // Values of the PortController… registry properties of USB-C ports 1
+        // and 3 at the time of the dump: SrdyCount 363 and 2344, SrdoCount
+        // 285, HardResetCount 10, FwVersion 3211776, ActiveContractRdo
+        // 327360712.
+        assert_eq!(dumped("D1CF", "ui16", &[0x01, 0x6b]), "363");
+        assert_eq!(dumped("D3CF", "ui16", &[0x09, 0x28]), "2344");
+        assert_eq!(dumped("D1CR", "ui16", &[0x01, 0x1d]), "285");
+        assert_eq!(dumped("D3Rc", "ui16", &[0x00, 0x0a]), "10");
+        assert_eq!(dumped("D1FV", "hex_", &[0x00, 0x31, 0x02, 0x00]), "3211776");
+        assert_eq!(
+            dumped("D3Ac", "hex_", &[0x13, 0x83, 0x20, 0xc8]),
+            "327360712"
+        );
+        // AttachCount 96 and 1034, DetachCount 97: little-endian neighbours.
+        assert_eq!(dumped("D1CA", "ui16", &[0x60, 0x00]), "96");
+        assert_eq!(dumped("D3CA", "ui16", &[0x0a, 0x04]), "1034");
+        assert_eq!(dumped("D1CD", "ui16", &[0x61, 0x00]), "97");
+    }
+
+    #[test]
+    fn big_endian_keys_are_matched_exactly() {
+        assert!(is_big_endian_key("#KEY"));
+        assert!(is_big_endian_key("RBRV"));
+        assert!(is_big_endian_key("D9Ac"));
+        // Not a port number, not a listed field, not four characters.
+        assert!(!is_big_endian_key("DRCF"));
+        assert!(!is_big_endian_key("D0CF"));
+        assert!(!is_big_endian_key("D1CA"));
+        assert!(!is_big_endian_key("D1C"));
+        assert!(!is_big_endian_key("B0CT"));
+        assert!(!is_big_endian_key(""));
+    }
+
+    #[test]
+    fn dump_decodes_nothing_from_a_payload_shorter_than_its_type() {
+        assert_eq!(dumped("B0AC", "si16", &[0x51]), "");
+        assert_eq!(dumped("TVDi", "si32", &[0x02, 0x00]), "");
+        assert_eq!(dumped("B0CT", "ui16", &[]), "");
+    }
+
+    #[test]
+    fn dump_float_and_fixed_point_types_keep_their_byte_order() {
+        assert_eq!(dumped("F0Ac", "flt ", &[0x00, 0xa0, 0x11, 0x45]), "2330");
+        assert_eq!(dumped("TG0C", "ioft", &[0, 0, 0x22, 0, 0, 0, 0, 0]), "34");
+        // Intel-era fixed point is big-endian.
+        assert_eq!(dumped("TC0P", "sp78", &[0x1e, 0x80]), "30.5");
+        assert_eq!(dumped("F0Ac", "fpe2", &[0x1c, 0x20]), "1800");
+    }
+
+    #[test]
+    fn le_uint_reads_whole_payloads_of_up_to_four_bytes() {
+        assert_eq!(le_uint(&[0x46]), Some(70));
+        assert_eq!(le_uint(&[0xf1, 0x00]), Some(241));
+        assert_eq!(le_uint(&[0x01, 0x02, 0x03]), Some(0x03_02_01));
+        assert_eq!(le_uint(&[0xff; 4]), Some(u32::MAX));
+        assert_eq!(le_uint(&[]), None);
+        assert_eq!(le_uint(&[0; 5]), None);
     }
 }
