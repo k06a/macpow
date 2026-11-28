@@ -1415,6 +1415,17 @@ unsafe fn probe_clpc(
     delivered
 }
 
+/// Flag `soc` as having no power source: [`IOReportSampler::new`] failed (as
+/// it does in every virtual machine, or under a sandbox that denies the
+/// IOReport user client), so no sample will ever fill it in. Without the
+/// flags its zeros can't be told from an idle chip.
+///
+/// Only the flags are set: other sources own some of the other fields.
+pub fn mark_unavailable(soc: &mut SocPower) {
+    soc.cpu_unavailable = true;
+    soc.rails_unavailable = true;
+}
+
 pub struct IOReportSampler {
     subscription: IOReportSubscriptionRef,
     subscribed_channels: CFMutableDictionaryRef,
@@ -2513,6 +2524,30 @@ mod tests {
         assert!((s.dyn_weight() - 4.0).abs() < 1e-9);
         let s = DvfsState { mhz: 2000, mv: 500 };
         assert!((s.dyn_weight() - 0.5).abs() < 1e-9);
+    }
+
+    // ── no IOReport at all ───────────────────────────────────────────────────
+
+    #[test]
+    fn unavailable_ioreport_is_flagged_in_json() {
+        let mut soc = SocPower {
+            gpu_util_renderer: 7,
+            ..Default::default()
+        };
+        // Flags are serialized only when set: an untouched SocPower looks
+        // exactly like an idle chip.
+        let json = serde_json::to_value(&soc).unwrap();
+        assert!(json.get("cpu_unavailable").is_none());
+        assert!(json.get("rails_unavailable").is_none());
+
+        mark_unavailable(&mut soc);
+        let json = serde_json::to_value(&soc).unwrap();
+        assert_eq!(json["cpu_unavailable"], true);
+        assert_eq!(json["rails_unavailable"], true);
+        // Nothing else changes, least of all the fields other sources own.
+        assert_eq!(soc.gpu_util_renderer, 7);
+        assert_eq!(json["total_w"], 0.0);
+        assert!(json.get("energy_model_gated").is_none());
     }
 
     // ── source selection ─────────────────────────────────────────────────────

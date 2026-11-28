@@ -1117,7 +1117,13 @@ impl Sampler {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                let Some(ior) = IOReportSampler::new().ok() else {
+                let Ok(ior) = IOReportSampler::new() else {
+                    // No IOReport at all (any virtual machine, a sandbox):
+                    // nothing will ever fill `soc`. Flag it, or its zeros
+                    // read as an idle chip.
+                    if let Ok(mut mg) = m.lock() {
+                        crate::ioreport::mark_unavailable(&mut mg.soc);
+                    }
                     return;
                 };
                 let mut prev = ior.sample().ok();
