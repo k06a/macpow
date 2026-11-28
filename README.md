@@ -69,7 +69,7 @@ cargo install macpow
 ```bash
 git clone https://github.com/k06a/macpow.git
 cd macpow
-cargo build --release
+cargo build --release      # rustup first installs the Rust release pinned in rust-toolchain.toml
 ./target/release/macpow
 ```
 
@@ -236,46 +236,54 @@ If a new chip isn't detected correctly, run `macpow --dump` to see the raw IORep
 
 - macOS 12+ (Monterey or later)
 - Apple Silicon (M1, M2, M3, M4, M5 — any variant)
-- Rust 1.70+
+- Rust 1.88+ for `cargo install` or building from source (declared as `rust-version` in `Cargo.toml`)
 
 ## Release checklist
 
-> **Toolchain pinning.** The repo ships a `rust-toolchain.toml` that pins
-> `stable`, matching `dtolnay/rust-toolchain@stable` in CI. Run
-> `rustup update stable` before each release so local clippy/fmt see the
-> same lints CI does — newly-promoted clippy lints have caused CI failures
-> after `cargo publish` already uploaded the broken version (immutable),
-> so this step is non-optional.
+> **Toolchain pinning.** `rust-toolchain.toml` pins an exact Rust release.
+> rustup installs it on first use, locally and in CI, so local clippy/fmt
+> always see the same lints CI does and there is nothing to update before a
+> release. A newer Rust, and the lints it adds, arrives only through a
+> commit that changes the version in that file — make it a commit of its
+> own, so CI tests it like any other change.
+>
+> **Dependency age.** No dependency is used before it is 7 days old: not a
+> Rust release, a crate or a GitHub Action. `.cargo/config.toml` makes Cargo
+> skip younger crate versions when it resolves, Dependabot waits 7 days
+> before proposing an update, and CI fails if `Cargo.lock` pins a younger
+> version (`python3 -I .github/scripts/lock-age.py`).
 
 ```bash
-# 0. Make sure the toolchain matches CI exactly
-rustup update stable
-rustc --version    # note the version; CI is on the same `stable`
-
 # 1. Bump version
 vim Cargo.toml                        # update version = "X.Y.Z"
+cargo check                           # writes the new version into Cargo.lock (CI builds with --locked)
 
 # 2. Build, lint, test — must all pass before the version bump commit
 cargo fmt --check                     # formatting clean
-# Clippy: copy this command verbatim from .github/workflows/ci.yml.
-# CI does NOT pass --all-targets, so neither do we — adding it pulls in
-# benches/examples that CI ignores and would block the release.
-cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
+# Clippy: the same command CI runs. The lints the project allows are listed in
+# Cargo.toml under [lints.clippy], so no -A flags are needed.
+cargo clippy --all-targets --locked -- -D warnings
 cargo test                            # all tests pass
-cargo build --release                 # final binary build
+cargo build --release --locked        # final binary build
 
-# 3. Dry-run the publish so any cargo-side issues show up before tagging
-cargo publish --dry-run
-
-# 4. Update Homebrew badge in README.md
+# 3. Update Homebrew badge in README.md
 #    Change: homebrew-vX.Y.Z in the badge URL
 
-# 5. Commit, tag, push
-git add -A
-git commit -m "Bump version to X.Y.Z"
+# 4. Commit, then dry-run the publish so any cargo-side issues show up before tagging
+#    -a stages tracked files only (Cargo.toml, Cargo.lock, README.md). Don't use
+#    `git add -A`: it would also commit drafts and dumps lying in the directory.
+git commit -am "Bump version to X.Y.Z"
+#    cargo refuses to package uncommitted changes, which is why this comes after the
+#    commit. Don't pass --allow-dirty; if the dry run fails, fix and `git commit -a --amend`.
+cargo publish --dry-run
+
+# 5. Tag, push
 git tag vX.Y.Z
 git push origin main --tags
-# CI will auto-create GitHub Release with binary
+# The tag run builds the binary on a clean runner and creates the GitHub Release with
+# macpow-aarch64-apple-darwin.tar.gz, its .sha256 and a build provenance attestation.
+# It fails if the tag is not "v" + the Cargo.toml version, or if a release for the
+# tag already exists.
 
 # 6. Publish to crates.io  (immutable — only after CI is green!)
 cargo publish
@@ -312,13 +320,12 @@ Before submitting a PR, please run:
 
 ```bash
 cargo fmt --check          # code formatting
-# Clippy: must match CI (see .github/workflows/ci.yml)
-cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
+cargo clippy --all-targets -- -D warnings   # the same lints CI enforces
 cargo test                 # unit + integration tests
 cargo build --release      # final build check
 ```
 
-All four must pass with zero errors. Clippy needs the flags above so local runs match CI; without them, stable Clippy may report project-wide warnings that CI intentionally allows (FFI / Objective-C style).
+All four must pass with zero errors. The lints the project intentionally allows (FFI / Objective-C style) are listed under `[lints.clippy]` in `Cargo.toml`, so plain `cargo clippy`, your editor and CI all apply the same rules. `rust-toolchain.toml` pins the Rust release they all use; rustup installs it on first use.
 
 ### Collecting diagnostics
 

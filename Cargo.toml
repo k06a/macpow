@@ -2,13 +2,28 @@
 name = "macpow"
 version = "0.1.20"
 edition = "2021"
+# Oldest Rust that builds the locked dependency tree: darling 0.23 and instability 0.3.12
+# (both pulled in by ratatui) declare 1.88. Raise it when a dependency update requires it.
+rust-version = "1.88"
 description = "Real-time power consumption monitor for Apple Silicon Macs"
 license = "MIT"
 repository = "https://github.com/k06a/macpow"
-homepage = "https://github.com/k06a/macpow"
 keywords = ["apple-silicon", "power", "monitor", "tui", "macos"]
 categories = ["command-line-utilities", "hardware-support"]
 readme = "README.md"
+# Allow-list of what `cargo publish` uploads. Without one, cargo packages every file in the
+# directory that git does not ignore, tracked or not, so a local draft or a diagnostics dump
+# ends up on crates.io, where uploads cannot be deleted.
+include = [
+    "/src/**",
+    "/tests/**",
+    "/benches/**",
+    "/examples/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
 
 [lib]
 name = "macpow"
@@ -35,14 +50,39 @@ core-foundation-sys = "0.8"
 libc = "0.2"
 unicode-width = { version = "0.2.0", optional = true }
 
+# Clippy lints the project allows on purpose (FFI and Objective-C style code). They are
+# listed here, not on a command line, so that `cargo clippy` judges the code by the same
+# rules locally, in an editor and in CI.
+[lints.clippy]
+field_reassign_with_default = "allow"
+manual_c_str_literals = "allow"
+manual_clamp = "allow"
+manual_range_contains = "allow"
+missing_safety_doc = "allow"
+needless_range_loop = "allow"
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+# Without the default `plotters` and `rayon` features: they only draw the HTML charts and
+# add eight crates to every test build. The timing table and the comparison with the
+# previous run are unaffected, and criterion still draws the charts if gnuplot is installed.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "data_sources"
 harness = false
+
+# Every line here buys download and on-disk size, not speed: 20 s of `macpow --json` costs
+# the same CPU time before and after, because that time goes to system calls. Measured on
+# 0.1.20 with rustc 1.100.1 the binary shrinks from 2,562,960 to 1,570,336 bytes, and a
+# release build on an M5 Max takes about 45 s instead of 20 s.
+[profile.release]
+strip = true      # -531 KB: no symbol table (panic messages keep their file:line)
+lto = true        # -379 KB: inlining and dead-code removal across crates
+codegen-units = 1 # -83 KB: LLVM optimises the whole program as one unit
+# `panic` stays "unwind": run_tui() needs catch_unwind to restore the terminal after a
+# panic, and Sampler::new() needs it to survive a start-up probe that panics.

@@ -1,0 +1,28 @@
+# Keeps the GitHub Actions pinned by commit SHA in .github/workflows and the Cargo
+# dependencies current. Each ecosystem gets one grouped pull request per week, and CI
+# runs on it like on any other change.
+#
+# cooldown: a release is proposed only once it is at least 7 days old, which leaves
+# time for a compromised release to be found and yanked. Dependabot does not apply
+# the cooldown to security updates; the lock-age check in ci.yml still rejects those
+# until they are 7 days old.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ['*']
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ['*']
