@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::stdout;
+use std::io::{self, stdout, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -83,10 +83,29 @@ fn run_json(rx: mpsc::Receiver<Metrics>) -> Result<()> {
     // default disposition (die at once, even while blocked on a slow reader)
     // is what we want. A handler that calls `process::exit` is not
     // async-signal-safe: it aborts when it interrupts a write to stdout.
+    let mut out = stdout().lock();
     for m in rx {
-        println!("{}", serde_json::to_string_pretty(&m)?);
+        if let Err(e) = write_json_line(&mut out, &m) {
+            // A reader that has seen enough and closed the pipe
+            // (`macpow --json | head -1`) is a normal way to stop.
+            return match e.kind() {
+                io::ErrorKind::BrokenPipe => Ok(()),
+                _ => Err(e.into()),
+            };
+        }
     }
     Ok(())
+}
+
+/// Writes one snapshot as a single line of compact JSON (JSON Lines) and
+/// flushes it, so a reader gets every object as soon as it exists.
+fn write_json_line(out: &mut impl Write, m: &Metrics) -> io::Result<()> {
+    // Serialise into memory first: the whole line then reaches stdout in one
+    // write instead of dribbling through std's 1 KB line buffer.
+    let mut line = serde_json::to_vec(m)?;
+    line.push(b'\n');
+    out.write_all(&line)?;
+    out.flush()
 }
 
 fn restore_terminal() {
@@ -159,4 +178,43 @@ fn run_dump_smc() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer whose reader has gone away.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_line_is_one_compact_object_per_line() {
+        let mut out = Vec::new();
+        write_json_line(&mut out, &Metrics::default()).unwrap();
+        write_json_line(&mut out, &Metrics::default()).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with('\n'));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per object");
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(value.is_object());
+        }
+    }
+
+    #[test]
+    fn json_line_reports_a_closed_pipe_as_broken_pipe() {
+        let err = write_json_line(&mut ClosedPipe, &Metrics::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
 }

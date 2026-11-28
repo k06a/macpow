@@ -3,9 +3,10 @@
 //! samplers, so they need a Mac; every wait is bounded, so a regression fails
 //! the test instead of hanging it.
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_macpow");
@@ -51,6 +52,27 @@ fn wait(child: &mut Child) -> ExitStatus {
     }
 }
 
+/// Reads the first line of the child's stdout and then closes the pipe, like
+/// `head -1` does. Kills the child and fails if no line arrives within `LIMIT`.
+fn first_line_then_close(child: &mut Child) -> String {
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+        // The reader is dropped here, which closes our end of the pipe.
+    });
+    match rx.recv_timeout(LIMIT) {
+        Ok(line) => line,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("macpow printed no line within {LIMIT:?}");
+        }
+    }
+}
+
 /// Everything the (already exited) child wrote to stderr.
 fn stderr_of(child: &mut Child) -> String {
     let mut text = String::new();
@@ -90,4 +112,22 @@ fn json_sigint_with_a_stalled_reader_ends_by_the_signal() {
     let stderr = stderr_of(&mut child);
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
     assert_eq!(status.signal(), Some(libc::SIGINT), "status: {status:?}");
+}
+
+/// `macpow --json | head -1`: the reader gets one whole object, and macpow
+/// ends quietly when its next write finds the pipe closed. It used to print
+/// the first line of a pretty-printed object and then panic (exit 101).
+#[test]
+fn json_is_one_object_per_line_and_a_closed_pipe_ends_cleanly() {
+    let mut child = spawn(&["--json", "--interval", "100"]);
+    let line = first_line_then_close(&mut child);
+    let status = wait(&mut child);
+    let stderr = stderr_of(&mut child);
+
+    assert!(line.ends_with('\n'), "first line: {line:?}");
+    let value: serde_json::Value =
+        serde_json::from_str(&line).expect("the first line is not one complete JSON value");
+    assert!(value.is_object(), "first line: {line:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert_eq!(status.code(), Some(0), "status: {status:?}");
 }
