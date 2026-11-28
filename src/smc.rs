@@ -69,27 +69,32 @@ fn fourcc_to_str(v: u32) -> String {
 
 /// FourCC for `flt ` (IEEE 754 float, with trailing space).
 const TYPE_FLT: u32 = 0x666c7420; // 'f','l','t',' '
-/// FourCC for `iof ` (IO float).
-const TYPE_IOF: u32 = 0x696f6620;
+/// FourCC for `ioft` (unsigned fixed-point 48.16, little-endian).
+const TYPE_IOFT: u32 = u32::from_be_bytes(*b"ioft");
 /// FourCC for `sp78` (signed fixed-point 7.8).
 const TYPE_SP78: u32 = 0x73703738;
 /// FourCC for `ui32`.
 #[allow(dead_code)]
 const TYPE_UI32: u32 = 0x75693332;
 
-fn bytes_to_f32_le(b: &[u8]) -> f32 {
-    if b.len() < 4 {
-        return 0.0;
+/// Decode the payload of a numeric SMC key (`flt `, `ioft`, `sp78`).
+///
+/// Returns `None` for any other type and for a payload shorter than its type
+/// needs: reading such bytes as a float would produce a number that looks
+/// like a measurement but is not one.
+fn decode_f32(data_type: u32, payload: &[u8]) -> Option<f32> {
+    match data_type {
+        TYPE_FLT => Some(f32::from_le_bytes(payload.get(..4)?.try_into().ok()?)),
+        TYPE_IOFT => {
+            let raw = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+            Some(raw as f32 / 65536.0)
+        }
+        TYPE_SP78 => {
+            let raw = i16::from_be_bytes(payload.get(..2)?.try_into().ok()?);
+            Some(raw as f32 / 256.0)
+        }
+        _ => None,
     }
-    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-fn bytes_to_sp78(b: &[u8]) -> f32 {
-    if b.len() < 2 {
-        return 0.0;
-    }
-    let raw = i16::from_be_bytes([b[0], b[1]]);
-    raw as f32 / 256.0
 }
 
 // ── Raw key dump ─────────────────────────────────────────────────────────────
@@ -123,11 +128,42 @@ impl RawSmcEntry {
     }
 
     /// Decode the payload to a human-readable string for the well-known SMC types.
-    /// Mirrors iSMC's decoding for cross-reference with their `reports/` dumps.
+    /// Mirrors iSMC's decoding for cross-reference with their `reports/` dumps,
+    /// except for the byte order of integers (see [`decode_smc_value`]).
     /// Returns an empty string for types we don't understand — the caller can
     /// still show the raw hex.
     pub fn decoded(&self) -> String {
-        decode_smc_value(&self.data_type, &self.bytes, self.data_size)
+        let mut bytes = self.bytes;
+        if is_big_endian_key(&self.key) {
+            // Reversed, a big-endian integer is the little-endian one that
+            // decode_smc_value reads.
+            let n = (self.data_size as usize).min(32);
+            bytes[..n].reverse();
+        }
+        decode_smc_value(&self.data_type, &bytes, self.data_size)
+    }
+}
+
+/// Whether an integer key is big-endian, unlike most Apple Silicon SMC
+/// integers. The byte order is a property of the key, not of its type, so
+/// this lists the keys that were checked on a Mac17,7 (M5 Max) against a
+/// source outside the SMC:
+/// * `#KEY` – the count the key enumeration walks.
+/// * `RBID`, `RCID`, `RCRV` – `board-id`, `chip-id` and `chip-revision` of
+///   the device tree. `RBRV` (board revision) has nothing to compare with and
+///   is listed as the fourth key of that boot-identity group.
+/// * `D<n>CF`, `D<n>CR`, `D<n>Rc`, `D<n>FV`, `D<n>Ac` – `SrdyCount`,
+///   `SrdoCount`, `HardResetCount`, `FwVersion` and `ActiveContractRdo` of
+///   USB-C port controller n in the registry (`PortController…` properties).
+///   Their neighbours `D<n>CA`/`D<n>CD` (attach/detach count) are
+///   little-endian.
+fn is_big_endian_key(key: &str) -> bool {
+    match key.as_bytes() {
+        b"#KEY" | b"RBID" | b"RBRV" | b"RCID" | b"RCRV" => true,
+        [b'D', b'1'..=b'9', field @ ..] => {
+            matches!(field, b"CF" | b"CR" | b"Rc" | b"FV" | b"Ac")
+        }
+        _ => false,
     }
 }
 
@@ -138,10 +174,17 @@ impl RawSmcEntry {
 /// * `ioft`     – 48.16 unsigned fixed-point, little-endian
 /// * `fp1f`–`fpe2` – unsigned fixed-point Q*.* (big-endian)
 /// * `sp1e`–`spf0` – signed fixed-point Q*.* (big-endian)
-/// * `ui8`/`ui16`/`ui32`/`hex_` – big-endian unsigned integer
-/// * `si8`/`si16`/`si32` – big-endian signed integer
+/// * `ui8`/`ui16`/`ui32`/`hex_` – little-endian unsigned integer (payloads of
+///   up to 4 bytes; a longer `hex_` blob has no single value)
+/// * `si8`/`si16`/`si32` – little-endian signed integer
 /// * `flag`     – 0/1 boolean (rendered as "true"/"false")
 /// * `pwm`      – 16-bit big-endian percentage of 0xFFFF
+///
+/// iSMC reads integers big-endian, the Intel SMC convention. On Apple Silicon
+/// most are little-endian: `B0CT` (battery cycle count, `ui16`) with bytes
+/// `f1 00` is 241, as the battery registry entry confirms. The keys known to
+/// be big-endian anyway are handled by [`RawSmcEntry::decoded`]; for any other
+/// key the raw bytes printed next to the value remain the reference.
 pub fn decode_smc_value(data_type: &str, bytes: &[u8; 32], size: u32) -> String {
     if size == 0 {
         return String::new();
@@ -167,23 +210,24 @@ pub fn decode_smc_value(data_type: &str, bytes: &[u8; 32], size: u32) -> String 
             ]);
             format!("{}", raw as f32 / 65536.0)
         }
-        "ui8" | "ui16" | "ui32" | "hex_" => {
-            format!("{}", be_uint(buf))
-        }
+        "ui8" | "ui16" | "ui32" | "hex_" => match le_uint(buf) {
+            Some(v) => format!("{}", v),
+            None => String::new(),
+        },
         "si8" => format!("{}", buf[0] as i8),
         "si16" => {
             if n < 2 {
                 return String::new();
             }
-            format!("{}", i16::from_be_bytes([buf[0], buf[1]]))
+            format!("{}", i16::from_le_bytes([buf[0], buf[1]]))
         }
         "si32" => {
             if n < 4 {
                 return String::new();
             }
-            format!("{}", i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]))
+            format!("{}", i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
         }
-        "flag" => format!("{}", be_uint(buf) == 1),
+        "flag" => format!("{}", le_uint(buf) == Some(1)),
         "pwm" => {
             if n < 2 {
                 return String::new();
@@ -209,13 +253,18 @@ pub fn decode_smc_value(data_type: &str, bytes: &[u8; 32], size: u32) -> String 
     }
 }
 
-fn be_uint(buf: &[u8]) -> u32 {
-    let n = buf.len().min(4);
-    let mut total: u32 = 0;
-    for (i, b) in buf[..n].iter().enumerate() {
-        total |= (*b as u32) << ((n - 1 - i) * 8);
+/// Little-endian unsigned integer made of the whole payload.
+///
+/// `None` when the payload is empty or longer than 4 bytes: a `hex_` blob can
+/// be up to 32 bytes of packed fields, and a number built from its first four
+/// would be an invented value.
+fn le_uint(buf: &[u8]) -> Option<u32> {
+    if buf.is_empty() || buf.len() > 4 {
+        return None;
     }
-    total
+    let mut le = [0u8; 4];
+    le[..buf.len()].copy_from_slice(buf);
+    Some(u32::from_le_bytes(le))
 }
 
 /// Returns `(divisor, signed)` for fixed-point fp/sp type tags.
@@ -238,6 +287,40 @@ fn fp_divisor(t: &str) -> Option<(f32, bool)> {
     };
     let div = (1u32 << frac) as f32;
     Some((div, signed))
+}
+
+/// Number of keys an enumeration walks for a reported `#KEY` value.
+///
+/// Apple Silicon Macs report about 1500–3900 keys (3864 on an M5 Max). The
+/// bound keeps a corrupt count from turning into billions of SMC calls.
+fn bounded_key_count(reported: u32) -> u32 {
+    reported.min(8192)
+}
+
+/// Category of a temperature key, chosen by its prefix; "Other" when no prefix
+/// is listed.
+fn temp_category(key: &str) -> &'static str {
+    // Longer prefixes first: TPMP/TPSP must match before Tp (CPU)
+    const PREFIXES: &[(&str, &str)] = &[
+        ("TPMP", "Trackpad"),
+        ("TPSP", "Trackpad"),
+        ("TD", "Display"),
+        ("Tp", "CPU"),
+        ("Te", "CPU"),
+        ("Tg", "GPU"),
+        ("Ts", "SSD"),
+        ("Tm", "Memory"),
+        ("TB", "Battery"),
+        ("Tw", "Wireless"),
+        // Keys are case-sensitive: the wireless sensor of an M5 Max is `TW0P`,
+        // which "Tw" does not match.
+        ("TW", "Wireless"),
+        ("Ta", "ANE"),
+    ];
+    PREFIXES
+        .iter()
+        .find(|(prefix, _)| key.starts_with(prefix))
+        .map_or("Other", |(_, category)| category)
 }
 
 // ── public interface ─────────────────────────────────────────────────────────
@@ -281,47 +364,14 @@ impl SmcConnection {
     /// Start async temperature key discovery. Call `finish_temp_discovery`
     /// later to collect results without blocking.
     pub fn start_temp_discovery(&self) -> std::thread::JoinHandle<Vec<(String, String)>> {
-        // Open a second SMC connection for the background thread
-        let conn2 = Self::open_raw_conn().unwrap_or(0);
-        std::thread::spawn(move || {
-            if conn2 == 0 {
-                return Vec::new();
-            }
-            let mut tmp = SmcConnection {
-                conn: conn2,
-                temp_keys: None,
-                key_info_cache: std::collections::HashMap::new(),
-                temp_value_cache: std::collections::HashMap::new(),
-            };
-            let keys = tmp.discover_temp_keys();
-            // Don't close via Drop — we manually close
-            unsafe {
-                IOServiceClose(conn2);
-            }
-            std::mem::forget(tmp);
-            keys
+        // The thread enumerates over a connection of its own, so its thousands
+        // of calls never delay a sample on `self`. It is an ordinary
+        // `SmcConnection`: dropping it when the closure returns closes the
+        // connection and frees its key-info cache.
+        std::thread::spawn(|| match Self::open() {
+            Ok(mut smc) => smc.discover_temp_keys(),
+            Err(_) => Vec::new(),
         })
-    }
-
-    fn open_raw_conn() -> Option<u32> {
-        unsafe {
-            let matching = IOServiceMatching(b"AppleSMC\0".as_ptr() as *const i8);
-            if matching.is_null() {
-                return None;
-            }
-            let service = IOServiceGetMatchingService(0, matching);
-            if service == 0 {
-                return None;
-            }
-            let mut conn: u32 = 0;
-            let kr = IOServiceOpen(service, mach_task_self(), 0, &mut conn);
-            IOObjectRelease(service);
-            if kr != 0 {
-                None
-            } else {
-                Some(conn)
-            }
-        }
     }
 
     pub fn finish_temp_discovery(
@@ -383,15 +433,20 @@ impl SmcConnection {
         Ok((info, out.bytes))
     }
 
-    /// Read a float value from an SMC key (handles `flt `, `iof `, `sp78` types).
+    /// Read a float value from an SMC key (handles `flt `, `ioft`, `sp78` types).
+    /// Fails for a key of any other type.
     pub fn read_f32(&mut self, key_str: &str) -> Result<f32> {
         let (info, bytes) = self.read_key_raw(key_str)?;
-        let val = match info.data_type {
-            TYPE_FLT | TYPE_IOF => bytes_to_f32_le(&bytes),
-            TYPE_SP78 => bytes_to_sp78(&bytes),
-            _ => bytes_to_f32_le(&bytes),
-        };
-        Ok(val)
+        let size = (info.data_size as usize).min(bytes.len());
+        match decode_f32(info.data_type, &bytes[..size]) {
+            Some(val) => Ok(val),
+            None => bail!(
+                "SMC key {:?}: cannot read type {:?} ({} bytes) as a float",
+                key_str,
+                fourcc_to_str(info.data_type),
+                info.data_size
+            ),
+        }
     }
 
     // ── SMC key enumeration ────────────────────────────────────────────────
@@ -438,10 +493,7 @@ impl SmcConnection {
     /// Output order matches the SMC's internal index ordering (alphabetical).
     /// Skips keys whose info or value read fails.
     pub fn dump_all(&mut self) -> Vec<RawSmcEntry> {
-        let count = self.key_count();
-        // Sane upper bound — current Apple Silicon Macs report ~1500–2700 keys.
-        // Guards against a corrupt #KEY value.
-        let count = count.min(8192);
+        let count = bounded_key_count(self.key_count());
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
             let Some(key_fcc) = self.key_at_index(i) else {
@@ -506,34 +558,15 @@ impl SmcConnection {
     }
 
     fn discover_temp_keys(&mut self) -> Vec<(String, String)> {
-        // Longer prefixes first: TPMP/TPSP must match before Tp (CPU)
-        let prefixes: &[(&str, &str)] = &[
-            ("TPMP", "Trackpad"),
-            ("TPSP", "Trackpad"),
-            ("TD", "Display"),
-            ("Tp", "CPU"),
-            ("Te", "CPU"),
-            ("Tg", "GPU"),
-            ("Ts", "SSD"),
-            ("Tm", "Memory"),
-            ("TB", "Battery"),
-            ("Tw", "Wireless"),
-            ("Ta", "ANE"),
-        ];
-
-        let count = self.key_count();
+        let count = bounded_key_count(self.key_count());
         (0..count)
             .filter_map(|i| {
                 let key_fcc = self.key_at_index(i)?;
                 ((key_fcc >> 24) as u8 == b'T').then_some(())?;
                 let key_str = fourcc_to_str(key_fcc);
                 let info = self.read_key_info(key_fcc).ok()?;
-                matches!(info.data_type, TYPE_FLT | TYPE_IOF | TYPE_SP78).then_some(())?;
-                let category = prefixes
-                    .iter()
-                    .find(|(p, _)| key_str.starts_with(p))
-                    .map(|(_, c)| c.to_string())
-                    .unwrap_or_else(|| "Other".into());
+                matches!(info.data_type, TYPE_FLT | TYPE_IOFT | TYPE_SP78).then_some(())?;
+                let category = temp_category(&key_str).to_string();
                 Some((key_str, category))
             })
             .collect()
@@ -605,5 +638,248 @@ impl Drop for SmcConnection {
         unsafe {
             IOServiceClose(self.conn);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Payload bytes in these tests were captured with `macpow --dump-smc` on a
+    // MacBook Pro Mac17,7 (M5 Max).
+
+    #[test]
+    fn type_tags_spell_their_names() {
+        assert_eq!(TYPE_FLT, fourcc("flt "));
+        assert_eq!(TYPE_IOFT, fourcc("ioft"));
+        assert_eq!(TYPE_SP78, fourcc("sp78"));
+        assert_eq!(TYPE_UI32, fourcc("ui32"));
+        assert_eq!(fourcc_to_str(TYPE_IOFT), "ioft");
+    }
+
+    #[test]
+    fn decode_f32_reads_flt_little_endian() {
+        // F0Ac: fan at 2330 rpm.
+        assert_eq!(
+            decode_f32(TYPE_FLT, &[0x00, 0xa0, 0x11, 0x45]),
+            Some(2330.0)
+        );
+    }
+
+    #[test]
+    fn decode_f32_reads_ioft_as_48_16_fixed_point() {
+        // TG0C and TG2B.
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0x00, 0x00, 0x22, 0, 0, 0, 0, 0]),
+            Some(34.0)
+        );
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0x00, 0x80, 0x22, 0, 0, 0, 0, 0]),
+            Some(34.5)
+        );
+        // TG0B (ioft) and TB0T (flt) are the same battery temperature, read
+        // in one dump: both payloads must decode to the same 36.8 °C.
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0xcc, 0xcc, 0x24, 0, 0, 0, 0, 0]),
+            decode_f32(TYPE_FLT, &[0x30, 0x33, 0x13, 0x42])
+        );
+        // The integer part is not limited to the low 32 bits.
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0, 0, 0, 0, 0x01, 0, 0, 0]),
+            Some(65536.0)
+        );
+    }
+
+    #[test]
+    fn decode_f32_reads_sp78_big_endian() {
+        assert_eq!(decode_f32(TYPE_SP78, &[0x1e, 0x80]), Some(30.5));
+        assert_eq!(decode_f32(TYPE_SP78, &[0xff, 0x80]), Some(-0.5));
+    }
+
+    #[test]
+    fn decode_f32_rejects_types_that_are_not_floats() {
+        // B0CT (battery cycle count) and #KEY (number of keys) are integers.
+        assert_eq!(decode_f32(fourcc("ui16"), &[0xf1, 0x00]), None);
+        assert_eq!(decode_f32(TYPE_UI32, &[0x00, 0x00, 0x0f, 0x18]), None);
+        // "iof " with a space is not an SMC type, only "ioft" is.
+        assert_eq!(
+            decode_f32(fourcc("iof "), &[0x33, 0x33, 0x23, 0, 0, 0, 0, 0]),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_f32_rejects_payloads_shorter_than_the_type() {
+        assert_eq!(decode_f32(TYPE_FLT, &[0x00, 0xa0, 0x11]), None);
+        assert_eq!(decode_f32(TYPE_IOFT, &[0x33, 0x33, 0x23, 0x00]), None);
+        assert_eq!(decode_f32(TYPE_SP78, &[0x1e]), None);
+        assert_eq!(decode_f32(TYPE_FLT, &[]), None);
+    }
+
+    /// The decoded column of `--dump-smc` for one key, built the way
+    /// `dump_all` builds its entries.
+    fn dumped(key: &str, data_type: &str, payload: &[u8]) -> String {
+        let mut bytes = [0u8; 32];
+        bytes[..payload.len()].copy_from_slice(payload);
+        RawSmcEntry {
+            key: key.into(),
+            data_type: data_type.into(),
+            data_size: payload.len() as u32,
+            bytes,
+        }
+        .decoded()
+    }
+
+    #[test]
+    fn dump_decodes_integers_little_endian() {
+        // The battery registry entry showed CycleCount 241 and DesignCapacity
+        // 6249 next to these two payloads.
+        assert_eq!(dumped("B0CT", "ui16", &[0xf1, 0x00]), "241");
+        assert_eq!(dumped("B0DC", "ui16", &[0x69, 0x18]), "6249");
+        // Battery voltage in mV and current in mA (negative: discharging).
+        assert_eq!(dumped("B0AV", "ui16", &[0x54, 0x30]), "12372");
+        assert_eq!(dumped("B0AC", "si16", &[0x51, 0xf9]), "-1711");
+        assert_eq!(dumped("CHBV", "ui32", &[0x20, 0x11, 0x00, 0x00]), "4384");
+        assert_eq!(dumped("TVDi", "si32", &[0x02, 0x00, 0x00, 0x00]), "2");
+        assert_eq!(dumped("B0AP", "si32", &[0xd4, 0x83, 0xff, 0xff]), "-31788");
+    }
+
+    #[test]
+    fn dump_decodes_single_byte_types() {
+        assert_eq!(dumped("BRSC", "ui8 ", &[0x46]), "70");
+        assert_eq!(dumped("AC-B", "si8 ", &[0xff]), "-1");
+        assert_eq!(dumped("AC-S", "flag", &[0x01]), "true");
+        assert_eq!(dumped("AC-E", "flag", &[0x00]), "false");
+    }
+
+    #[test]
+    fn dump_decodes_short_hex_and_leaves_longer_blobs_as_raw_bytes() {
+        // The battery registry entry showed ChemID 29795 and GaugeFlagRaw 192.
+        assert_eq!(dumped("B0CI", "hex_", &[0x63, 0x74, 0x00, 0x00]), "29795");
+        assert_eq!(dumped("B0FI", "hex_", &[0xc0, 0x00]), "192");
+        // BTTA packs four 16-bit fields; it has no single value.
+        assert_eq!(
+            dumped("BTTA", "hex_", &[0x0c, 0, 0x0f, 0, 0x14, 0, 0x2d, 0]),
+            ""
+        );
+    }
+
+    #[test]
+    fn dump_keeps_big_endian_keys_big_endian() {
+        // 3864 keys; chip-id 0x6050, board-id 10 and chip-revision 0x11 in
+        // the device tree.
+        assert_eq!(dumped("#KEY", "ui32", &[0x00, 0x00, 0x0f, 0x18]), "3864");
+        assert_eq!(dumped("RCID", "ui32", &[0x00, 0x00, 0x60, 0x50]), "24656");
+        assert_eq!(dumped("RBID", "ui32", &[0x00, 0x00, 0x00, 0x0a]), "10");
+        assert_eq!(dumped("RCRV", "ui32", &[0x00, 0x00, 0x00, 0x11]), "17");
+        // The same bytes under any other key are little-endian.
+        assert_eq!(
+            dumped("CHBV", "ui32", &[0x00, 0x00, 0x0f, 0x18]),
+            "403636224"
+        );
+    }
+
+    #[test]
+    fn dump_follows_the_byte_order_of_each_port_controller_key() {
+        // Values of the PortController… registry properties of USB-C ports 1
+        // and 3 at the time of the dump: SrdyCount 363 and 2344, SrdoCount
+        // 285, HardResetCount 10, FwVersion 3211776, ActiveContractRdo
+        // 327360712.
+        assert_eq!(dumped("D1CF", "ui16", &[0x01, 0x6b]), "363");
+        assert_eq!(dumped("D3CF", "ui16", &[0x09, 0x28]), "2344");
+        assert_eq!(dumped("D1CR", "ui16", &[0x01, 0x1d]), "285");
+        assert_eq!(dumped("D3Rc", "ui16", &[0x00, 0x0a]), "10");
+        assert_eq!(dumped("D1FV", "hex_", &[0x00, 0x31, 0x02, 0x00]), "3211776");
+        assert_eq!(
+            dumped("D3Ac", "hex_", &[0x13, 0x83, 0x20, 0xc8]),
+            "327360712"
+        );
+        // AttachCount 96 and 1034, DetachCount 97: little-endian neighbours.
+        assert_eq!(dumped("D1CA", "ui16", &[0x60, 0x00]), "96");
+        assert_eq!(dumped("D3CA", "ui16", &[0x0a, 0x04]), "1034");
+        assert_eq!(dumped("D1CD", "ui16", &[0x61, 0x00]), "97");
+    }
+
+    #[test]
+    fn big_endian_keys_are_matched_exactly() {
+        assert!(is_big_endian_key("#KEY"));
+        assert!(is_big_endian_key("RBRV"));
+        assert!(is_big_endian_key("D9Ac"));
+        // Not a port number, not a listed field, not four characters.
+        assert!(!is_big_endian_key("DRCF"));
+        assert!(!is_big_endian_key("D0CF"));
+        assert!(!is_big_endian_key("D1CA"));
+        assert!(!is_big_endian_key("D1C"));
+        assert!(!is_big_endian_key("B0CT"));
+        assert!(!is_big_endian_key(""));
+    }
+
+    #[test]
+    fn dump_decodes_nothing_from_a_payload_shorter_than_its_type() {
+        assert_eq!(dumped("B0AC", "si16", &[0x51]), "");
+        assert_eq!(dumped("TVDi", "si32", &[0x02, 0x00]), "");
+        assert_eq!(dumped("B0CT", "ui16", &[]), "");
+    }
+
+    #[test]
+    fn dump_float_and_fixed_point_types_keep_their_byte_order() {
+        assert_eq!(dumped("F0Ac", "flt ", &[0x00, 0xa0, 0x11, 0x45]), "2330");
+        assert_eq!(dumped("TG0C", "ioft", &[0, 0, 0x22, 0, 0, 0, 0, 0]), "34");
+        // Intel-era fixed point is big-endian.
+        assert_eq!(dumped("TC0P", "sp78", &[0x1e, 0x80]), "30.5");
+        assert_eq!(dumped("F0Ac", "fpe2", &[0x1c, 0x20]), "1800");
+    }
+
+    #[test]
+    fn le_uint_reads_whole_payloads_of_up_to_four_bytes() {
+        assert_eq!(le_uint(&[0x46]), Some(70));
+        assert_eq!(le_uint(&[0xf1, 0x00]), Some(241));
+        assert_eq!(le_uint(&[0x01, 0x02, 0x03]), Some(0x03_02_01));
+        assert_eq!(le_uint(&[0xff; 4]), Some(u32::MAX));
+        assert_eq!(le_uint(&[]), None);
+        assert_eq!(le_uint(&[0; 5]), None);
+    }
+
+    #[test]
+    fn temp_category_finds_the_wireless_sensor_in_either_case() {
+        assert_eq!(temp_category("TW0P"), "Wireless");
+        assert_eq!(temp_category("Tw0P"), "Wireless");
+    }
+
+    #[test]
+    fn temp_category_keeps_every_other_prefix() {
+        for (key, category) in [
+            ("TPMP", "Trackpad"),
+            ("TPSP", "Trackpad"),
+            ("TD00", "Display"),
+            ("Tp00", "CPU"),
+            ("Te05", "CPU"),
+            ("Tg08", "GPU"),
+            ("Ts00", "SSD"),
+            ("Tm00", "Memory"),
+            ("TB0T", "Battery"),
+            ("Ta00", "ANE"),
+        ] {
+            assert_eq!(temp_category(key), category, "{key}");
+        }
+    }
+
+    #[test]
+    fn temp_category_is_other_for_unlisted_prefixes() {
+        // Upper and lower case are different prefixes (TG is not Tg, TS is
+        // not Ts), and TP alone is not the trackpad.
+        for key in ["TG0B", "TS0P", "TPD0", "TR0Z", "TH0x", "TVMD", "Tf06"] {
+            assert_eq!(temp_category(key), "Other", "{key}");
+        }
+    }
+
+    #[test]
+    fn bounded_key_count_passes_real_counts_and_caps_corrupt_ones() {
+        assert_eq!(bounded_key_count(0), 0);
+        assert_eq!(bounded_key_count(3864), 3864);
+        assert_eq!(bounded_key_count(8192), 8192);
+        // The #KEY payload 00 00 0f 18 read in the wrong byte order.
+        assert_eq!(bounded_key_count(0x180f_0000), 8192);
+        assert_eq!(bounded_key_count(u32::MAX), 8192);
     }
 }
