@@ -78,7 +78,9 @@ fn main() -> Result<()> {
 // Timing model, the same for both front ends.
 //
 // The Sampler runs one thread per data source. Each thread re-reads its source
-// every `--interval` and publishes the result into shared state, and
+// every `--interval` and publishes the result into shared state (Bluetooth
+// batteries, per-process network counters and the Wi-Fi SSID fallback start a
+// subprocess, so they refresh no more often than every 10 s, 2 s and 30 s), and
 // `Sampler::snapshot` copies that state without waiting for any of them. The
 // front end owns the Sampler and takes a snapshot at the moment it is about to
 // use one, so it always shows the newest published state, never a queued one:

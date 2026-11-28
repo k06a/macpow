@@ -99,7 +99,7 @@ macpow --dump             # Dump IOReport channel names (diagnostics)
 macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 ```
 
-`--interval` is how often every source is sampled. It is also the TUI's initial refresh interval (shown in the footer, changed with `l`) and the period of the `--json` stream.
+`--interval` is the base sampling period of every source. Three sources that each start a subprocess refresh no more often than their own period: Bluetooth batteries every 10 s, per-process network counters every 2 s and the Wi-Fi SSID fallback every 30 s. `--interval` is also the TUI's initial refresh interval (shown in the footer, changed with `l`) and the period of the `--json` stream.
 
 `--json` writes one object per `--interval`. Each object is compact JSON on a single line ([JSON Lines](https://jsonlines.org)), flushed as soon as it is produced, so `while read`, `grep` and `jq -c` can consume the stream record by record. When the reader closes the pipe (`macpow --json | head -1`) macpow exits with status 0; Ctrl+C ends it by SIGINT like any other filter.
 
