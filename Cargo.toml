@@ -61,3 +61,14 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "data_sources"
 harness = false
+
+# Every line here buys download and on-disk size, not speed: 20 s of `macpow --json` costs
+# the same CPU time before and after, because that time goes to system calls. Measured on
+# 0.1.20 with rustc 1.100.1 the binary shrinks from 2,562,960 to 1,570,336 bytes, and a
+# release build on an M5 Max takes about 45 s instead of 20 s.
+[profile.release]
+strip = true      # -531 KB: no symbol table (panic messages keep their file:line)
+lto = true        # -379 KB: inlining and dead-code removal across crates
+codegen-units = 1 # -83 KB: LLVM optimises the whole program as one unit
+# `panic` stays "unwind": run_tui() needs catch_unwind to restore the terminal after a
+# panic, and Sampler::new() needs it to survive a start-up probe that panics.
