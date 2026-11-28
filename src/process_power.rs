@@ -367,6 +367,24 @@ impl ProcessTracker {
     }
 }
 
+// ── Network counters ─────────────────────────────────────────────────────────
+
+/// Per-process network counters cost a `nettop` subprocess per reading, far
+/// more than the rest of a scan, so they are refreshed only this often and the
+/// last reading is reused in between.
+pub const NET_COUNTERS_REFRESH: Duration = Duration::from_secs(2);
+
+/// How long the network counters of a process must stay unchanged before a
+/// consumer may call it idle. Derived from the refresh period because a shorter
+/// wait mistakes the pause before the next refresh for silence; the margin
+/// covers a consumer that itself polls only every 2 s.
+pub const NET_COUNTERS_IDLE_SECS: f64 = 2.5 * NET_COUNTERS_REFRESH.as_secs_f64();
+
+/// Whether something last refreshed at `last` (`None`: never) is due at `now`.
+pub fn refresh_due(last: Option<Instant>, now: Instant, period: Duration) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= period)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +667,28 @@ mod tests {
         // The total covers every process, listed or not.
         let all_joules: u64 = pids.map(|pid| pid.max(2) as u64).sum();
         assert_eq!(report.total_energy_mj, all_joules as f64 * 1000.0);
+    }
+
+    #[test]
+    fn refresh_is_due_at_first_and_then_once_per_period() {
+        let at = clock();
+        let period = Duration::from_secs(2);
+        assert!(refresh_due(None, at(0.0), period));
+        assert!(!refresh_due(Some(at(0.0)), at(0.25), period));
+        assert!(!refresh_due(Some(at(0.0)), at(1.99), period));
+        assert!(refresh_due(Some(at(0.0)), at(2.0), period));
+
+        // The sampler's loop at its default 250 ms tick, for 12 s.
+        let mut last = None;
+        let mut refreshes = 0;
+        for tick in 0..48 {
+            let now = at(tick as f64 * 0.25);
+            if refresh_due(last, now, period) {
+                last = Some(now);
+                refreshes += 1;
+            }
+        }
+        assert_eq!(refreshes, 6, "not once per tick (48)");
     }
 
     #[test]

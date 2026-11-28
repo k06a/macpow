@@ -855,7 +855,7 @@ impl App {
                     self.proc_net_rates.insert(p.pid, (nr, nt));
                     self.proc_prev_net
                         .insert(p.pid, (p.net_rx_bytes, p.net_tx_bytes, now));
-                } else if elapsed > 2.0 {
+                } else if elapsed > macpow::process_power::NET_COUNTERS_IDLE_SECS {
                     self.proc_net_rates.insert(p.pid, (0.0, 0.0));
                 }
             } else {

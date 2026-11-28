@@ -1488,13 +1488,19 @@ impl Sampler {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                let mut tracker = crate::process_power::ProcessTracker::default();
+                use crate::process_power::{refresh_due, ProcessTracker, NET_COUNTERS_REFRESH};
+                let mut tracker = ProcessTracker::default();
+                let mut net = powermetrics::ProcNetCounters::new();
+                let mut net_read_at = None;
                 while running.load(Ordering::Relaxed) {
                     let scan = read_all_process_energy();
                     // Stamp the scan before anything slower runs, so the time
                     // between two stamps is the time the energy deltas cover.
                     let now = Instant::now();
-                    let net = powermetrics::read_proc_net_counters();
+                    if refresh_due(net_read_at, now, NET_COUNTERS_REFRESH) {
+                        net = powermetrics::read_proc_net_counters();
+                        net_read_at = Some(now);
+                    }
 
                     let mut report = tracker.update(&scan, now);
                     for p in &mut report.processes {
