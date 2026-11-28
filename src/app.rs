@@ -94,6 +94,17 @@ fn fmt_freq(mhz: f32) -> String {
     }
 }
 
+/// Removes control characters (C0, DEL and C1) from text that names something
+/// outside the program: a process, a USB device, a network interface.
+///
+/// Such a name is attacker-chosen, and ratatui writes a `Span` to the terminal
+/// as it is — only `Buffer::set_string` drops control characters. An ESC that
+/// survives into the chart title starts a real escape sequence: it can clear
+/// the screen, retitle the window or, with OSC 52, replace the clipboard.
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 // ── TreeRow: pure data for one row ──────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1114,11 +1125,13 @@ impl App {
         }
         self.cursor = self.cursor.min(self.total_rows.saturating_sub(1));
 
-        // Cache labels for chart titles
+        // Cache labels for chart titles. This is the only place a label is
+        // stored, and the title is the only place one is drawn as a `Span`, so
+        // control characters are stripped here, once.
         for r in &rows {
             if let Some(key) = r.key {
                 if !r.label.is_empty() {
-                    self.labels.insert(key, r.label.clone());
+                    self.labels.insert(key, strip_control_chars(&r.label));
                 }
             }
         }
@@ -4092,5 +4105,108 @@ mod tests {
             vals(&p_temps),
             (62..68).map(|i| i as f32).collect::<Vec<_>>()
         );
+    }
+
+    // ── Control characters in external names ────────────────────────────────
+
+    /// An OSC 52 clipboard write followed by "erase display".
+    const ESCAPES: &str = "\x1b]52;c;AAAA\x07\x1b[2J";
+
+    #[test]
+    fn strip_control_chars_removes_c0_del_and_c1() {
+        assert_eq!(strip_control_chars("a\x1bb"), "ab"); // ESC
+        assert_eq!(strip_control_chars("a\x07b"), "ab"); // BEL
+        assert_eq!(strip_control_chars("a\0b"), "ab"); // NUL
+        assert_eq!(strip_control_chars("a\nb\r\n"), "ab");
+        assert_eq!(strip_control_chars("a\tb"), "ab");
+        assert_eq!(strip_control_chars("a\x7fb"), "ab"); // DEL
+        assert_eq!(strip_control_chars("a\u{9b}2Jb"), "a2Jb"); // C1 CSI
+        assert_eq!(strip_control_chars("a\u{80}\u{9d}\u{9f}b"), "ab"); // C1 range
+        assert_eq!(strip_control_chars(ESCAPES), "]52;c;AAAA[2J");
+        assert_eq!(strip_control_chars("\x1b\x07\0"), "");
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_printable_text() {
+        for s in [
+            "",
+            "macpow (pid 1, 2.0 MB)",
+            "Наушники",
+            "日本語のキーボード",
+            "AirPods Pro 🎧",
+            // ZWJ and variation selectors are format characters, not controls.
+            "👩‍💻 ❤️",
+            "café — naïve",
+            // U+00A0 is the first character after the C1 range.
+            "a\u{a0}b",
+        ] {
+            assert_eq!(strip_control_chars(s), s);
+        }
+    }
+
+    #[test]
+    fn hostile_names_reach_the_screen_without_control_characters() {
+        let mut m = Metrics::default();
+        m.top_processes.push(ProcessPower {
+            pid: 4242,
+            name: format!("evil{ESCAPES}"),
+            power_w: 0.5,
+            energy_mj: 1.0,
+            alive: true,
+            ..Default::default()
+        });
+        m.usb_devices.push(UsbDevice {
+            name: format!("Stick{ESCAPES}"),
+            ..Default::default()
+        });
+        m.bluetooth_devices.push(BluetoothDevice {
+            name: format!("Buds{ESCAPES}"),
+            minor_type: "Headphones".into(),
+            connected: true,
+            batteries: vec![(String::new(), "80%".into())],
+        });
+
+        let mut app = App::new();
+        app.machine_name = "Test Mac".into();
+        app.update(m);
+        // A pinned row gets a chart whatever row the cursor is on.
+        app.pinned = vec![proc_key(&mut app.proc_keys, 4242), usb_key(0)];
+
+        let (width, height) = (120, 60);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+
+        // Debug formatting only: a failure must not replay the sequences into
+        // the terminal that runs the tests.
+        let leaked: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains(char::is_control))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "control characters reached the screen: {leaked:#?}"
+        );
+
+        // The printable part of each name is still shown: in both chart
+        // titles, and in the tree row of the Bluetooth device (which has no
+        // chart of its own).
+        for text in [
+            " evil]52;c;AAAA[2J (pid 4242, 0 B) — 0.500 W [pinned]",
+            " Stick]52;c;AAAA[2J (1.5Mbps) — 0.000 W [pinned]",
+            "Buds]52;c;AAAA[2J Headphones [80%]",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.contains(text)),
+                "missing {text:?} in {lines:#?}"
+            );
+        }
     }
 }
