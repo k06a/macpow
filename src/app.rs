@@ -3027,18 +3027,7 @@ impl App {
                 if is_data {
                     human_rate(v)
                 } else {
-                    let mw = v * 1000.0;
-                    if mw.abs() >= 100.0 {
-                        format!("{:.0}mW", mw)
-                    } else if mw.abs() >= 1.0 {
-                        format!("{:.1}mW", mw)
-                    } else if mw.abs() > 0.0 {
-                        format!("{:.2}mW", mw)
-                    } else if v.abs() >= 1.0 {
-                        format!("{:.1}W", v)
-                    } else {
-                        format!("{:.0}mW", mw)
-                    }
+                    fmt_axis_power(v)
                 }
             };
             let scale_lines: Vec<Line> = (0..scale_h)
@@ -3526,6 +3515,23 @@ fn nice_scale(max_val: f64) -> f64 {
         .unwrap_or(max_val.ceil().max(1.0))
 }
 
+/// Chart axis label for a power in watts. Fits the 6-column axis for every
+/// scale `nice_scale` picks: whole watts first, or 50 W would read "50000mW".
+fn fmt_axis_power(w: f64) -> String {
+    let mw = w * 1000.0;
+    if w.abs() >= 1.0 {
+        format!("{:.1}W", w)
+    } else if mw.abs() >= 100.0 {
+        format!("{:.0}mW", mw)
+    } else if mw.abs() >= 1.0 {
+        format!("{:.1}mW", mw)
+    } else if mw.abs() > 0.0 {
+        format!("{:.2}mW", mw)
+    } else {
+        "0mW".to_string()
+    }
+}
+
 fn usage_bar(pct: f32) -> String {
     let width = 10;
     let filled = ((pct / 100.0) * width as f32).round() as usize;
@@ -3721,6 +3727,24 @@ mod tests {
             category: "CPU".to_string(),
             value_celsius: temp,
             stale: false,
+        }
+    }
+
+    #[test]
+    fn power_axis_labels_fit_the_axis_column() {
+        assert_eq!(fmt_axis_power(50.0), "50.0W");
+        assert_eq!(fmt_axis_power(2.5), "2.5W");
+        assert_eq!(fmt_axis_power(0.5), "500mW");
+        assert_eq!(fmt_axis_power(0.025), "25.0mW");
+        assert_eq!(fmt_axis_power(0.0005), "0.50mW");
+        assert_eq!(fmt_axis_power(0.0), "0mW");
+        // Every scale and half scale a power chart can get, up to 200 W.
+        for max in [0.0, 0.00005, 0.0007, 0.03, 0.4, 3.0, 21.7, 150.0, 200.0] {
+            let top = nice_scale(max);
+            for v in [top, top / 2.0] {
+                let label = fmt_axis_power(v);
+                assert!(label.chars().count() <= 6, "{v} W -> {label:?}");
+            }
         }
     }
 
