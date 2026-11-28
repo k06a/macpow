@@ -245,27 +245,11 @@ unsafe fn number_in(dict: CFDictionaryRef, key: &str) -> Option<f64> {
 }
 
 unsafe fn read_adapter_inner() -> Option<AdapterInfo> {
-    let matching = IOServiceMatching(b"AppleSmartBattery\0".as_ptr() as *const i8);
-    if matching.is_null() {
-        return None;
-    }
-    let service = IOServiceGetMatchingService(0, matching);
-    if service == 0 {
-        return None;
-    }
-
-    let mut props = std::ptr::null_mut();
-    let kr = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
-    IOObjectRelease(service);
-    if kr != 0 || props.is_null() {
-        return None;
-    }
-
-    let dict = props as CFDictionaryRef;
+    let dict = copy_service_properties(c"AppleSmartBattery")?;
     let external = cf_utils::cfdict_get_bool(dict, "ExternalConnected").unwrap_or(false);
 
     if !external {
-        cf_utils::cf_release(props as _);
+        cf_utils::cf_release(dict as _);
         return Some(AdapterInfo::default());
     }
 
@@ -280,7 +264,7 @@ unsafe fn read_adapter_inner() -> Option<AdapterInfo> {
         (0, 0, 0, false)
     };
 
-    cf_utils::cf_release(props as _);
+    cf_utils::cf_release(dict as _);
 
     Some(AdapterInfo {
         connected: true,
@@ -299,23 +283,7 @@ pub fn read_usb_power_out_per_port() -> Vec<UsbPortPower> {
 unsafe fn read_usb_power_per_port_inner() -> Option<Vec<UsbPortPower>> {
     use core_foundation_sys::array::CFArrayRef;
 
-    let matching = IOServiceMatching(b"AppleSmartBattery\0".as_ptr() as *const i8);
-    if matching.is_null() {
-        return None;
-    }
-    let service = IOServiceGetMatchingService(0, matching);
-    if service == 0 {
-        return None;
-    }
-
-    let mut props = std::ptr::null_mut();
-    let kr = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
-    IOObjectRelease(service);
-    if kr != 0 || props.is_null() {
-        return None;
-    }
-
-    let dict = props as CFDictionaryRef;
+    let dict = copy_service_properties(c"AppleSmartBattery")?;
 
     // PowerOutDetails carries the measured watts per port, but the battery
     // firmware only lists the port(s) currently winning USB-PD negotiation —
@@ -390,7 +358,7 @@ unsafe fn read_usb_power_per_port_inner() -> Option<Vec<UsbPortPower>> {
         }
     }
 
-    cf_utils::cf_release(props as _);
+    cf_utils::cf_release(dict as _);
     Some(ports)
 }
 

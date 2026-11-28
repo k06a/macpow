@@ -1371,9 +1371,12 @@ impl Sampler {
                             };
                         }
                     }
+                    // Read before the lock: it copies AppleSmartBattery's
+                    // properties again, which takes a few hundred microseconds.
+                    let adapter = battery::read_adapter();
                     if let Ok(mut mg) = m.lock() {
                         mg.battery = b;
-                        mg.adapter = battery::read_adapter();
+                        mg.adapter = adapter;
                     }
                     std::thread::sleep(dt);
                 }
