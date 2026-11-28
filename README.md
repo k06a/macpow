@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/k06a/macpow/actions/workflows/ci.yml/badge.svg)](https://github.com/k06a/macpow/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/macpow)](https://crates.io/crates/macpow)
-[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.20-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
+[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.21-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](https://github.com/k06a/macpow)
 
@@ -42,6 +42,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **Temperatures** — per-component and per-core from SMC sensors (CPU, GPU, ANE, DRAM, SSD, Battery); universal bank-based key mapping for all Apple Silicon generations (M1–M5+, including Ultra dual-die); stale value caching with `~` indicator when sensors temporarily read invalid
 - **Memory** — used/total GB via `host_statistics64` Mach API
 - **Display** — brightness, panel class (SDR/HDR/XDR), refresh rate / ProMotion, live HDR-active indicator from `AppleARMBacklight` IOReport `DPB factor`, plus IOReport SoC display controller and external display power via DISPEXT
+  - `nits` is the brightness slider × the active preset's peak (1600 in "P3-1600 nits"); `panel_nits` (`panel N` in the tree) is the level the built-in panel is actually driven at, read from its framebuffer's `IOMFBBrightnessLevel`, and `null` in `--json` when no built-in panel publishes one (e.g. an external main display)
 - **Keyboard** — backlight brightness and estimated power via IORegistry PWM
 - **Battery** — voltage, amperage, charge %, time remaining, temperature, drain/charge rate
 - **SSD** — model, interconnect (Apple Fabric/PCIe), power estimation from IORegistry disk counters
@@ -51,7 +52,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **Collapsible tree** — fold/unfold with arrows, `+`/`-` for all
 - **Sparkline charts** — pin any resource with Space, inline 1-line history column at wide terminals
 - **Time-based SMA** — toggle 0s/5s/10s smoothing window
-- **Latency control** — toggle UI refresh rate: 500ms / 2s / 5s
+- **Latency control** — toggle UI refresh rate: 1x / 2x / 4x / 8x of `--interval` (`l`)
 - **Mouse support** — click to select rows
 - **JSON mode** — pipe structured data for scripts and dashboards
 - **No sudo** — runs entirely with user-level permissions
@@ -61,15 +62,17 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 ### With cargo
 
 ```bash
-cargo install macpow
+cargo install --locked macpow
 ```
+
+`--locked` installs the dependency versions this release was tested with (see `Cargo.lock`).
 
 ### From source
 
 ```bash
 git clone https://github.com/k06a/macpow.git
 cd macpow
-cargo build --release
+cargo build --release      # rustup first installs the Rust release pinned in rust-toolchain.toml
 ./target/release/macpow
 ```
 
@@ -92,11 +95,16 @@ pixi exec macpow
 
 ```
 macpow                    # TUI mode (default)
-macpow --json             # JSON output to stdout
-macpow --interval 500     # Set sampling interval in ms (default: 250)
+macpow --json             # JSON Lines on stdout: one compact object per line
+macpow --json | jq .      # the same stream, pretty-printed
+macpow --interval 500     # Sampling interval in ms, 100 to 60000 (default: 250)
 macpow --dump             # Dump IOReport channel names (diagnostics)
 macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 ```
+
+`--interval` is the base sampling period of every source. Three sources that each start a subprocess refresh no more often than their own period: Bluetooth batteries every 10 s, per-process network counters every 2 s and the Wi-Fi SSID fallback every 30 s. `--interval` is also the TUI's initial refresh interval (shown in the footer, changed with `l`) and the period of the `--json` stream.
+
+`--json` writes one object per `--interval`. Each object is compact JSON on a single line ([JSON Lines](https://jsonlines.org)), flushed as soon as it is produced, so `while read`, `grep` and `jq -c` can consume the stream record by record. When the reader closes the pipe (`macpow --json | head -1`) macpow exits with status 0; Ctrl+C ends it by SIGINT like any other filter.
 
 ### Keybindings
 
@@ -109,13 +117,13 @@ macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 | `-` | Collapse all nodes |
 | `Space` | Pin/unpin resource chart |
 | `a` | Cycle SMA window: 0s / 5s / 10s |
-| `l` | Cycle refresh interval: 250ms / 500ms / 1s / 2s |
+| `l` | Cycle refresh interval: 1x / 2x / 4x / 8x of `--interval` (250ms / 500ms / 1s / 2s by default) |
 | `r` | Reset all totals and min/max |
 | `PgUp` / `PgDn` | Scroll by 10 rows |
 | `Home` | Jump to top |
 | Mouse click | Select row |
 
-All letter keys work on any keyboard layout (QWERTY, Russian, Dvorak, etc).
+Letter keys are matched by the Latin letter they type, so on a non-Latin layout (Russian, for example) switch to a Latin one, or use the arrow keys and `Esc`.
 
 ## Architecture
 
@@ -135,7 +143,7 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 |                  | USB devices, SSD model, disk I/O counters   |
 | CoreAudio        | Volume level, mute state                    |
 | Mach API         | Per-CPU utilization ticks, memory stats     |
-| proc_pid_rusage  | Per-process billed energy                   |
+| proc_pid_rusage  | Per-process CPU energy                      |
 | getifaddrs       | Network traffic byte counters               |
 | CoreWLAN/pmset   | WiFi info, Bluetooth devices                |
 | IOPMAssertions   | Power assertions, audio playback detection  |
@@ -156,12 +164,12 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 | Power adapter | SMC PDTR | Direct power delivery measurement |
 | System total | SMC PSTR | Direct power rail measurement |
 | Battery | IORegistry | V * I calculation |
-| Per-process | Kernel | `ri_billed_energy` from rusage_info_v4 |
+| Per-process | Kernel | `ri_energy_nj` (CPU energy) from rusage_info_v6, or `ri_billed_energy` from rusage_info_v4 on kernels without v6; without root only the current user's processes are readable |
 | Per-process disk I/O | Kernel | `ri_diskio_bytesread/written` from rusage_info_v4 |
 | Per-process memory | Kernel | `ri_phys_footprint` from rusage_info_v4 |
 | Per-process network | nettop | Cumulative bytes per process (~18ms subprocess) |
 | CPU utilization | Mach API | `host_processor_info` tick deltas |
-| Memory | Mach API | `host_statistics64` (active + inactive + wired + compressor pages) |
+| Memory | Mach API | `host_statistics64` (anonymous − purgeable + wired + compressor pages: Activity Monitor's Memory Used; the file cache is not counted) |
 | Keyboard | IORegistry PWM | Duty cycle * 0.5W max |
 | Fans | SMC RPM | Cubic model: (RPM/RPM_max)^3 * 1W |
 | Audio | CoreAudio + IOPMAssertions | Idle 0.05W + volume^2 * 1W |
@@ -231,46 +239,54 @@ If a new chip isn't detected correctly, run `macpow --dump` to see the raw IORep
 
 - macOS 12+ (Monterey or later)
 - Apple Silicon (M1, M2, M3, M4, M5 — any variant)
-- Rust 1.70+
+- Rust 1.88+ for `cargo install` or building from source (declared as `rust-version` in `Cargo.toml`)
 
 ## Release checklist
 
-> **Toolchain pinning.** The repo ships a `rust-toolchain.toml` that pins
-> `stable`, matching `dtolnay/rust-toolchain@stable` in CI. Run
-> `rustup update stable` before each release so local clippy/fmt see the
-> same lints CI does — newly-promoted clippy lints have caused CI failures
-> after `cargo publish` already uploaded the broken version (immutable),
-> so this step is non-optional.
+> **Toolchain pinning.** `rust-toolchain.toml` pins an exact Rust release.
+> rustup installs it on first use, locally and in CI, so local clippy/fmt
+> always see the same lints CI does and there is nothing to update before a
+> release. A newer Rust, and the lints it adds, arrives only through a
+> commit that changes the version in that file — make it a commit of its
+> own, so CI tests it like any other change.
+>
+> **Dependency age.** No dependency is used before it is 7 days old: not a
+> Rust release, a crate or a GitHub Action. `.cargo/config.toml` makes Cargo
+> skip younger crate versions when it resolves, Dependabot waits 7 days
+> before proposing an update, and CI fails if `Cargo.lock` pins a younger
+> version (`python3 -I .github/scripts/lock-age.py`).
 
 ```bash
-# 0. Make sure the toolchain matches CI exactly
-rustup update stable
-rustc --version    # note the version; CI is on the same `stable`
-
 # 1. Bump version
 vim Cargo.toml                        # update version = "X.Y.Z"
+cargo check                           # writes the new version into Cargo.lock (CI builds with --locked)
 
 # 2. Build, lint, test — must all pass before the version bump commit
 cargo fmt --check                     # formatting clean
-# Clippy: copy this command verbatim from .github/workflows/ci.yml.
-# CI does NOT pass --all-targets, so neither do we — adding it pulls in
-# benches/examples that CI ignores and would block the release.
-cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
+# Clippy: the same command CI runs. The lints the project allows are listed in
+# Cargo.toml under [lints.clippy], so no -A flags are needed.
+cargo clippy --all-targets --locked -- -D warnings
 cargo test                            # all tests pass
-cargo build --release                 # final binary build
+cargo build --release --locked        # final binary build
 
-# 3. Dry-run the publish so any cargo-side issues show up before tagging
-cargo publish --dry-run
-
-# 4. Update Homebrew badge in README.md
+# 3. Update Homebrew badge in README.md
 #    Change: homebrew-vX.Y.Z in the badge URL
 
-# 5. Commit, tag, push
-git add -A
-git commit -m "Bump version to X.Y.Z"
+# 4. Commit, then dry-run the publish so any cargo-side issues show up before tagging
+#    -a stages tracked files only (Cargo.toml, Cargo.lock, README.md). Don't use
+#    `git add -A`: it would also commit drafts and dumps lying in the directory.
+git commit -am "Bump version to X.Y.Z"
+#    cargo refuses to package uncommitted changes, which is why this comes after the
+#    commit. Don't pass --allow-dirty; if the dry run fails, fix and `git commit -a --amend`.
+cargo publish --dry-run
+
+# 5. Tag, push
 git tag vX.Y.Z
 git push origin main --tags
-# CI will auto-create GitHub Release with binary
+# The tag run builds the binary on a clean runner and creates the GitHub Release with
+# macpow-aarch64-apple-darwin.tar.gz, its .sha256 and a build provenance attestation.
+# It fails if the tag is not "v" + the Cargo.toml version, or if a release for the
+# tag already exists.
 
 # 6. Publish to crates.io  (immutable — only after CI is green!)
 cargo publish
@@ -307,13 +323,12 @@ Before submitting a PR, please run:
 
 ```bash
 cargo fmt --check          # code formatting
-# Clippy: must match CI (see .github/workflows/ci.yml)
-cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
+cargo clippy --all-targets -- -D warnings   # the same lints CI enforces
 cargo test                 # unit + integration tests
 cargo build --release      # final build check
 ```
 
-All four must pass with zero errors. Clippy needs the flags above so local runs match CI; without them, stable Clippy may report project-wide warnings that CI intentionally allows (FFI / Objective-C style).
+All four must pass with zero errors. The lints the project intentionally allows (FFI / Objective-C style) are listed under `[lints.clippy]` in `Cargo.toml`, so plain `cargo clippy`, your editor and CI all apply the same rules. `rust-toolchain.toml` pins the Rust release they all use; rustup installs it on first use.
 
 ### Collecting diagnostics
 

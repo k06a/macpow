@@ -2,8 +2,46 @@ use crate::process_utils::command_output_timeout;
 use crate::types::{DiskInfo, NetworkInfo};
 use std::collections::HashMap;
 
-/// Parsed cumulative byte counters per network interface.
-pub type NetCounters = HashMap<String, (u64, u64)>; // iface → (bytes_in, bytes_out)
+/// Cumulative counters of one network interface, as `getifaddrs` reports
+/// them: only the low 32 bits of the kernel's 64-bit counters, so the byte
+/// counters wrap every 4 GiB. The 64-bit fields of sysctl `NET_RT_IFLIST2`
+/// are no way around that: on macOS 27 an ordinary, unentitled process is
+/// handed the same low 32 bits there.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IfCounters {
+    pub bytes_in: u32,
+    pub bytes_out: u32,
+    pub packets_in: u32,
+    pub packets_out: u32,
+}
+
+impl IfCounters {
+    /// Bytes received and sent since `prev`, an earlier sample of the same
+    /// interface.
+    fn bytes_since(&self, prev: &IfCounters) -> (u64, u64) {
+        // A byte counter that went backwards has normally wrapped, and
+        // wrapping subtraction is then the true delta as long as the interface
+        // moves less than 4 GiB per sample. The exception is an interface that
+        // was re-created under the same name (VPN tunnel restart, dock
+        // re-attach): the kernel starts its counters from zero again, and the
+        // same subtraction would report up to 4 GiB that never moved. The
+        // packet counters tell the two apart: they keep rising across a byte
+        // wrap, so one of them going backwards means a re-created interface,
+        // and the sample counts as zero. The price is one zero sample each
+        // time a packet counter itself wraps, every 2^32 packets. Not caught:
+        // a re-created interface that passes both of its old packet counts
+        // within one sample.
+        if self.packets_in < prev.packets_in || self.packets_out < prev.packets_out {
+            return (0, 0);
+        }
+        (
+            self.bytes_in.wrapping_sub(prev.bytes_in) as u64,
+            self.bytes_out.wrapping_sub(prev.bytes_out) as u64,
+        )
+    }
+}
+
+pub type NetCounters = HashMap<String, IfCounters>; // iface → counters
 
 #[repr(C)]
 struct IfData {
@@ -34,9 +72,9 @@ struct IfData {
     ifi_lastchange: libc::timeval,
 }
 
-/// Read cumulative network byte counters via getifaddrs (no subprocess).
+/// Read cumulative network counters via getifaddrs (no subprocess).
 pub fn read_net_counters() -> NetCounters {
-    let mut result = HashMap::new();
+    let mut result = NetCounters::new();
     unsafe {
         let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut addrs) != 0 {
@@ -59,12 +97,14 @@ pub fn read_net_counters() -> NetCounters {
                 continue;
             }
             let data = &*(entry.ifa_data as *const IfData);
-            let ib = data.ifi_ibytes as u64;
-            let ob = data.ifi_obytes as u64;
+            let ib = data.ifi_ibytes;
+            let ob = data.ifi_obytes;
             if ib > 0 || ob > 0 {
-                let e = result.entry(name.into_owned()).or_insert((0, 0));
-                e.0 = e.0.max(ib);
-                e.1 = e.1.max(ob);
+                let e = result.entry(name.into_owned()).or_default();
+                e.bytes_in = e.bytes_in.max(ib);
+                e.bytes_out = e.bytes_out.max(ob);
+                e.packets_in = e.packets_in.max(data.ifi_ipackets);
+                e.packets_out = e.packets_out.max(data.ifi_opackets);
             }
         }
         libc::freeifaddrs(addrs);
@@ -100,10 +140,7 @@ fn compute_net_rates_for(
     let (total_in, total_out) = cur
         .iter()
         .filter(|(iface, _)| filter(iface))
-        .filter_map(|(iface, &(ci, co))| {
-            prev.get(iface)
-                .map(|&(pi, po)| (ci.saturating_sub(pi), co.saturating_sub(po)))
-        })
+        .filter_map(|(iface, c)| prev.get(iface).map(|p| c.bytes_since(p)))
         .fold((0u64, 0u64), |(ai, ao), (di, do_)| (ai + di, ao + do_));
     NetworkInfo {
         bytes_in_per_sec: total_in as f64 / dt_s,
@@ -175,7 +212,7 @@ pub type ProcNetCounters = HashMap<i32, (u64, u64)>; // pid → (rx_bytes, tx_by
 /// Returns in ~18ms. Parses CSV: "name.pid,,iface,state,bytes_in,bytes_out,..."
 pub fn read_proc_net_counters() -> ProcNetCounters {
     let output = match command_output_timeout(
-        "nettop",
+        "/usr/bin/nettop",
         &["-P", "-n", "-L", "1", "-x"],
         std::time::Duration::from_millis(1000),
     ) {
@@ -217,16 +254,26 @@ pub fn read_proc_net_counters() -> ProcNetCounters {
 mod tests {
     use super::*;
 
+    /// Snapshot from (interface, bytes_in, bytes_out, packets_in, packets_out).
+    fn snapshot(ifaces: &[(&str, u32, u32, u32, u32)]) -> NetCounters {
+        ifaces
+            .iter()
+            .map(|&(name, bytes_in, bytes_out, packets_in, packets_out)| {
+                let counters = IfCounters {
+                    bytes_in,
+                    bytes_out,
+                    packets_in,
+                    packets_out,
+                };
+                (name.to_string(), counters)
+            })
+            .collect()
+    }
+
     #[test]
     fn compute_net_rates_aggregates_interfaces() {
-        let prev = HashMap::from([
-            ("en0".to_string(), (100u64, 200u64)),
-            ("en1".to_string(), (50u64, 100u64)),
-        ]);
-        let cur = HashMap::from([
-            ("en0".to_string(), (300u64, 500u64)),
-            ("en1".to_string(), (100u64, 160u64)),
-        ]);
+        let prev = snapshot(&[("en0", 100, 200, 1, 2), ("en1", 50, 100, 1, 1)]);
+        let cur = snapshot(&[("en0", 300, 500, 3, 5), ("en1", 100, 160, 2, 2)]);
         let rates = compute_net_rates(&prev, &cur, 2.0);
         assert_eq!(rates.bytes_in_per_sec, 125.0);
         assert_eq!(rates.bytes_out_per_sec, 180.0);
@@ -234,17 +281,65 @@ mod tests {
 
     #[test]
     fn compute_net_rates_iface_filters_target_only() {
-        let prev = HashMap::from([
-            ("en0".to_string(), (100u64, 200u64)),
-            ("en1".to_string(), (10u64, 20u64)),
-        ]);
-        let cur = HashMap::from([
-            ("en0".to_string(), (160u64, 260u64)),
-            ("en1".to_string(), (110u64, 220u64)),
-        ]);
+        let prev = snapshot(&[("en0", 100, 200, 1, 2), ("en1", 10, 20, 1, 1)]);
+        let cur = snapshot(&[("en0", 160, 260, 2, 3), ("en1", 110, 220, 2, 3)]);
         let rates = compute_net_rates_iface(&prev, &cur, 2.0, "en0");
         assert_eq!(rates.bytes_in_per_sec, 30.0);
         assert_eq!(rates.bytes_out_per_sec, 30.0);
+    }
+
+    #[test]
+    fn compute_net_rates_counts_across_32bit_wrap() {
+        // en0's byte counters wrap in both directions between the two samples
+        // while its packet counters keep rising; en1 does not wrap.
+        let prev = snapshot(&[
+            ("en0", u32::MAX - 999, u32::MAX - 1_999, 7_000, 9_000),
+            ("en1", 10, 20, 1, 1),
+        ]);
+        let cur = snapshot(&[("en0", 1_000, 2_000, 7_002, 9_003), ("en1", 110, 220, 2, 3)]);
+        let en0 = compute_net_rates_iface(&prev, &cur, 2.0, "en0");
+        assert_eq!(en0.bytes_in_per_sec, 1_000.0);
+        assert_eq!(en0.bytes_out_per_sec, 2_000.0);
+        let all = compute_net_rates(&prev, &cur, 2.0);
+        assert_eq!(all.bytes_in_per_sec, 1_050.0);
+        assert_eq!(all.bytes_out_per_sec, 2_100.0);
+    }
+
+    #[test]
+    fn compute_net_rates_skips_recreated_interface() {
+        // utun5 was torn down and came back under the same name, so all its
+        // counters restarted from zero. en0 kept running and is still counted.
+        let prev = snapshot(&[
+            ("utun5", 26_624, 55_296, 178, 274),
+            ("en0", 1_000, 2_000, 10, 20),
+        ]);
+        let cur = snapshot(&[("utun5", 1_024, 2_048, 3, 5), ("en0", 1_500, 2_250, 11, 21)]);
+        let utun5 = compute_net_rates_iface(&prev, &cur, 0.25, "utun5");
+        assert_eq!(utun5.bytes_in_per_sec, 0.0);
+        assert_eq!(utun5.bytes_out_per_sec, 0.0);
+        let all = compute_net_rates(&prev, &cur, 0.25);
+        assert_eq!(all.bytes_in_per_sec, 2_000.0);
+        assert_eq!(all.bytes_out_per_sec, 1_000.0);
+
+        // One packet counter going backwards is enough: here the new tunnel
+        // has already sent more than the old one did, but received less.
+        let cur = snapshot(&[("utun5", 1_024, 90_112, 3, 300)]);
+        let utun5 = compute_net_rates_iface(&prev, &cur, 0.25, "utun5");
+        assert_eq!(utun5.bytes_in_per_sec, 0.0);
+        assert_eq!(utun5.bytes_out_per_sec, 0.0);
+    }
+
+    #[test]
+    fn compute_net_rates_total_may_exceed_32_bits() {
+        // 3 GB on each of two interfaces: the sum does not fit the counter type.
+        let prev = snapshot(&[("en0", 1, 1, 1, 1), ("en1", 1, 1, 1, 1)]);
+        let cur = snapshot(&[
+            ("en0", 3_000_000_001, 1, 2_000_001, 1),
+            ("en1", 3_000_000_001, 1, 2_000_001, 1),
+        ]);
+        let rates = compute_net_rates(&prev, &cur, 1.0);
+        assert_eq!(rates.bytes_in_per_sec, 6_000_000_000.0);
+        assert_eq!(rates.bytes_out_per_sec, 0.0);
     }
 
     #[test]

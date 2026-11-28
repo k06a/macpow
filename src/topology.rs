@@ -158,7 +158,9 @@ pub fn os_major_version() -> Option<u32> {
         .ok()
 }
 
-fn sysctl_string(name: &str) -> Option<String> {
+/// String sysctl such as `hw.model`, read in-process with `sysctlbyname`.
+/// `None` if the name is unknown or the value is not UTF-8.
+pub fn sysctl_string(name: &str) -> Option<String> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut len: libc::size_t = 0;
     unsafe {
@@ -192,19 +194,33 @@ fn sysctl_string(name: &str) -> Option<String> {
 }
 
 fn sysctl_u32(name: &str) -> Option<u32> {
+    sysctl_fixed(name).map(u32::from_ne_bytes)
+}
+
+/// 64-bit integer sysctl such as `hw.memsize`. `None` if the name is unknown
+/// or the value has another width.
+pub fn sysctl_u64(name: &str) -> Option<u64> {
+    sysctl_fixed(name).map(u64::from_ne_bytes)
+}
+
+/// Read a sysctl whose value is exactly `N` bytes wide.
+fn sysctl_fixed<const N: usize>(name: &str) -> Option<[u8; N]> {
     let cname = std::ffi::CString::new(name).ok()?;
-    let mut val: u32 = 0;
-    let mut len: libc::size_t = std::mem::size_of::<u32>();
+    let mut val = [0u8; N];
+    let mut len: libc::size_t = N;
+    // SAFETY: `cname` is NUL-terminated, and `val` is writable for the `len`
+    // (= N) bytes the kernel is told it may fill. No new value is set.
     let rc = unsafe {
         libc::sysctlbyname(
             cname.as_ptr(),
-            &mut val as *mut u32 as *mut libc::c_void,
+            val.as_mut_ptr() as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
             0,
         )
     };
-    (rc == 0 && len == std::mem::size_of::<u32>()).then_some(val)
+    // A narrower value would leave part of `val` unset, a wider one fails.
+    (rc == 0 && len == N).then_some(val)
 }
 
 /// Read a device-tree property that may be a CFNumber or a little-endian CFData.
@@ -359,5 +375,26 @@ mod tests {
         assert!(t.high_tier_mask().is_empty());
         assert!(t.clusters().is_empty());
         assert_eq!(t.low_tier_type(), None);
+    }
+
+    // These names exist on every Mac, including CI virtual machines.
+    #[test]
+    fn sysctl_integers_are_read_only_at_their_own_width() {
+        // hw.memsize is 64-bit, hw.ncpu is 32-bit.
+        assert!(sysctl_u64("hw.memsize").is_some_and(|bytes| bytes >= 1 << 30));
+        assert!(sysctl_u32("hw.ncpu").is_some_and(|n| (1..=1024).contains(&n)));
+        assert_eq!(sysctl_u32("hw.memsize"), None);
+        assert_eq!(sysctl_u64("hw.ncpu"), None);
+    }
+
+    #[test]
+    fn sysctl_string_has_no_terminator_and_unknown_names_are_none() {
+        let model = sysctl_string("hw.model").expect("hw.model");
+        assert!(!model.is_empty());
+        assert!(!model.contains('\0'));
+
+        assert_eq!(sysctl_string("macpow.no.such.name"), None);
+        assert_eq!(sysctl_u32("macpow.no.such.name"), None);
+        assert_eq!(sysctl_u64("macpow.no.such.name"), None);
     }
 }

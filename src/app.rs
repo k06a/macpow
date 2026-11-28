@@ -1,4 +1,3 @@
-use macpow::process_utils::command_output_timeout;
 use macpow::sma::TimeSma;
 use macpow::types::*;
 use ratatui::buffer::Buffer;
@@ -93,6 +92,17 @@ fn fmt_freq(mhz: f32) -> String {
     } else {
         String::new()
     }
+}
+
+/// Removes control characters (C0, DEL and C1) from text that names something
+/// outside the program: a process, a USB device, a network interface.
+///
+/// Such a name is attacker-chosen, and ratatui writes a `Span` to the terminal
+/// as it is — only `Buffer::set_string` drops control characters. An ESC that
+/// survives into the chart title starts a real escape sequence: it can clear
+/// the screen, retitle the window or, with OSC 52, replace the clipboard.
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 // ── TreeRow: pure data for one row ──────────────────────────────────────────
@@ -512,7 +522,10 @@ pub struct App {
     wh: Wh,
     sma: MetricsSma,
     pub sma_window: u32,
+    /// How often the screen takes a new snapshot; `l` changes it.
     pub interval_ms: u64,
+    /// `--interval`: how often the sources are sampled.
+    sampling_interval_ms: u64,
     temp_min: BTreeMap<String, f32>,
     temp_max: BTreeMap<String, f32>,
     temp_sum: BTreeMap<String, f64>,
@@ -529,6 +542,9 @@ pub struct App {
     // Insert-only: labels are kept for chart titles of dead/pinned processes.
     labels: BTreeMap<&'static str, String>,
     proc_baseline: std::collections::HashMap<i32, f64>,
+    /// `all_procs_energy_mj` at the last reset. The per-pid baselines above cannot
+    /// stand in for it: the total also covers processes that are not listed.
+    proc_total_baseline: f64,
     proc_keys: std::collections::HashMap<i32, &'static str>,
     proc_prev_disk: std::collections::HashMap<i32, (u64, u64, Instant)>,
     proc_prev_net: std::collections::HashMap<i32, (u64, u64, Instant)>,
@@ -549,7 +565,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(interval_ms: u64) -> Self {
         let machine_name = read_machine_name();
         Self {
             metrics: Metrics::default(),
@@ -558,7 +574,8 @@ impl App {
             wh: Wh::default(),
             sma: MetricsSma::new(0.0),
             sma_window: 0,
-            interval_ms: 250,
+            interval_ms,
+            sampling_interval_ms: interval_ms,
             temp_min: BTreeMap::new(),
             temp_max: BTreeMap::new(),
             temp_sum: BTreeMap::new(),
@@ -593,6 +610,7 @@ impl App {
             row_is_sep: Vec::new(),
             labels: BTreeMap::new(),
             proc_baseline: std::collections::HashMap::new(),
+            proc_total_baseline: 0.0,
             proc_keys: std::collections::HashMap::new(),
             proc_prev_disk: std::collections::HashMap::new(),
             proc_prev_net: std::collections::HashMap::new(),
@@ -851,7 +869,7 @@ impl App {
                     self.proc_net_rates.insert(p.pid, (nr, nt));
                     self.proc_prev_net
                         .insert(p.pid, (p.net_rx_bytes, p.net_tx_bytes, now));
-                } else if elapsed > 2.0 {
+                } else if elapsed > macpow::process_power::NET_COUNTERS_IDLE_SECS {
                     self.proc_net_rates.insert(p.pid, (0.0, 0.0));
                 }
             } else {
@@ -912,7 +930,7 @@ impl App {
             KeyCode::Char('r') => self.reset(),
             KeyCode::Char('a') => self.cycle_sma(),
             KeyCode::Char('l') => self.cycle_latency(),
-            KeyCode::Home => self.cursor = 0,
+            KeyCode::Home => self.cursor = cursor_target(&self.row_is_sep, 0, 0),
             KeyCode::PageUp => self.move_cursor(-10),
             KeyCode::PageDown => self.move_cursor(10),
             KeyCode::Char(' ') => self.toggle_pin(),
@@ -924,15 +942,7 @@ impl App {
     }
 
     fn move_cursor(&mut self, delta: i32) {
-        let max = self.total_rows.saturating_sub(1) as i32;
-        let mut pos = (self.cursor as i32 + delta).clamp(0, max);
-        let dir = if delta >= 0 { 1 } else { -1 };
-        // Skip separator rows
-        while pos >= 0 && pos <= max && self.row_is_sep.get(pos as usize).copied().unwrap_or(false)
-        {
-            pos += dir;
-        }
-        self.cursor = pos.clamp(0, max) as usize;
+        self.cursor = cursor_target(&self.row_is_sep, self.cursor, delta);
     }
 
     pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
@@ -962,12 +972,8 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp => {
-                self.cursor = self.cursor.saturating_sub(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.cursor = (self.cursor + 3).min(self.total_rows.saturating_sub(1));
-            }
+            MouseEventKind::ScrollUp => self.move_cursor(-3),
+            MouseEventKind::ScrollDown => self.move_cursor(3),
             _ => {}
         }
     }
@@ -1050,6 +1056,7 @@ impl App {
             .iter()
             .map(|p| (p.pid, p.energy_mj))
             .collect();
+        self.proc_total_baseline = self.metrics.all_procs_energy_mj;
     }
 
     fn cycle_sma(&mut self) {
@@ -1062,16 +1069,22 @@ impl App {
     }
 
     fn cycle_latency(&mut self) {
-        self.interval_ms = match self.interval_ms {
-            250 => 500,
-            500 => 1000,
-            1000 => 2000,
-            _ => 250,
-        };
+        self.interval_ms = Self::next_refresh_ms(self.sampling_interval_ms, self.interval_ms);
     }
 
-    pub fn poll_interval_ms(&self) -> u64 {
-        self.interval_ms
+    /// `l` steps the refresh interval through 1x, 2x, 4x and 8x of `--interval`
+    /// (250 ms / 500 ms / 1 s / 2 s by default) and then wraps around. It never
+    /// goes below `--interval`: the sources have nothing newer to show.
+    pub fn next_refresh_ms(sampling_ms: u64, current_ms: u64) -> u64 {
+        if current_ms >= sampling_ms * 8 {
+            sampling_ms
+        } else {
+            current_ms * 2
+        }
+    }
+
+    pub fn refresh_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.interval_ms)
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
@@ -1100,11 +1113,13 @@ impl App {
         }
         self.cursor = self.cursor.min(self.total_rows.saturating_sub(1));
 
-        // Cache labels for chart titles
+        // Cache labels for chart titles. This is the only place a label is
+        // stored, and the title is the only place one is drawn as a `Span`, so
+        // control characters are stripped here, once.
         for r in &rows {
             if let Some(key) = r.key {
                 if !r.label.is_empty() {
-                    self.labels.insert(key, r.label.clone());
+                    self.labels.insert(key, strip_control_chars(&r.label));
                 }
             }
         }
@@ -1961,6 +1976,10 @@ impl App {
                 if m.display.nits > 0.0 && peak > 0.0 {
                     parts.push(format!("{:.0}/{:.0} nits", m.display.nits, peak));
                 }
+                // Measured level of the built-in panel, when it publishes one.
+                if let Some(panel) = m.display.panel_nits {
+                    parts.push(format!("panel {:.0}", panel));
+                }
                 if m.display.refresh_hz > 0.0 {
                     parts.push(format!("{:.0}Hz", m.display.refresh_hz));
                 }
@@ -2579,8 +2598,7 @@ impl App {
 
         // ── Software (standalone collapsible section after the tree)
         rows.push(TreeRow::separator());
-        let all_sw_energy =
-            (m.all_procs_energy_mj - self.proc_baseline.values().sum::<f64>()).max(0.0);
+        let all_sw_energy = (m.all_procs_energy_mj - self.proc_total_baseline).max(0.0);
         // Dynamic limit: count only visible rows (after collapse filtering)
         let visible_tree_rows = rows.iter().filter(|r| !self.is_hidden(r, &rows)).count();
         let chart_slots = if self.pinned.is_empty() {
@@ -2591,7 +2609,8 @@ impl App {
         let reserved = visible_tree_rows + 5 + chart_slots * CHART_HEIGHT as usize;
         let proc_limit = ((self.term_height as usize).saturating_sub(reserved)).max(10);
         {
-            let sw_color = power_color(m.all_procs_power_w * 1000.0);
+            // Same watt scale as every other row (README colour legend).
+            let sw_color = power_color(m.all_procs_power_w);
             let mut sw_row = TreeRow::pw(
                 "software",
                 None,
@@ -2653,7 +2672,7 @@ impl App {
             } else if p.pid == self_pid {
                 Color::Blue
             } else {
-                power_color(p.power_w * 1000.0)
+                power_color(p.power_w)
             };
             let key = proc_row_keys[i];
             let mem_str = human_bytes(p.phys_mem_bytes as f64);
@@ -3001,18 +3020,7 @@ impl App {
                 if is_data {
                     human_rate(v)
                 } else {
-                    let mw = v * 1000.0;
-                    if mw.abs() >= 100.0 {
-                        format!("{:.0}mW", mw)
-                    } else if mw.abs() >= 1.0 {
-                        format!("{:.1}mW", mw)
-                    } else if mw.abs() > 0.0 {
-                        format!("{:.2}mW", mw)
-                    } else if v.abs() >= 1.0 {
-                        format!("{:.1}W", v)
-                    } else {
-                        format!("{:.0}mW", mw)
-                    }
+                    fmt_axis_power(v)
                 }
             };
             let scale_lines: Vec<Line> = (0..scale_h)
@@ -3500,6 +3508,44 @@ fn nice_scale(max_val: f64) -> f64 {
         .unwrap_or(max_val.ceil().max(1.0))
 }
 
+/// The row the cursor lands on when it moves `delta` rows from `cursor`
+/// (`is_sep[i]`: row `i` is a separator). The move stops at the first and the
+/// last row; from there the nearest row that is not a separator is taken,
+/// looking in the direction of travel first and then back.
+fn cursor_target(is_sep: &[bool], cursor: usize, delta: i32) -> usize {
+    let Some(max) = is_sep.len().checked_sub(1) else {
+        return 0;
+    };
+    let start = (cursor as i64 + i64::from(delta)).clamp(0, max as i64) as usize;
+    let usable = |i: &usize| !is_sep[*i];
+    let up = || (0..=start).rev().find(usable);
+    let down = || (start..=max).find(usable);
+    let row = if delta < 0 {
+        up().or_else(down)
+    } else {
+        down().or_else(up)
+    };
+    // Only separators: stay where the move ended.
+    row.unwrap_or(start)
+}
+
+/// Chart axis label for a power in watts. Fits the 6-column axis for every
+/// scale `nice_scale` picks: whole watts first, or 50 W would read "50000mW".
+fn fmt_axis_power(w: f64) -> String {
+    let mw = w * 1000.0;
+    if w.abs() >= 1.0 {
+        format!("{:.1}W", w)
+    } else if mw.abs() >= 100.0 {
+        format!("{:.0}mW", mw)
+    } else if mw.abs() >= 1.0 {
+        format!("{:.1}mW", mw)
+    } else if mw.abs() > 0.0 {
+        format!("{:.2}mW", mw)
+    } else {
+        "0mW".to_string()
+    }
+}
+
 fn usage_bar(pct: f32) -> String {
     let width = 10;
     let filled = ((pct / 100.0) * width as f32).round() as usize;
@@ -3670,20 +3716,13 @@ fn proc_key(cache: &mut std::collections::HashMap<i32, &'static str>, pid: i32) 
 }
 
 fn read_machine_name() -> String {
-    let chip = command_output_timeout(
-        "sysctl",
-        &["-n", "machdep.cpu.brand_string"],
-        std::time::Duration::from_millis(500),
-    )
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    .filter(|s| !s.is_empty());
-    let model = command_output_timeout(
-        "sysctl",
-        &["-n", "hw.model"],
-        std::time::Duration::from_millis(500),
-    )
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    .filter(|s| !s.is_empty());
+    let read = |name: &str| {
+        macpow::topology::sysctl_string(name)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let chip = read("machdep.cpu.brand_string");
+    let model = read("hw.model");
     match (chip, model) {
         (Some(c), Some(m)) => format!("{} ({})", c, m),
         (Some(c), None) => c,
@@ -3702,6 +3741,65 @@ mod tests {
             category: "CPU".to_string(),
             value_celsius: temp,
             stale: false,
+        }
+    }
+
+    #[test]
+    fn cursor_never_rests_on_a_separator() {
+        // The tree starts with a separator under the header, as on screen.
+        let sep = [true, false, false, true, false];
+        // Up from the first data row used to end on the separator above it.
+        assert_eq!(cursor_target(&sep, 1, -1), 1);
+        assert_eq!(cursor_target(&sep, 4, -10), 1);
+        // Home is a move to row 0.
+        assert_eq!(cursor_target(&sep, 0, 0), 1);
+        // A separator in the way is skipped in the direction of travel.
+        assert_eq!(cursor_target(&sep, 2, 1), 4);
+        assert_eq!(cursor_target(&sep, 4, -1), 2);
+        assert_eq!(cursor_target(&sep, 2, 10), 4);
+        // Past a separator at the end, the nearest row before it.
+        assert_eq!(cursor_target(&[false, false, true], 0, 5), 1);
+        assert_eq!(cursor_target(&[], 3, -1), 0);
+        assert_eq!(cursor_target(&[true], 0, 1), 0);
+    }
+
+    #[test]
+    fn home_and_the_wheel_skip_the_top_separator() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = App::new(250);
+        app.row_is_sep = vec![true, false, false, false, false];
+        app.total_rows = app.row_is_sep.len();
+        app.cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.cursor, 1);
+        app.cursor = 2;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.cursor, 1);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn power_axis_labels_fit_the_axis_column() {
+        assert_eq!(fmt_axis_power(50.0), "50.0W");
+        assert_eq!(fmt_axis_power(2.5), "2.5W");
+        assert_eq!(fmt_axis_power(0.5), "500mW");
+        assert_eq!(fmt_axis_power(0.025), "25.0mW");
+        assert_eq!(fmt_axis_power(0.0005), "0.50mW");
+        assert_eq!(fmt_axis_power(0.0), "0mW");
+        // Every scale and half scale a power chart can get, up to 200 W.
+        for max in [0.0, 0.00005, 0.0007, 0.03, 0.4, 3.0, 21.7, 150.0, 200.0] {
+            let top = nice_scale(max);
+            for v in [top, top / 2.0] {
+                let label = fmt_axis_power(v);
+                assert!(label.chars().count() <= 6, "{v} W -> {label:?}");
+            }
         }
     }
 
@@ -4086,5 +4184,108 @@ mod tests {
             vals(&p_temps),
             (62..68).map(|i| i as f32).collect::<Vec<_>>()
         );
+    }
+
+    // ── Control characters in external names ────────────────────────────────
+
+    /// An OSC 52 clipboard write followed by "erase display".
+    const ESCAPES: &str = "\x1b]52;c;AAAA\x07\x1b[2J";
+
+    #[test]
+    fn strip_control_chars_removes_c0_del_and_c1() {
+        assert_eq!(strip_control_chars("a\x1bb"), "ab"); // ESC
+        assert_eq!(strip_control_chars("a\x07b"), "ab"); // BEL
+        assert_eq!(strip_control_chars("a\0b"), "ab"); // NUL
+        assert_eq!(strip_control_chars("a\nb\r\n"), "ab");
+        assert_eq!(strip_control_chars("a\tb"), "ab");
+        assert_eq!(strip_control_chars("a\x7fb"), "ab"); // DEL
+        assert_eq!(strip_control_chars("a\u{9b}2Jb"), "a2Jb"); // C1 CSI
+        assert_eq!(strip_control_chars("a\u{80}\u{9d}\u{9f}b"), "ab"); // C1 range
+        assert_eq!(strip_control_chars(ESCAPES), "]52;c;AAAA[2J");
+        assert_eq!(strip_control_chars("\x1b\x07\0"), "");
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_printable_text() {
+        for s in [
+            "",
+            "macpow (pid 1, 2.0 MB)",
+            "Наушники",
+            "日本語のキーボード",
+            "AirPods Pro 🎧",
+            // ZWJ and variation selectors are format characters, not controls.
+            "👩‍💻 ❤️",
+            "café — naïve",
+            // U+00A0 is the first character after the C1 range.
+            "a\u{a0}b",
+        ] {
+            assert_eq!(strip_control_chars(s), s);
+        }
+    }
+
+    #[test]
+    fn hostile_names_reach_the_screen_without_control_characters() {
+        let mut m = Metrics::default();
+        m.top_processes.push(ProcessPower {
+            pid: 4242,
+            name: format!("evil{ESCAPES}"),
+            power_w: 0.5,
+            energy_mj: 1.0,
+            alive: true,
+            ..Default::default()
+        });
+        m.usb_devices.push(UsbDevice {
+            name: format!("Stick{ESCAPES}"),
+            ..Default::default()
+        });
+        m.bluetooth_devices.push(BluetoothDevice {
+            name: format!("Buds{ESCAPES}"),
+            minor_type: "Headphones".into(),
+            connected: true,
+            batteries: vec![(String::new(), "80%".into())],
+        });
+
+        let mut app = App::new(250);
+        app.machine_name = "Test Mac".into();
+        app.update(m);
+        // A pinned row gets a chart whatever row the cursor is on.
+        app.pinned = vec![proc_key(&mut app.proc_keys, 4242), usb_key(0)];
+
+        let (width, height) = (120, 60);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+
+        // Debug formatting only: a failure must not replay the sequences into
+        // the terminal that runs the tests.
+        let leaked: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains(char::is_control))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "control characters reached the screen: {leaked:#?}"
+        );
+
+        // The printable part of each name is still shown: in both chart
+        // titles, and in the tree row of the Bluetooth device (which has no
+        // chart of its own).
+        for text in [
+            " evil]52;c;AAAA[2J (pid 4242, 0 B) — 0.500 W [pinned]",
+            " Stick]52;c;AAAA[2J (1.5Mbps) — 0.000 W [pinned]",
+            "Buds]52;c;AAAA[2J Headphones [80%]",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.contains(text)),
+                "missing {text:?} in {lines:#?}"
+            );
+        }
     }
 }

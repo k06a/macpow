@@ -4,7 +4,6 @@ use crate::iokit_ffi::*;
 use crate::ioreport::IOReportSampler;
 use crate::peripherals;
 use crate::powermetrics;
-use crate::process_utils::command_output_timeout;
 use crate::smc::SmcConnection;
 use crate::types::*;
 use core_foundation_sys::dictionary::{CFDictionaryRef, CFMutableDictionaryRef};
@@ -36,8 +35,10 @@ pub const SSD_MAX_ACTIVE_W: f32 = 2.5;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGDisplayIsBuiltin(display: u32) -> libc::boolean_t;
+    fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetIOFlags(mode: CGDisplayModeRef) -> u32;
     fn CGDisplayScreenSize(display: u32) -> CGSize;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayCopyAllDisplayModes(
@@ -163,6 +164,100 @@ pub fn read_display_linear_brightness() -> Option<f32> {
     }
 }
 
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOServiceNameMatching(name: *const i8) -> *mut libc::c_void;
+    fn IORegistryEntrySearchCFProperty(
+        entry: u32,
+        plane: *const i8,
+        key: core_foundation_sys::string::CFStringRef,
+        allocator: core_foundation_sys::base::CFAllocatorRef,
+        options: u32,
+    ) -> core_foundation_sys::base::CFTypeRef;
+}
+
+/// `kIORegistryIterateRecursively`: also search the entry's children.
+const IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
+
+/// Decode a brightness level published by the framebuffer driver: nits in
+/// 16.16 fixed point. 0 is a real reading (the panel is dark while the display
+/// sleeps). A level the driver has not set is all-ones, which arrives here as
+/// a negative number.
+fn nits_from_fixed_16_16(raw: i64) -> Option<f32> {
+    (raw >= 0).then(|| (raw as f64 / 65536.0) as f32)
+}
+
+/// Whether the main display is the Mac's own panel rather than an external
+/// display.
+fn main_display_is_builtin() -> bool {
+    // SAFETY: both functions take and return plain integers and accept any
+    // display ID, including one that is no longer online.
+    unsafe { CGDisplayIsBuiltin(CGMainDisplayID()) != 0 }
+}
+
+/// Luminance the built-in panel is driven at right now, in nits, as published
+/// by its own framebuffer driver: the `IOMFBBrightnessLevel` property below
+/// the `disp0` device node.
+///
+/// This is the only live source of real nits found so far: it follows the
+/// slider and auto-brightness and is 0 while the display sleeps, whereas
+/// AppleARMBacklight's `BrightnessMilliNits` kept one old value through all
+/// of those changes.
+///
+/// `None` when the main display is not the built-in panel (the level of
+/// `disp0` says nothing about an external display) or the driver does not
+/// publish a level.
+pub fn read_panel_nits() -> Option<f32> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    if !main_display_is_builtin() {
+        return None;
+    }
+    // SAFETY: every pointer handed to IOKit is either a NUL-terminated
+    // literal or a live CFString, and each result is checked before use.
+    // Ownership follows the documented rules: IOServiceGetMatchingService
+    // consumes the matching dictionary, the service port is released once,
+    // and the property (Create rule) is released when `value` is dropped.
+    unsafe {
+        let matching = IOServiceNameMatching(b"disp0\0".as_ptr() as *const i8);
+        if matching.is_null() {
+            return None;
+        }
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+        // The property sits on the framebuffer, a child of `disp0` whose
+        // class name differs between macOS releases, hence the search.
+        let key = CFString::new("IOMFBBrightnessLevel");
+        let value = IORegistryEntrySearchCFProperty(
+            service,
+            b"IOService\0".as_ptr() as *const i8,
+            key.as_concrete_TypeRef(),
+            std::ptr::null(),
+            IO_REGISTRY_ITERATE_RECURSIVELY,
+        );
+        IOObjectRelease(service);
+        if value.is_null() {
+            return None;
+        }
+        let value = CFType::wrap_under_create_rule(value);
+        nits_from_fixed_16_16(value.downcast::<CFNumber>()?.to_i64()?)
+    }
+}
+
+/// Whether a reading of [`read_panel_nits`] is plausible for a panel whose
+/// calibrated peak is `max_nits`: finite, not negative, and at most twice that
+/// peak. The 16.16 decoding has been confirmed on one Mac only; should another
+/// driver publish the level in other units, no number beats a wrong one. The
+/// bound is loose on purpose, so that HDR content and panel-to-panel
+/// calibration never trip it.
+fn panel_nits_plausible(nits: f32, max_nits: f32) -> bool {
+    nits.is_finite() && (0.0..=2.0 * max_nits).contains(&nits)
+}
+
 /// Classify the panel from its peak millinits into static SDR/HDR/XDR class.
 /// Thresholds: ≤500 nits → SDR, 501–999 → HDR, ≥1000 → XDR (Apple flagship mini-LED).
 pub fn classify_panel(max_nits: f32) -> PanelClass {
@@ -189,6 +284,110 @@ pub fn read_display_refresh_hz() -> f32 {
         CGDisplayModeRelease(mode);
         hz
     }
+}
+
+/// `kDisplayModeNativeFlag` (IOKit/graphics/IOGraphicsTypes.h): the mode maps
+/// one-to-one onto the panel's own pixel grid.
+const DISPLAY_MODE_NATIVE_FLAG: u32 = 0x0200_0000;
+
+/// Pixel size and IOKit flags of one display mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModePixels {
+    width: u32,
+    height: u32,
+    io_flags: u32,
+}
+
+impl ModePixels {
+    fn is_native(&self) -> bool {
+        self.io_flags & DISPLAY_MODE_NATIVE_FLAG != 0
+    }
+
+    /// # Safety
+    /// `mode` must be null or point to a live display mode.
+    unsafe fn read(mode: CGDisplayModeRef) -> Self {
+        // SAFETY: the getters only read the mode, which the caller keeps
+        // alive for the call, and all three are declared to accept null.
+        unsafe {
+            ModePixels {
+                width: CGDisplayModeGetPixelWidth(mode) as u32,
+                height: CGDisplayModeGetPixelHeight(mode) as u32,
+                io_flags: CGDisplayModeGetIOFlags(mode),
+            }
+        }
+    }
+}
+
+/// Pick the panel's own pixel grid out of a display's modes.
+///
+/// A mode's pixel size is the size its frame is rendered at. That is the
+/// panel's size only in the modes the driver flags as native; every scaled
+/// mode is rendered at another size and resampled to the panel. On a
+/// 3024 x 1964 panel the "More Space" mode renders 3600 x 2338 and a
+/// larger-text mode 2294 x 1490, so the current mode alone cannot be trusted.
+///
+/// The current mode is taken when it is flagged native. Otherwise the first
+/// flagged mode of the display is, and `all_modes` is only asked for in that
+/// case, because listing the modes costs more than reading one. A display
+/// that flags no mode at all falls back to the current mode's size, the best
+/// that is known about it.
+fn native_pixel_size(
+    current: Option<ModePixels>,
+    all_modes: impl FnOnce() -> Vec<ModePixels>,
+) -> Option<(u32, u32)> {
+    current
+        .filter(ModePixels::is_native)
+        .or_else(|| all_modes().into_iter().find(ModePixels::is_native))
+        .or(current)
+        .map(|mode| (mode.width, mode.height))
+}
+
+/// Every mode the main display offers.
+fn read_all_display_modes() -> Vec<ModePixels> {
+    // SAFETY: `CGDisplayCopyAllDisplayModes` returns null or an array we own
+    // (Copy rule), released exactly once below. Its elements are display
+    // modes that stay alive as long as the array does.
+    unsafe {
+        let modes = CGDisplayCopyAllDisplayModes(CGMainDisplayID(), std::ptr::null());
+        if modes.is_null() {
+            return Vec::new();
+        }
+        let all = (0..core_foundation_sys::array::CFArrayGetCount(modes))
+            .map(|i| {
+                let mode = core_foundation_sys::array::CFArrayGetValueAtIndex(modes, i);
+                ModePixels::read(mode as CGDisplayModeRef)
+            })
+            .collect();
+        cf_utils::cf_release(modes as _);
+        all
+    }
+}
+
+/// Width and height of the main display's panel in physical pixels
+/// (3024 x 1964 on a 14" MacBook Pro), whatever scaling the user has chosen:
+/// see [`native_pixel_size`]. This is the "Resolution" that `system_profiler`
+/// prints for an Apple panel.
+///
+/// `CGDisplayPixelsWide/High` must not be used for this: despite the name they
+/// return the current mode's size in points, which on a HiDPI ("Retina") mode
+/// is half the pixel size in each direction (1512 x 982 on the same panel).
+///
+/// `None` if the display has neither a current mode nor a native one.
+pub fn read_display_native_pixel_size() -> Option<(u32, u32)> {
+    // SAFETY: `CGDisplayCopyDisplayMode` returns either null or a mode we own
+    // (Copy rule). It is null-checked, only read while we hold it, and
+    // released exactly once.
+    let current = unsafe {
+        let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        if mode.is_null() {
+            None
+        } else {
+            let pixels = ModePixels::read(mode);
+            CGDisplayModeRelease(mode);
+            Some(pixels)
+        }
+    };
+    native_pixel_size(current, read_all_display_modes)
 }
 
 /// Detect ProMotion support by checking if any available display mode reports a
@@ -445,6 +644,141 @@ pub fn read_backlight_current() -> Option<(i64, i64)> {
     }
 }
 
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    fn assert_nits(actual: Option<f32>, expected: f32) {
+        let actual = actual.expect("a value, got None");
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{actual} nits, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn framebuffer_level_decodes_from_16_16_fixed_point() {
+        // Registry values of an M5 Max MacBook Pro at 73 % and 100 % slider.
+        assert_nits(nits_from_fixed_16_16(12_126_980), 185.04);
+        assert_nits(nits_from_fixed_16_16(23_592_960), 360.0);
+        // The unused external framebuffers of the same machine read 1 nit.
+        assert_nits(nits_from_fixed_16_16(65_536), 1.0);
+        // Display asleep: a real reading of darkness, not a missing one.
+        assert_eq!(nits_from_fixed_16_16(0), Some(0.0));
+        // Unset levels are published as u64::MAX.
+        assert_eq!(nits_from_fixed_16_16(u64::MAX as i64), None);
+    }
+
+    /// Calibrated peak of the XDR panel of an M5 Max MacBook Pro:
+    /// `BrightnessMilliNits.max` = 1599999.
+    const XDR_MAX_NITS: f32 = 1600.0;
+
+    #[test]
+    fn plausible_panel_readings_are_kept() {
+        // Dark (display asleep), the external framebuffers' 1 nit, a reading
+        // of that Mac, its SDR cap, its peak, and the bound itself.
+        for nits in [0.0, 1.0, 111.79, 600.0, 1600.0, 3200.0] {
+            assert!(panel_nits_plausible(nits, XDR_MAX_NITS), "{nits}");
+        }
+    }
+
+    #[test]
+    fn implausible_panel_readings_are_dropped() {
+        for nits in [
+            -1.0,
+            3200.5,
+            // That Mac's 111.79 nits, had a driver published millinits.
+            111_790.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            assert!(!panel_nits_plausible(nits, XDR_MAX_NITS), "{nits}");
+        }
+        // The bound follows the panel: twice 500 nits for a 500-nit panel.
+        assert!(panel_nits_plausible(1000.0, 500.0));
+        assert!(!panel_nits_plausible(1000.5, 500.0));
+    }
+
+    // IO flags as CoreGraphics reports them on a 14" MacBook Pro (M5 Max):
+    // valid + safe, plus the native bit on the modes that match the panel,
+    // plus the default bit on the mode macOS picks out of the box.
+    const SCALED: u32 = 0x0000_0003;
+    const NATIVE: u32 = 0x0200_0003;
+    const NATIVE_DEFAULT: u32 = 0x0200_0007;
+
+    fn mode(width: u32, height: u32, io_flags: u32) -> ModePixels {
+        ModePixels {
+            width,
+            height,
+            io_flags,
+        }
+    }
+
+    /// Pixel sizes of that Mac's mode list (`CGDisplayCopyAllDisplayModes`
+    /// with no options), one entry per size, in the order it is returned.
+    fn macbook_pro_14_modes() -> Vec<ModePixels> {
+        vec![
+            mode(1920, 1200, SCALED),
+            mode(2048, 1330, SCALED),
+            mode(2294, 1490, SCALED),
+            mode(2560, 1600, SCALED),
+            mode(2704, 1756, SCALED),
+            mode(3024, 1890, SCALED),
+            mode(3024, 1964, NATIVE),
+        ]
+    }
+
+    #[test]
+    fn native_current_mode_is_the_panel_size() {
+        // Default scaling: 1512 x 982 points rendered at 3024 x 1964. The
+        // mode list is not needed and must not be fetched.
+        let current = mode(3024, 1964, NATIVE_DEFAULT);
+        assert_eq!(
+            native_pixel_size(Some(current), || panic!("mode list was fetched")),
+            Some((3024, 1964))
+        );
+    }
+
+    #[test]
+    fn scaled_current_mode_yields_the_native_mode_of_the_list() {
+        // "More Space": 1800 x 1169 points rendered at 3600 x 2338 and
+        // resampled to the panel. Reporting the rendered size would describe
+        // a panel that does not exist.
+        let more_space = mode(3600, 2338, SCALED);
+        assert_eq!(
+            native_pixel_size(Some(more_space), macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+        // The same from the other side: 1147 x 745 points at 2294 x 1490.
+        let larger_text = mode(2294, 1490, SCALED);
+        assert_eq!(
+            native_pixel_size(Some(larger_text), macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+        // No current mode at all, but the list still knows the panel.
+        assert_eq!(
+            native_pixel_size(None, macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+    }
+
+    #[test]
+    fn without_a_native_mode_the_current_mode_is_reported() {
+        let unflagged = || vec![mode(1920, 1080, SCALED), mode(3840, 2160, SCALED)];
+        assert_eq!(
+            native_pixel_size(Some(mode(3840, 2160, SCALED)), unflagged),
+            Some((3840, 2160))
+        );
+        assert_eq!(
+            native_pixel_size(Some(mode(1920, 1080, SCALED)), Vec::new),
+            Some((1920, 1080))
+        );
+        assert_eq!(native_pixel_size(None, unflagged), None);
+        assert_eq!(native_pixel_size(None, Vec::new), None);
+    }
+}
+
 /// Keyboard backlight: reverse-map PWM duty cycle through the nits-to-pwm table
 /// to recover the actual 0-100% brightness level.
 fn read_keyboard_brightness() -> Option<f32> {
@@ -694,102 +1028,100 @@ fn read_audio_info(assertions: &[crate::types::PowerAssertion]) -> AudioInfo {
 
 // ── GPU core count from IORegistry ───────────────────────────────────────────
 
+/// GPU core count: the `gpu-core-count` property of the AGX accelerator, the
+/// registry service that `read_gpu_utilization` polls. 0 when there is none.
 fn read_gpu_core_count() -> u32 {
-    command_output_timeout(
-        "sysctl",
-        &["-n", "machdep.gpu.core_count"],
-        Duration::from_millis(500),
-    )
-        .and_then(|o| std::str::from_utf8(&o.stdout).ok()?.trim().parse().ok())
-        .or_else(|| {
-            command_output_timeout(
-                "bash",
-                &[
-                    "-c",
-                    r#"ioreg -l 2>/dev/null | grep -oE '"gpu-core-count" = [0-9]+' | head -1 | grep -oE '[0-9]+$'"#,
-                ],
-                Duration::from_millis(1000),
-            )
-                .and_then(|o| std::str::from_utf8(&o.stdout).ok()?.trim().parse().ok())
-        })
-        .unwrap_or(0)
+    // SAFETY: IOKit calls on objects owned by this function. The matching
+    // dictionary is consumed by IOServiceGetMatchingServices; the iterator,
+    // every service it yields and every property dictionary are released
+    // exactly once, and `props` is alive while `gpu_core_count_prop` reads it.
+    unsafe {
+        // Every AGXAcceleratorG<generation><variant> driver class derives from
+        // IOAccelerator, so the base class finds the GPU on any chip.
+        let matching = IOServiceMatching(b"IOAccelerator\0".as_ptr() as *const i8);
+        if matching.is_null() {
+            return 0;
+        }
+        let mut iter: u32 = 0;
+        if IOServiceGetMatchingServices(0, matching, &mut iter) != 0 {
+            return 0;
+        }
+        let mut cores = None;
+        while cores.is_none() {
+            let service = IOIteratorNext(iter);
+            if service == 0 {
+                break;
+            }
+            let mut props = std::ptr::null_mut();
+            if IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0) == 0
+                && !props.is_null()
+            {
+                cores = gpu_core_count_prop(props as CFDictionaryRef);
+                cf_utils::cf_release(props as _);
+            }
+            IOObjectRelease(service);
+        }
+        IOObjectRelease(iter);
+        cores.unwrap_or(0)
+    }
+}
+
+/// `gpu-core-count` from the properties of one accelerator service. The value
+/// is whatever the driver published; `cfdict_get_i64` reads anything but a
+/// CFNumber as missing.
+unsafe fn gpu_core_count_prop(props: CFDictionaryRef) -> Option<u32> {
+    cf_utils::cfdict_get_i64(props, "gpu-core-count").and_then(|n| u32::try_from(n).ok())
+}
+
+#[cfg(test)]
+mod gpu_core_count_tests {
+    use super::gpu_core_count_prop;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    fn prop_of(pairs: &[(&str, CFType)]) -> Option<u32> {
+        let pairs: Vec<(CFString, CFType)> = pairs
+            .iter()
+            .map(|(key, value)| (CFString::new(key), value.clone()))
+            .collect();
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        // SAFETY: `dict` is a valid CFDictionary that outlives the call.
+        unsafe { gpu_core_count_prop(dict.as_concrete_TypeRef()) }
+    }
+
+    #[test]
+    fn reads_a_number_property() {
+        let cores = CFNumber::from(40i64).as_CFType();
+        let other = CFNumber::from(7i64).as_CFType();
+        assert_eq!(
+            prop_of(&[("gpu-core-count", cores), ("other", other)]),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn ignores_a_missing_non_number_or_negative_property() {
+        let other = CFNumber::from(7i64).as_CFType();
+        assert_eq!(prop_of(&[("other", other)]), None);
+        let text = CFString::new("40").as_CFType();
+        assert_eq!(prop_of(&[("gpu-core-count", text)]), None);
+        let negative = CFNumber::from(-1i64).as_CFType();
+        assert_eq!(prop_of(&[("gpu-core-count", negative)]), None);
+    }
 }
 
 // ── Sampler ──────────────────────────────────────────────────────────────────
 
 // ── Per-process energy via proc_pid_rusage ───────────────────────────────────
 
-extern "C" {
-    fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
-    fn proc_name(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
-}
-
-const RUSAGE_INFO_V4: i32 = 4;
-// rusage_info_v4: 16-byte UUID + 35 uint64_t fields = 296 bytes
-// ri_billed_energy is field #31 (0-indexed) after the UUID
-const BILLED_ENERGY_OFFSET: usize = 16 + 31 * 8; // = 264
-const DISKIO_READ_OFFSET: usize = 16 + 16 * 8; // = 144 (ri_diskio_bytesread)
-const DISKIO_WRITE_OFFSET: usize = 16 + 17 * 8; // = 152 (ri_diskio_byteswritten)
-const PHYS_FOOTPRINT_OFFSET: usize = 16 + 7 * 8; // = 72 (ri_phys_footprint)
-const RUSAGE_V4_SIZE: usize = 16 + 35 * 8; // = 296
-
-/// Per-process resource data: (name, energy_nj, disk_read, disk_write, phys_mem)
-pub fn read_all_process_energy() -> std::collections::HashMap<i32, (String, u64, u64, u64, u64)> {
-    let mut result = std::collections::HashMap::new();
-    unsafe {
-        let mut pids = vec![0i32; 4096];
-        let n = proc_listallpids(pids.as_mut_ptr(), (pids.len() * 4) as i32);
-        if n <= 0 {
-            return result;
-        }
-
-        let mut buf = vec![0u8; RUSAGE_V4_SIZE];
-        let mut name_buf = vec![0u8; 256];
-
-        for i in 0..n as usize {
-            let pid = pids[i];
-            if pid <= 0 {
-                continue;
-            }
-
-            let ret = proc_pid_rusage(pid, RUSAGE_INFO_V4, buf.as_mut_ptr());
-            if ret != 0 {
-                continue;
-            }
-
-            let read_u64 = |off: usize| -> u64 {
-                u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]))
-            };
-            let energy_nj = read_u64(BILLED_ENERGY_OFFSET);
-            if energy_nj == 0 {
-                continue;
-            }
-            let disk_r = read_u64(DISKIO_READ_OFFSET);
-            let disk_w = read_u64(DISKIO_WRITE_OFFSET);
-            let phys_mem = read_u64(PHYS_FOOTPRINT_OFFSET);
-
-            name_buf.fill(0);
-            proc_name(pid, name_buf.as_mut_ptr(), 256);
-            let name = std::ffi::CStr::from_ptr(name_buf.as_ptr() as *const i8)
-                .to_string_lossy()
-                .into_owned();
-
-            result.insert(pid, (name, energy_nj, disk_r, disk_w, phys_mem));
-        }
-    }
-    result
-}
+// The reader and the accounting live in `process_power`. Re-exported so that
+// `metrics::read_all_process_energy` keeps working for existing callers.
+pub use crate::process_power::read_all_process_energy;
 
 fn read_dram_gb() -> u32 {
-    command_output_timeout("sysctl", &["-n", "hw.memsize"], Duration::from_millis(500))
-        .and_then(|o| {
-            std::str::from_utf8(&o.stdout)
-                .ok()?
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
+    crate::topology::sysctl_u64("hw.memsize")
         .map(|bytes| (bytes / (1024 * 1024 * 1024)) as u32)
         .unwrap_or(0)
 }
@@ -836,92 +1168,92 @@ fn read_ssd_model() -> String {
 
 extern "C" {
     fn host_statistics64(host: u32, flavor: i32, info: *mut u8, count: *mut u32) -> i32;
+    fn host_page_size(host: u32, out_page_size: *mut usize) -> i32;
 }
 const HOST_VM_INFO64: i32 = 4;
-const HOST_VM_INFO64_COUNT: u32 = 38; // sizeof(vm_statistics64_data_t) / sizeof(integer_t)
-const PAGE_SIZE: u64 = 16384;
+const HOST_VM_INFO64_COUNT: u32 = 38; // HOST_VM_INFO64_REV1_COUNT: VmStats64 in integer_t units
 
-pub fn read_mem_used_gb() -> f32 {
-    #[repr(C)]
-    struct VmStats64 {
-        free_count: u32,
-        active_count: u32,
-        inactive_count: u32,
-        wire_count: u32,
-        zero_fill_count: u64,
-        reactivations: u64,
-        pageins: u64,
-        pageouts: u64,
-        faults: u64,
-        cow_faults: u64,
-        lookups: u64,
-        hits: u64,
-        purges: u64,
-        purgeable_count: u32,
-        speculative_count: u32,
-        decompressions: u64,
-        compressions: u64,
-        swapins: u64,
-        swapouts: u64,
-        compressor_page_count: u32,
-        throttled_count: u32,
-        external_page_count: u32,
-        internal_page_count: u32,
-        total_uncompressed_pages_in_compressor: u64,
-    }
-    unsafe {
-        let mut info = std::mem::zeroed::<VmStats64>();
-        let mut count = HOST_VM_INFO64_COUNT;
-        let kr = host_statistics64(
-            mach_host_self(),
-            HOST_VM_INFO64,
-            &mut info as *mut VmStats64 as *mut u8,
-            &mut count,
-        );
-        if kr != 0 {
-            return 0.0;
-        }
-        let used_pages = info.active_count as u64
-            + info.inactive_count as u64
-            + info.wire_count as u64
-            + info.compressor_page_count as u64;
-        (used_pages * PAGE_SIZE) as f32 / (1024.0 * 1024.0 * 1024.0)
-    }
+/// `vm_statistics64` from <mach/vm_statistics.h> up to its revision 1, which
+/// is all the kernel fills in for HOST_VM_INFO64_COUNT. The `*_count` fields
+/// are numbers of pages.
+#[repr(C)]
+#[derive(Default)]
+struct VmStats64 {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
 }
 
-pub fn read_gpu_utilization() -> (u32, u32, u32) {
-    static GPU_CLASS: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+// host_statistics64 writes HOST_VM_INFO64_COUNT integers into a VmStats64.
+const _: () = assert!(
+    std::mem::size_of::<VmStats64>() == HOST_VM_INFO64_COUNT as usize * std::mem::size_of::<i32>()
+);
 
-    let cached = GPU_CLASS.get_or_init(|| {
-        for gen in (13..=19).rev() {
-            for suffix in &["X\0", "G\0", "P\0"] {
-                let name = format!("AGXAcceleratorG{}{}", gen, suffix);
-                let matched = unsafe {
-                    let m = IOServiceMatching(name.as_ptr() as *const i8);
-                    if m.is_null() {
-                        false
-                    } else {
-                        let s = IOServiceGetMatchingService(0, m);
-                        if s != 0 {
-                            IOObjectRelease(s);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                };
-                if matched {
-                    return Some(name.into_bytes());
-                }
-            }
-        }
-        None
-    });
+/// Pages behind Activity Monitor's "Memory Used": app memory (anonymous pages
+/// that are not purgeable) + wired + compressor. File cache and purgeable
+/// pages are left out because the kernel gives them up on demand; counting
+/// them (active + inactive) made the figure creep up to the whole RAM on any
+/// Mac with some uptime.
+fn mem_used_pages(vm: &VmStats64) -> u64 {
+    let app = (vm.internal_page_count as u64).saturating_sub(vm.purgeable_count as u64);
+    app + vm.wire_count as u64 + vm.compressor_page_count as u64
+}
 
-    match cached {
-        Some(name) => unsafe { try_gpu_util_class(name) },
-        None => (0, 0, 0),
+pub fn read_mem_used_gb() -> f32 {
+    let mut vm = VmStats64::default();
+    let mut count = HOST_VM_INFO64_COUNT;
+    // The kernel counts in its own page size (16 KiB on Apple Silicon, 4 KiB
+    // on Intel), which host_page_size reports.
+    let mut page_size: usize = 0;
+    // SAFETY: `vm` is exactly `count` integers long (asserted above), so the
+    // kernel cannot write past it, and any bit pattern is a valid VmStats64.
+    // `page_size` is a valid out-pointer for the vm_size_t the call returns.
+    let ok = unsafe {
+        let host = mach_host_self();
+        host_statistics64(
+            host,
+            HOST_VM_INFO64,
+            &mut vm as *mut VmStats64 as *mut u8,
+            &mut count,
+        ) == 0
+            && host_page_size(host, &mut page_size) == 0
+    };
+    if !ok {
+        return 0.0;
     }
+    (mem_used_pages(&vm) * page_size as u64) as f32 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// (device, renderer, tiler) utilisation in percent as the GPU driver reports
+/// them; all zero when there is no such driver (virtual machines).
+pub fn read_gpu_utilization() -> (u32, u32, u32) {
+    // Every Apple GPU driver (AGXAcceleratorG13G ... AGXAcceleratorG17X) is a
+    // subclass of IOAccelerator, so matching the base class also finds the
+    // generations that do not exist yet.
+    // SAFETY: the class name is NUL-terminated, the only thing
+    // try_gpu_util_class requires of its argument.
+    unsafe { try_gpu_util_class(b"IOAccelerator\0") }
 }
 
 unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
@@ -938,9 +1270,10 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
         && !props.is_null()
     {
         let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
-        let stats = cf_utils::cfdict_get(dict, "PerformanceStatistics");
-        if !stats.is_null() {
-            let sd = stats as core_foundation_sys::dictionary::CFDictionaryRef;
+        // Any IOAccelerator can match, so do not take it on trust that the
+        // property is the dictionary the Apple GPU drivers publish:
+        // `cfdict_get_dict` reads anything else as missing.
+        if let Some(sd) = cf_utils::cfdict_get_dict(dict, "PerformanceStatistics") {
             let dev = cf_utils::cfdict_get_i64(sd, "Device Utilization %").unwrap_or(0) as u32;
             let ren = cf_utils::cfdict_get_i64(sd, "Renderer Utilization %").unwrap_or(0) as u32;
             let til = cf_utils::cfdict_get_i64(sd, "Tiler Utilization %").unwrap_or(0) as u32;
@@ -956,6 +1289,79 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
     }
     IOObjectRelease(service);
     result
+}
+
+/// IOReport GPU residency (percent) from which all zeros from the driver
+/// cannot be a GPU that had nothing to do.
+const GPU_BUSY_MIN_PCT: u32 = 5;
+/// Collided readings in a row that keep the last good values. After that the
+/// values would be too old to pass for a measurement and the zeros go out.
+const GPU_MAX_BRIDGED_READS: u32 = 5;
+
+/// Tells driver readings that lost a race from real ones.
+///
+/// The GPU driver refreshes its utilisation figures only every 130-270 ms
+/// (measured on an M5 Max) and a read clears them until the next refresh.
+/// Whoever reads second in between gets 0/0/0: another macpow, Activity
+/// Monitor, ioreg, or this process itself at a short sampling interval.
+/// IOReport's GPU residency is not affected, so all zeros while IOReport
+/// shows a busy GPU mean "no data", not "idle". Reading again would not
+/// help: it takes the next refresh away from the other reader.
+#[derive(Default)]
+struct GpuCollisionFilter {
+    bridged_reads: u32,
+}
+
+impl GpuCollisionFilter {
+    /// The (renderer, tiler) pair to publish for a driver reading, or `None`
+    /// when the reading collided and the last published pair should stay.
+    fn accept(
+        &mut self,
+        (device, renderer, tiler): (u32, u32, u32),
+        ioreport_device_pct: u32,
+    ) -> Option<(u32, u32)> {
+        let collided =
+            (device, renderer, tiler) == (0, 0, 0) && ioreport_device_pct >= GPU_BUSY_MIN_PCT;
+        if !collided {
+            self.bridged_reads = 0;
+        } else if self.bridged_reads < GPU_MAX_BRIDGED_READS {
+            self.bridged_reads += 1;
+            return None;
+        }
+        Some((renderer, tiler))
+    }
+}
+
+// ── System stats: CPU usage, memory, GPU utilisation ─────────────────────────
+
+/// One reading of the metrics that come from Mach and the IORegistry alone.
+/// They need neither the SMC nor IOReport, so they also work in a virtual
+/// machine or a sandbox where those are missing.
+struct SystemStats {
+    /// One value per logical CPU. Empty on a reader's first reading, which
+    /// has no earlier tick counts to measure an interval against.
+    cpu_usage_pct: Vec<f32>,
+    mem_used_gb: f32,
+    /// (device, renderer, tiler) as the GPU driver reported them.
+    gpu_util: (u32, u32, u32),
+}
+
+#[derive(Default)]
+struct SystemStatsReader {
+    prev_cpu_ticks: Vec<(u64, u64)>,
+}
+
+impl SystemStatsReader {
+    fn read(&mut self) -> SystemStats {
+        let cpu_ticks = read_cpu_ticks();
+        let cpu_usage_pct = compute_cpu_usage(&self.prev_cpu_ticks, &cpu_ticks);
+        self.prev_cpu_ticks = cpu_ticks;
+        SystemStats {
+            cpu_usage_pct,
+            mem_used_gb: read_mem_used_gb(),
+            gpu_util: read_gpu_utilization(),
+        }
+    }
 }
 
 // ── Per-CPU utilization via Mach host_processor_info ─────────────────────────
@@ -1036,6 +1442,17 @@ fn compute_cpu_usage(prev: &[(u64, u64)], cur: &[(u64, u64)]) -> Vec<f32> {
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The shortest sampling period, in milliseconds. The sources do not change
+/// faster, and a shorter period only makes every source thread spin. The CLI
+/// builds its `--interval` range from this, so the two cannot disagree.
+pub const MIN_INTERVAL_MS: u64 = 100;
+
+/// The period every source thread sleeps between reads: `interval_ms`, raised
+/// to `MIN_INTERVAL_MS`.
+fn sampling_period(interval_ms: u64) -> Duration {
+    Duration::from_millis(interval_ms.max(MIN_INTERVAL_MS))
+}
+
 #[derive(Clone, Default)]
 struct StaticSnapshot {
     gpu_cores: u32,
@@ -1071,6 +1488,9 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// Starts one thread per source. Each wakes every `interval_ms`, raised to
+    /// `MIN_INTERVAL_MS`; the slow sources (Bluetooth batteries, per-process
+    /// network counters, the Wi-Fi SSID) refresh only every few wake-ups.
     pub fn new(interval_ms: u64) -> Self {
         // Parallelize init reads — all independent
         let (gpu_cores, dram_gb, ssd_model, max_nits) = std::thread::scope(|s| {
@@ -1110,14 +1530,20 @@ impl Sampler {
         };
         let running = Arc::new(AtomicBool::new(true));
         let mut handles = Vec::new();
-        let dt = Duration::from_millis(interval_ms.max(100));
+        let dt = sampling_period(interval_ms);
 
         // ── IOReport (SoC power + frequencies) ───────────────────────────
         {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                let Some(ior) = IOReportSampler::new().ok() else {
+                let Ok(ior) = IOReportSampler::new() else {
+                    // No IOReport at all (any virtual machine, a sandbox):
+                    // nothing will ever fill `soc`. Flag it, or its zeros
+                    // read as an idle chip.
+                    if let Ok(mut mg) = m.lock() {
+                        crate::ioreport::mark_unavailable(&mut mg.soc);
+                    }
                     return;
                 };
                 let mut prev = ior.sample().ok();
@@ -1135,7 +1561,7 @@ impl Sampler {
                             if let Ok(raw) = ior.parse_raw(p, &cur) {
                                 let mut soc = estimator.assemble(raw);
                                 if let Ok(mut mg) = m.lock() {
-                                    // The SMC thread owns these two fields.
+                                    // The system-stats source owns these two fields.
                                     soc.gpu_util_renderer = mg.soc.gpu_util_renderer;
                                     soc.gpu_util_tiler = mg.soc.gpu_util_tiler;
                                     mg.soc = soc;
@@ -1170,7 +1596,6 @@ impl Sampler {
                 };
                 let mut disc_handle: Option<std::thread::JoinHandle<Vec<(String, String)>>> =
                     Some(smc.start_temp_discovery());
-                let mut prev_ticks = read_cpu_ticks();
                 while running.load(Ordering::Relaxed) {
                     // Non-blocking: check if temp discovery finished
                     if let Some(ref h) = disc_handle {
@@ -1194,9 +1619,6 @@ impl Sampler {
                     let adapter_power = smc.read_f32("PDTR").unwrap_or(0.0);
                     let wifi_power = smc.read_f32("wiPm").unwrap_or(0.0);
                     let usb_power_smc = smc.read_f32("PUSB").unwrap_or(0.0);
-                    let cur_ticks = read_cpu_ticks();
-                    let cpu_usage = compute_cpu_usage(&prev_ticks, &cur_ticks);
-                    prev_ticks = cur_ticks;
                     if let Ok(mut mg) = m.lock() {
                         mg.temperatures = temps;
                         mg.fans = fans;
@@ -1209,11 +1631,6 @@ impl Sampler {
                         mg.adapter_power_w = adapter_power;
                         mg.wifi_power_w = wifi_power;
                         mg.usb_power_smc_w = usb_power_smc;
-                        mg.mem_used_gb = read_mem_used_gb();
-                        mg.cpu_usage_pct = cpu_usage;
-                        let (_, gr, gt) = read_gpu_utilization();
-                        mg.soc.gpu_util_renderer = gr;
-                        mg.soc.gpu_util_tiler = gt;
                     }
                     std::thread::sleep(dt);
                 }
@@ -1223,6 +1640,29 @@ impl Sampler {
                     }
                 }
             }));
+        }
+
+        // ── System stats (CPU usage, memory, GPU utilisation) ────────────
+        // Kept apart from the SMC source: that one ends at once where the SMC
+        // cannot be opened, and none of these values depends on it.
+        {
+            let m = shared.clone();
+            let mut reader = SystemStatsReader::default();
+            let mut gpu_filter = GpuCollisionFilter::default();
+            spawn_periodic(&mut handles, &running, dt, move || {
+                // Every system call is made here, before the lock is taken.
+                let stats = reader.read();
+                if let Ok(mut mg) = m.lock() {
+                    mg.cpu_usage_pct = stats.cpu_usage_pct;
+                    mg.mem_used_gb = stats.mem_used_gb;
+                    if let Some((renderer, tiler)) =
+                        gpu_filter.accept(stats.gpu_util, mg.soc.gpu_util_device)
+                    {
+                        mg.soc.gpu_util_renderer = renderer;
+                        mg.soc.gpu_util_tiler = tiler;
+                    }
+                }
+            });
         }
 
         // ── Battery ──────────────────────────────────────────────────────
@@ -1255,9 +1695,12 @@ impl Sampler {
                             };
                         }
                     }
+                    // Read before the lock: it copies AppleSmartBattery's
+                    // properties again, which takes a few hundred microseconds.
+                    let adapter = battery::read_adapter();
                     if let Ok(mut mg) = m.lock() {
                         mg.battery = b;
-                        mg.adapter = battery::read_adapter();
+                        mg.adapter = adapter;
                     }
                     std::thread::sleep(dt);
                 }
@@ -1279,10 +1722,16 @@ impl Sampler {
             handles.push(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     let brightness = read_display_brightness();
+                    let panel_nits =
+                        read_panel_nits().filter(|&nits| panel_nits_plausible(nits, max_nits));
                     let backlight_current = read_backlight_current();
                     let refresh_hz = read_display_refresh_hz();
+                    let pixel_size = read_display_native_pixel_size();
                     let preset = read_display_preset();
                     if let Ok(mut mg) = m.lock() {
+                        // The measured level, independent of the slider-based
+                        // `nits` below.
+                        mg.display.panel_nits = panel_nits;
                         if let Some(br) = brightness {
                             mg.display.available = true;
                             mg.display.brightness_pct = br * 100.0;
@@ -1345,8 +1794,12 @@ impl Sampler {
                                     br * MAX_DISPLAY_W
                                 };
                             let display = unsafe { CGMainDisplayID() };
-                            mg.display.width_px = unsafe { CGDisplayPixelsWide(display) } as u32;
-                            mg.display.height_px = unsafe { CGDisplayPixelsHigh(display) } as u32;
+                            // The panel's native pixels; 0 x 0 = unknown.
+                            (mg.display.width_px, mg.display.height_px) =
+                                pixel_size.unwrap_or_default();
+                            // The diagonal is derived from the panel's physical
+                            // size in millimetres, so it does not depend on
+                            // the display mode either.
                             let size_mm = unsafe { CGDisplayScreenSize(display) };
                             let diag_mm = (size_mm.width.powi(2) + size_mm.height.powi(2)).sqrt();
                             mg.display.diagonal_inches =
@@ -1480,7 +1933,9 @@ impl Sampler {
                 if let Ok(mut mg) = m.lock() {
                     mg.usb_devices = usb;
                     mg.power_assertions = asserts;
-                    mg.usb_power_out_w = usb_ports.iter().map(|p| p.power_w).sum();
+                    // Not `.sum()`: a float sum over no ports is -0.0, which
+                    // JSON prints as "-0.0".
+                    mg.usb_power_out_w = usb_ports.iter().fold(0.0, |w, p| w + p.power_w);
                     mg.usb_power_per_port = usb_ports;
                 }
             });
@@ -1490,7 +1945,15 @@ impl Sampler {
         {
             let m = shared.clone();
             let running = running.clone();
+            // Read every BLUETOOTH_POLL_PERIOD, not every tick. The thread keeps
+            // ticking at `dt` and skips in between: spawn_periodic sleeps a whole
+            // period at a time and Drop joins the thread, so passing the 10 s
+            // period here would make dropping a Sampler take up to 10 s.
+            let mut next_poll = Instant::now();
             spawn_periodic(&mut handles, &running, dt, move || {
+                if !peripherals::bluetooth_poll_due(&mut next_poll, Instant::now()) {
+                    return;
+                }
                 let devs = peripherals::read_bluetooth_devices();
                 let pw: f32 = devs.len() as f32 * BT_PERIPHERAL_W;
                 if let Ok(mut mg) = m.lock() {
@@ -1504,8 +1967,9 @@ impl Sampler {
         {
             let m = shared.clone();
             let running = running.clone();
+            let mut wifi_reader = peripherals::WifiReader::default();
             spawn_periodic(&mut handles, &running, dt, move || {
-                let wifi = peripherals::read_wifi_info();
+                let wifi = wifi_reader.read();
                 let ethernet = peripherals::read_ethernet_info(&wifi.interface_name);
                 if let Ok(mut mg) = m.lock() {
                     mg.wifi = wifi;
@@ -1546,100 +2010,31 @@ impl Sampler {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                // (name, energy_nj, session_mj, delta_nj, dt_s, last_seen, disk_r, disk_w, phys_mem)
-                #[allow(clippy::type_complexity)]
-                let mut known: std::collections::HashMap<
-                    i32,
-                    (String, u64, f64, u64, f64, Instant, u64, u64, u64),
-                > = std::collections::HashMap::new();
-                let mut proc_sma: std::collections::HashMap<i32, crate::sma::TimeSma> =
-                    std::collections::HashMap::new();
-                let mut total_sma = crate::sma::TimeSma::new(5.0);
+                use crate::process_power::{refresh_due, ProcessTracker, NET_COUNTERS_REFRESH};
+                let mut tracker = ProcessTracker::default();
+                let mut net = powermetrics::ProcNetCounters::new();
+                let mut net_read_at = None;
                 while running.load(Ordering::Relaxed) {
-                    let cur = read_all_process_energy();
-                    let net = powermetrics::read_proc_net_counters();
+                    let scan = read_all_process_energy();
+                    // Stamp the scan before anything slower runs, so the time
+                    // between two stamps is the time the energy deltas cover.
                     let now = Instant::now();
-
-                    for (&pid, (name, energy_nj, disk_r, disk_w, phys_mem)) in &cur {
-                        let energy_nj = *energy_nj;
-                        let entry = known.entry(pid).or_insert_with(|| {
-                            (name.clone(), energy_nj, 0.0, 0, 0.0, now, 0u64, 0u64, 0u64)
-                        });
-                        // Detect PID reuse: name changed or energy counter reset
-                        if entry.0 != *name || energy_nj < entry.1 {
-                            *entry = (
-                                name.clone(),
-                                energy_nj,
-                                0.0,
-                                0,
-                                0.0,
-                                now,
-                                *disk_r,
-                                *disk_w,
-                                *phys_mem,
-                            );
-                            continue;
-                        }
-                        let delta_nj = energy_nj.saturating_sub(entry.1);
-                        let dt_s = now.duration_since(entry.5).as_secs_f64();
-                        entry.0 = name.clone();
-                        entry.1 = energy_nj;
-                        entry.2 += delta_nj as f64 / 1e6;
-                        entry.3 = delta_nj;
-                        entry.4 = dt_s;
-                        entry.5 = now;
-                        entry.6 = *disk_r;
-                        entry.7 = *disk_w;
-                        entry.8 = *phys_mem;
+                    if refresh_due(net_read_at, now, NET_COUNTERS_REFRESH) {
+                        net = powermetrics::read_proc_net_counters();
+                        net_read_at = Some(now);
                     }
 
-                    known.retain(|_, entry| now.duration_since(entry.5).as_secs() < 30);
-
-                    let mut procs: Vec<ProcessPower> = known
-                        .iter()
-                        .filter(|(_, entry)| entry.2 > 0.0)
-                        .map(|(&pid, entry)| {
-                            let raw_power = if entry.4 > 0.01 {
-                                (entry.3 as f64 / 1e9 / entry.4) as f32
-                            } else {
-                                0.0
-                            };
-                            let sma = proc_sma
-                                .entry(pid)
-                                .or_insert_with(|| crate::sma::TimeSma::new(5.0));
-                            sma.push(raw_power);
-                            let power_w = sma.get();
-                            let alive = cur.contains_key(&pid);
-                            let (net_rx, net_tx) = net.get(&pid).copied().unwrap_or((0, 0));
-                            ProcessPower {
-                                pid,
-                                name: entry.0.clone(),
-                                power_w,
-                                energy_mj: entry.2,
-                                alive,
-                                disk_read_bytes: entry.6,
-                                disk_write_bytes: entry.7,
-                                phys_mem_bytes: entry.8,
-                                net_rx_bytes: net_rx,
-                                net_tx_bytes: net_tx,
-                            }
-                        })
-                        .collect();
-                    proc_sma.retain(|pid, _| known.contains_key(pid));
-                    let total_raw: f32 = procs.iter().map(|p| p.power_w).sum();
-                    total_sma.push(total_raw);
-                    let total_power = total_sma.get();
-                    let total_energy: f64 = procs.iter().map(|p| p.energy_mj).sum();
-                    procs.sort_by(|a, b| {
-                        b.energy_mj
-                            .partial_cmp(&a.energy_mj)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    procs.truncate(50);
+                    let mut report = tracker.update(&scan, now);
+                    for p in &mut report.processes {
+                        if let Some(&(rx, tx)) = net.get(&p.pid) {
+                            p.net_rx_bytes = rx;
+                            p.net_tx_bytes = tx;
+                        }
+                    }
                     if let Ok(mut mg) = m.lock() {
-                        mg.all_procs_power_w = total_power;
-                        mg.all_procs_energy_mj = total_energy;
-                        mg.top_processes = procs;
+                        mg.all_procs_power_w = report.total_power_w;
+                        mg.all_procs_energy_mj = report.total_energy_mj;
+                        mg.top_processes = report.processes;
                     }
 
                     std::thread::sleep(dt);
@@ -1686,6 +2081,126 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_period_never_goes_below_the_floor() {
+        // 0 used to reach `thread::sleep(ZERO)` and spin every source thread.
+        assert_eq!(sampling_period(0), Duration::from_millis(MIN_INTERVAL_MS));
+        assert_eq!(sampling_period(99), Duration::from_millis(MIN_INTERVAL_MS));
+        assert_eq!(sampling_period(100), Duration::from_millis(100));
+        assert_eq!(sampling_period(1000), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn gpu_filter_publishes_real_readings() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((24, 17, 10), 22), Some((17, 10)));
+        // Busy device with an idle renderer and tiler is a reading too.
+        assert_eq!(filter.accept((30, 0, 0), 30), Some((0, 0)));
+    }
+
+    #[test]
+    fn gpu_filter_keeps_last_values_when_a_read_collides() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((0, 0, 0), 22), None);
+        assert_eq!(filter.accept((0, 0, 0), GPU_BUSY_MIN_PCT), None);
+    }
+
+    #[test]
+    fn gpu_filter_publishes_zeros_of_an_idle_gpu() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((0, 0, 0), 0), Some((0, 0)));
+        assert_eq!(filter.accept((0, 0, 0), GPU_BUSY_MIN_PCT - 1), Some((0, 0)));
+    }
+
+    #[test]
+    fn gpu_filter_gives_up_on_a_long_run_of_collisions() {
+        let mut filter = GpuCollisionFilter::default();
+        for _ in 0..GPU_MAX_BRIDGED_READS {
+            assert_eq!(filter.accept((0, 0, 0), 40), None);
+        }
+        // The kept values are too old by now: say "no data" instead.
+        assert_eq!(filter.accept((0, 0, 0), 40), Some((0, 0)));
+        assert_eq!(filter.accept((0, 0, 0), 40), Some((0, 0)));
+        // A real reading starts a fresh run.
+        assert_eq!(filter.accept((41, 35, 6), 40), Some((35, 6)));
+        assert_eq!(filter.accept((0, 0, 0), 40), None);
+    }
+
+    // Counters of an M5 Max with 128 GB as vm_stat printed them, in pages of
+    // 16 KiB: Activity Monitor showed 82.3 GiB used while active + inactive +
+    // wired + compressor came to 126.3 GiB.
+    fn vm_stats_with_file_cache() -> VmStats64 {
+        VmStats64 {
+            active_count: 3_112_965,
+            inactive_count: 3_158_230,
+            wire_count: 552_682,
+            compressor_page_count: 1_456_189,
+            internal_page_count: 3_655_584,
+            external_page_count: 2_615_920,
+            purgeable_count: 272_722,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mem_used_pages_is_app_memory_plus_wired_plus_compressor() {
+        let vm = vm_stats_with_file_cache();
+        assert_eq!(
+            mem_used_pages(&vm),
+            3_655_584 - 272_722 + 552_682 + 1_456_189
+        );
+        assert_eq!(mem_used_pages(&vm) * 16384 / (1 << 30), 82);
+    }
+
+    #[test]
+    fn mem_used_pages_does_not_count_file_cache() {
+        let mut vm = vm_stats_with_file_cache();
+        let used = mem_used_pages(&vm);
+        // A large file is read: its pages are file-backed and sit on the
+        // active and inactive queues until the kernel needs them back.
+        vm.external_page_count += 1_000_000;
+        vm.active_count += 400_000;
+        vm.inactive_count += 600_000;
+        assert_eq!(mem_used_pages(&vm), used);
+    }
+
+    #[test]
+    fn mem_used_pages_survives_more_purgeable_than_anonymous_pages() {
+        let vm = VmStats64 {
+            internal_page_count: 10,
+            purgeable_count: 25,
+            wire_count: 3,
+            compressor_page_count: 4,
+            ..Default::default()
+        };
+        assert_eq!(mem_used_pages(&vm), 7);
+    }
+
+    // Needs neither the SMC nor IOReport, so it has to pass in a VM too.
+    #[test]
+    fn system_stats_reader_covers_every_logical_cpu_and_used_memory() {
+        // SAFETY: sysconf takes no pointers and has no preconditions.
+        let logical_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+        assert!(logical_cpus > 0);
+
+        let mut reader = SystemStatsReader::default();
+        let first = reader.read();
+        assert!(
+            first.cpu_usage_pct.is_empty(),
+            "usage needs two tick readings, got {:?}",
+            first.cpu_usage_pct
+        );
+        assert!(first.mem_used_gb > 0.0, "used memory {}", first.mem_used_gb);
+
+        let second = reader.read();
+        assert_eq!(second.cpu_usage_pct.len(), logical_cpus as usize);
+        assert!(second
+            .cpu_usage_pct
+            .iter()
+            .all(|pct| (0.0..=100.0).contains(pct)));
+        assert!(second.mem_used_gb > 0.0);
+    }
 
     #[test]
     fn compute_cpu_usage_returns_expected_percentages() {

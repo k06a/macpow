@@ -7,9 +7,9 @@ fn main() {
         "PU2R", "PUBC", "PUBD", "PUB0", "PUB1", "PPRT", "PBUS",
     ];
     for key in &keys {
-        match smc.read_f32(key) {
-            Ok(v) => println!("{}: {:>8.4} W", key, v),
-            Err(_) => {}
+        // A key this Mac does not have is skipped; `macpow --dump-smc` lists every key.
+        if let Ok(v) = smc.read_f32(key) {
+            println!("{}: {:>8.4} W", key, v);
         }
     }
 }
