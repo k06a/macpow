@@ -1,15 +1,19 @@
-# Builds macpow on every macOS version GitHub hosts for Apple Silicon and
-# reports which data it really obtained there.
+# Builds and tests macpow on every macOS version GitHub hosts for Apple Silicon,
+# and reports which data it really obtained there.
 #
-# GitHub's runners are virtual machines, so most hardware telemetry is expected
-# to be missing: the hardware tests and the probe are informational and never
-# fail the job. What does fail it: the build and the hermetic unit tests.
+# GitHub's macOS runners are virtual machines on Apple M1 hosts, whatever the
+# label: the chip cannot be chosen, and IOReport, the SMC, the battery and the
+# display are absent. So this matrix covers macOS versions, not chips. The
+# build and the hermetic tests fail the job; the hardware tests and the probe
+# are informational and only show what a guest exposes.
 name: macOS matrix
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ci/macos-matrix]
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,16 +37,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Free arm64 images (Apple M1 guests): macOS 15, macOS 26 and macOS 27.
+        # Free arm64 images: macOS 15, macOS 26 and macOS 27.
         runner: [macos-15, macos-26, xcode-27]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the Rust release that rust-toolchain.toml pins.
+      - run: rustup toolchain install
 
       - name: Build
         run: cargo build --release --locked
 
       - name: Unit tests
-        run: cargo test --lib --locked
+        run: cargo test --locked --lib --bins
 
       - name: Hardware tests (informational)
         continue-on-error: true
@@ -55,10 +64,10 @@ jobs:
         timeout-minutes: 5
         env:
           RUNNER_LABEL: ${{ matrix.runner }}
-        run: .github/scripts/probe.sh target/release/macpow out "$RUNNER_LABEL"
+        run: bash .github/scripts/probe.sh target/release/macpow out "$RUNNER_LABEL"
 
       - name: Report
-        run: python3 .github/scripts/coverage.py out | tee -a "$GITHUB_STEP_SUMMARY"
+        run: python3 -I .github/scripts/coverage.py out | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() }}
@@ -74,11 +83,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: reports
 
       - name: Report
-        run: python3 .github/scripts/coverage.py reports/* | tee -a "$GITHUB_STEP_SUMMARY"
+        run: python3 -I .github/scripts/coverage.py reports/* | tee -a "$GITHUB_STEP_SUMMARY"
