@@ -51,7 +51,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **Collapsible tree** — fold/unfold with arrows, `+`/`-` for all
 - **Sparkline charts** — pin any resource with Space, inline 1-line history column at wide terminals
 - **Time-based SMA** — toggle 0s/5s/10s smoothing window
-- **Latency control** — toggle UI refresh rate: 500ms / 2s / 5s
+- **Latency control** — toggle UI refresh rate: 1x / 2x / 4x / 8x of `--interval` (`l`)
 - **Mouse support** — click to select rows
 - **JSON mode** — pipe structured data for scripts and dashboards
 - **No sudo** — runs entirely with user-level permissions
