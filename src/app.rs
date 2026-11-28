@@ -4166,7 +4166,7 @@ mod tests {
             batteries: vec![(String::new(), "80%".into())],
         });
 
-        let mut app = App::new();
+        let mut app = App::new(250);
         app.machine_name = "Test Mac".into();
         app.update(m);
         // A pinned row gets a chart whatever row the cursor is on.
