@@ -1,10 +1,14 @@
-# Pin the toolchain to "stable" so local `cargo`, `cargo clippy`, and
-# `cargo fmt` invocations use exactly the same Rust version that CI does
-# (the `dtolnay/rust-toolchain@stable` action in .github/workflows/ci.yml).
+# Pins the exact Rust release, so that `cargo`, `cargo clippy` and `cargo fmt` behave the
+# same locally and in CI. rustup reads this file in both places and installs the release
+# on first use.
 #
-# Without this, a developer on an older `stable` could pass clippy locally
-# while CI fails on a new lint that was promoted in a more recent release.
+# A channel name such as "stable" is not a pin. It means "whatever stable is installed
+# here": the CI runner picks up every new release on the day it comes out, and a lint
+# added by that release then fails a commit that did not touch the code.
+#
+# To move to a newer Rust, change the version in a commit of its own, so that its new
+# lints arrive in a change that CI tests like any other.
 [toolchain]
-channel = "stable"
+channel = "1.100.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

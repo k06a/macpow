@@ -1,0 +1,19 @@
+# Keeps the GitHub Actions pinned by commit SHA in .github/workflows and the Cargo
+# dependencies current. Each ecosystem gets one grouped pull request per week, and CI
+# runs on it like on any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ['*']

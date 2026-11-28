@@ -69,7 +69,7 @@ cargo install macpow
 ```bash
 git clone https://github.com/k06a/macpow.git
 cd macpow
-cargo build --release
+cargo build --release      # rustup first installs the Rust release pinned in rust-toolchain.toml
 ./target/release/macpow
 ```
 
@@ -235,18 +235,14 @@ If a new chip isn't detected correctly, run `macpow --dump` to see the raw IORep
 
 ## Release checklist
 
-> **Toolchain pinning.** The repo ships a `rust-toolchain.toml` that pins
-> `stable`, matching `dtolnay/rust-toolchain@stable` in CI. Run
-> `rustup update stable` before each release so local clippy/fmt see the
-> same lints CI does — newly-promoted clippy lints have caused CI failures
-> after `cargo publish` already uploaded the broken version (immutable),
-> so this step is non-optional.
+> **Toolchain pinning.** `rust-toolchain.toml` pins an exact Rust release.
+> rustup installs it on first use, locally and in CI, so local clippy/fmt
+> always see the same lints CI does and there is nothing to update before a
+> release. A newer Rust, and the lints it adds, arrives only through a
+> commit that changes the version in that file — make it a commit of its
+> own, so CI tests it like any other change.
 
 ```bash
-# 0. Make sure the toolchain matches CI exactly
-rustup update stable
-rustc --version    # note the version; CI is on the same `stable`
-
 # 1. Bump version
 vim Cargo.toml                        # update version = "X.Y.Z"
 cargo check                           # writes the new version into Cargo.lock (CI builds with --locked)
@@ -318,7 +314,7 @@ cargo test                 # unit + integration tests
 cargo build --release      # final build check
 ```
 
-All four must pass with zero errors. The lints the project intentionally allows (FFI / Objective-C style) are listed under `[lints.clippy]` in `Cargo.toml`, so plain `cargo clippy`, your editor and CI all apply the same rules.
+All four must pass with zero errors. The lints the project intentionally allows (FFI / Objective-C style) are listed under `[lints.clippy]` in `Cargo.toml`, so plain `cargo clippy`, your editor and CI all apply the same rules. `rust-toolchain.toml` pins the Rust release they all use; rustup installs it on first use.
 
 ### Collecting diagnostics
 
