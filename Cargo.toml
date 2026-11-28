@@ -56,7 +56,10 @@ bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+# Without the default `plotters` and `rayon` features: they only draw the HTML charts and
+# add eight crates to every test build. The timing table and the comparison with the
+# previous run are unaffected, and criterion still draws the charts if gnuplot is installed.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "data_sources"
