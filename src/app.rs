@@ -512,7 +512,10 @@ pub struct App {
     wh: Wh,
     sma: MetricsSma,
     pub sma_window: u32,
+    /// How often the screen takes a new snapshot; `l` changes it.
     pub interval_ms: u64,
+    /// `--interval`: how often the sources are sampled.
+    sampling_interval_ms: u64,
     temp_min: BTreeMap<String, f32>,
     temp_max: BTreeMap<String, f32>,
     temp_sum: BTreeMap<String, f64>,
@@ -549,7 +552,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(interval_ms: u64) -> Self {
         let machine_name = read_machine_name();
         Self {
             metrics: Metrics::default(),
@@ -558,7 +561,8 @@ impl App {
             wh: Wh::default(),
             sma: MetricsSma::new(0.0),
             sma_window: 0,
-            interval_ms: 250,
+            interval_ms,
+            sampling_interval_ms: interval_ms,
             temp_min: BTreeMap::new(),
             temp_max: BTreeMap::new(),
             temp_sum: BTreeMap::new(),
@@ -1062,16 +1066,22 @@ impl App {
     }
 
     fn cycle_latency(&mut self) {
-        self.interval_ms = match self.interval_ms {
-            250 => 500,
-            500 => 1000,
-            1000 => 2000,
-            _ => 250,
-        };
+        self.interval_ms = Self::next_refresh_ms(self.sampling_interval_ms, self.interval_ms);
     }
 
-    pub fn poll_interval_ms(&self) -> u64 {
-        self.interval_ms
+    /// `l` steps the refresh interval through 1x, 2x, 4x and 8x of `--interval`
+    /// (250 ms / 500 ms / 1 s / 2 s by default) and then wraps around. It never
+    /// goes below `--interval`: the sources have nothing newer to show.
+    pub fn next_refresh_ms(sampling_ms: u64, current_ms: u64) -> u64 {
+        if current_ms >= sampling_ms * 8 {
+            sampling_ms
+        } else {
+            current_ms * 2
+        }
+    }
+
+    pub fn refresh_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.interval_ms)
     }
 
     pub fn draw(&mut self, f: &mut Frame) {

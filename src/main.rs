@@ -14,8 +14,8 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, stdout, Write};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 
 /// Accepted `--interval` values, in milliseconds. The sources do not change
 /// faster than every 100 ms, so anything lower only repeats the same numbers
@@ -47,8 +47,6 @@ struct CliArgs {
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
-    let interval = args.interval;
-    let json_mode = args.json;
 
     if args.dump {
         match macpow::ioreport::IOReportSampler::new() {
@@ -62,36 +60,46 @@ fn main() -> Result<()> {
         return run_dump_smc();
     }
 
-    let (tx, rx) = mpsc::sync_channel::<Metrics>(2);
-
-    // Sampler spawns independent threads per source, all update shared state.
-    // This thread just snapshots and sends to the TUI at the desired interval.
-    std::thread::spawn(move || {
-        let sampler = Sampler::new(interval);
-        loop {
-            std::thread::sleep(Duration::from_millis(interval));
-            let m = sampler.snapshot();
-            if tx.send(m).is_err() {
-                break;
-            }
-        }
-    });
-
-    if json_mode {
-        run_json(rx)
+    if args.json {
+        run_json(args.interval)
     } else {
-        run_tui(rx)
+        run_tui(args.interval)
     }
 }
 
-fn run_json(rx: mpsc::Receiver<Metrics>) -> Result<()> {
+// Timing model, the same for both front ends.
+//
+// The Sampler runs one thread per data source. Each thread re-reads its source
+// every `--interval` and publishes the result into shared state, and
+// `Sampler::snapshot` copies that state without waiting for any of them. The
+// front end owns the Sampler and takes a snapshot at the moment it is about to
+// use one, so what it shows is never older than one sampling interval:
+//
+// - `--json` prints one snapshot every `--interval`;
+// - the TUI takes one snapshot per refresh. The refresh interval starts at
+//   `--interval`; the `l` key stretches it to 2x, 4x and 8x. That only slows
+//   the screen down, the sources keep sampling every `--interval`.
+
+/// Starts the sampler threads; they run until the process exits.
+///
+/// The Sampler is never dropped on purpose. Its `Drop` joins every source
+/// thread, and each of them may be asleep for a whole interval, so quitting
+/// would hang for up to `--interval` (measured: 0.96 s at 1000 ms). The threads
+/// hold nothing that has to be released before the process ends.
+fn start_sampler(interval_ms: u64) -> ManuallyDrop<Sampler> {
+    ManuallyDrop::new(Sampler::new(interval_ms))
+}
+
+fn run_json(interval_ms: u64) -> Result<()> {
     // No SIGINT handler on purpose: JSON mode has nothing to clean up, so the
     // default disposition (die at once, even while blocked on a slow reader)
     // is what we want. A handler that calls `process::exit` is not
     // async-signal-safe: it aborts when it interrupts a write to stdout.
+    let sampler = start_sampler(interval_ms);
     let mut out = stdout().lock();
-    for m in rx {
-        if let Err(e) = write_json_line(&mut out, &m) {
+    loop {
+        std::thread::sleep(Duration::from_millis(interval_ms));
+        if let Err(e) = write_json_line(&mut out, &sampler.snapshot()) {
             // A reader that has seen enough and closed the pipe
             // (`macpow --json | head -1`) is a normal way to stop.
             return match e.kind() {
@@ -100,7 +108,6 @@ fn run_json(rx: mpsc::Receiver<Metrics>) -> Result<()> {
             };
         }
     }
-    Ok(())
 }
 
 /// Writes one snapshot as a single line of compact JSON (JSON Lines) and
@@ -120,7 +127,7 @@ fn restore_terminal() {
     let _ = stdout().execute(LeaveAlternateScreen);
 }
 
-fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
+fn run_tui(interval_ms: u64) -> Result<()> {
     if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
         anyhow::bail!("TUI requires a real terminal. Use --json for piped output.");
     }
@@ -131,14 +138,22 @@ fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let backend = CrosstermBackend::new(stdout());
         let mut terminal = Terminal::new(backend)?;
-        let mut app = App::new();
+        let mut app = App::new(interval_ms);
+        // Show the still empty screen before starting the sampler: its
+        // start-up reads take several hundred milliseconds.
+        terminal.draw(|f| app.draw(f))?;
+        let sampler = start_sampler(interval_ms);
+        let mut last_update = Instant::now();
 
         loop {
-            while let Ok(m) = rx.try_recv() {
-                app.update(m);
+            let refresh = app.refresh_interval();
+            if last_update.elapsed() >= refresh {
+                app.update(sampler.snapshot());
+                last_update = Instant::now();
             }
             terminal.draw(|f| app.draw(f))?;
-            if event::poll(Duration::from_millis(app.poll_interval_ms()))? {
+            // Wait for input only until the next frame is due.
+            if event::poll(refresh.saturating_sub(last_update.elapsed()))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press && app.handle_key(key) => {
                         break;
@@ -223,6 +238,21 @@ mod tests {
                 "--interval {value}"
             );
         }
+    }
+
+    #[test]
+    fn l_key_steps_through_multiples_of_the_sampling_interval() {
+        // The default keeps the steps the key always had.
+        let mut steps = vec![250];
+        for _ in 0..4 {
+            steps.push(App::next_refresh_ms(250, steps[steps.len() - 1]));
+        }
+        assert_eq!(steps, [250, 500, 1000, 2000, 250]);
+
+        // A custom --interval is the base of the cycle and is never undercut.
+        assert_eq!(App::next_refresh_ms(300, 300), 600);
+        assert_eq!(App::next_refresh_ms(300, 2400), 300);
+        assert_eq!(App::next_refresh_ms(60_000, 480_000), 60_000);
     }
 
     #[test]

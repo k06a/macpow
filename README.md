@@ -99,6 +99,8 @@ macpow --dump             # Dump IOReport channel names (diagnostics)
 macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 ```
 
+`--interval` is how often every source is sampled. It is also the TUI's initial refresh interval (shown in the footer, changed with `l`) and the period of the `--json` stream.
+
 `--json` writes one object per `--interval`. Each object is compact JSON on a single line ([JSON Lines](https://jsonlines.org)), flushed as soon as it is produced, so `while read`, `grep` and `jq -c` can consume the stream record by record. When the reader closes the pipe (`macpow --json | head -1`) macpow exits with status 0; Ctrl+C ends it by SIGINT like any other filter.
 
 ### Keybindings
@@ -112,7 +114,7 @@ macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 | `-` | Collapse all nodes |
 | `Space` | Pin/unpin resource chart |
 | `a` | Cycle SMA window: 0s / 5s / 10s |
-| `l` | Cycle refresh interval: 250ms / 500ms / 1s / 2s |
+| `l` | Cycle refresh interval: 1x / 2x / 4x / 8x of `--interval` (250ms / 500ms / 1s / 2s by default) |
 | `r` | Reset all totals and min/max |
 | `PgUp` / `PgDn` | Scroll by 10 rows |
 | `Home` | Jump to top |
