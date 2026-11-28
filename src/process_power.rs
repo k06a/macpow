@@ -1,11 +1,15 @@
 //! Per-process power.
 //!
 //! The kernel keeps a cumulative energy counter for every process
-//! (`proc_pid_rusage`). [`read_all_process_energy`] reads those counters.
+//! (`proc_pid_rusage`). [`read_all_process_energy`] reads those counters and
+//! [`ProcessTracker`] turns successive readings into power and session energy.
 
+use crate::types::ProcessPower;
 use libc::c_int;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 // ── Kernel counters ──────────────────────────────────────────────────────────
 
@@ -186,6 +190,183 @@ pub fn read_all_process_energy() -> ProcessScan {
     scan
 }
 
+// ── Accounting ───────────────────────────────────────────────────────────────
+
+/// Power is averaged over this much history.
+const POWER_WINDOW: Duration = Duration::from_secs(5);
+/// An exited process stays listed (as `alive: false`) for this long, so that
+/// the energy it used does not vanish from view the moment it exits.
+const KEEP_DEAD_FOR: Duration = Duration::from_secs(30);
+/// Processes reported per update, picked by session energy.
+const MAX_REPORTED: usize = 50;
+/// Two readings closer together than this say nothing useful about power.
+const MIN_SPAN_SECS: f64 = 0.01;
+
+/// Readings of a cumulative energy counter covering the last [`POWER_WINDOW`].
+///
+/// The average power over the window is the energy difference between its two
+/// ends divided by the time between them. That is exactly the time-weighted
+/// mean of the per-tick powers, with nothing to average twice.
+#[derive(Default)]
+struct EnergyWindow {
+    readings: VecDeque<(Instant, u64)>,
+}
+
+impl EnergyWindow {
+    fn push(&mut self, now: Instant, energy_nj: u64) {
+        self.readings.push_back((now, energy_nj));
+        // The front may go once its successor is old enough to start the
+        // window; until then it is needed to span the full window.
+        while self
+            .readings
+            .get(1)
+            .is_some_and(|&(t, _)| now.duration_since(t) >= POWER_WINDOW)
+        {
+            self.readings.pop_front();
+        }
+    }
+
+    fn power_w(&self) -> f32 {
+        let (Some(&(t0, e0)), Some(&(t1, e1))) = (self.readings.front(), self.readings.back())
+        else {
+            return 0.0;
+        };
+        let secs = t1.duration_since(t0).as_secs_f64();
+        if secs < MIN_SPAN_SECS {
+            return 0.0;
+        }
+        (e1.saturating_sub(e0) as f64 / 1e9 / secs) as f32
+    }
+}
+
+/// What the tracker remembers about one process.
+struct Tracked {
+    name: String,
+    /// Last kernel counter value, to form the next delta.
+    energy_nj: u64,
+    /// Energy used since the tracker first saw the process.
+    session_nj: u64,
+    window: EnergyWindow,
+    last_seen: Instant,
+    disk_read_bytes: u64,
+    disk_write_bytes: u64,
+    phys_mem_bytes: u64,
+}
+
+impl Tracked {
+    /// Starts tracking at the current counter value: energy the process used
+    /// before we first saw it is not part of this session.
+    fn new(sample: &ProcessSample, now: Instant) -> Self {
+        let mut window = EnergyWindow::default();
+        window.push(now, 0);
+        Self {
+            name: sample.name.clone(),
+            energy_nj: sample.energy_nj,
+            session_nj: 0,
+            window,
+            last_seen: now,
+            disk_read_bytes: sample.disk_read_bytes,
+            disk_write_bytes: sample.disk_write_bytes,
+            phys_mem_bytes: sample.phys_mem_bytes,
+        }
+    }
+}
+
+/// Result of one [`ProcessTracker::update`].
+#[derive(Debug, Default)]
+pub struct ProcessReport {
+    /// Top processes by session energy, highest first. Network counters are
+    /// left at zero; the tracker does not know them.
+    pub processes: Vec<ProcessPower>,
+    /// Power of all tracked processes together, averaged like each process's.
+    pub total_power_w: f32,
+    /// Energy of all tracked processes since the tracker started. Never
+    /// decreases, also not when exited processes are forgotten.
+    pub total_energy_mj: f64,
+}
+
+/// Turns successive process scans into per-process power and session energy.
+#[derive(Default)]
+pub struct ProcessTracker {
+    known: HashMap<i32, Tracked>,
+    /// Every delta ever attributed, summed. Kept apart from `known` so that
+    /// forgetting a process cannot lower the total.
+    session_nj: u64,
+    window: EnergyWindow,
+}
+
+impl ProcessTracker {
+    /// Accounts for one scan taken at `now`.
+    pub fn update(&mut self, scan: &ProcessScan, now: Instant) -> ProcessReport {
+        for (&pid, sample) in scan {
+            let tracked = match self.known.entry(pid) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    entry.insert(Tracked::new(sample, now));
+                    continue;
+                }
+            };
+            // A different name or a counter that went backwards means the pid
+            // now belongs to another process: start over instead of billing
+            // the newcomer for the difference between two unrelated counters.
+            if tracked.name != sample.name || sample.energy_nj < tracked.energy_nj {
+                *tracked = Tracked::new(sample, now);
+                continue;
+            }
+            let delta_nj = sample.energy_nj - tracked.energy_nj;
+            tracked.energy_nj = sample.energy_nj;
+            tracked.session_nj += delta_nj;
+            tracked.window.push(now, tracked.session_nj);
+            tracked.last_seen = now;
+            tracked.disk_read_bytes = sample.disk_read_bytes;
+            tracked.disk_write_bytes = sample.disk_write_bytes;
+            tracked.phys_mem_bytes = sample.phys_mem_bytes;
+            self.session_nj += delta_nj;
+        }
+        self.known
+            .retain(|_, tracked| now.duration_since(tracked.last_seen) < KEEP_DEAD_FOR);
+        self.window.push(now, self.session_nj);
+
+        let mut top: Vec<(i32, &Tracked)> = self
+            .known
+            .iter()
+            .filter(|(_, tracked)| tracked.session_nj > 0)
+            .map(|(&pid, tracked)| (pid, tracked))
+            .collect();
+        // Ties broken by pid so the order does not depend on hash order.
+        top.sort_unstable_by(|a, b| b.1.session_nj.cmp(&a.1.session_nj).then(a.0.cmp(&b.0)));
+        top.truncate(MAX_REPORTED);
+
+        let processes = top
+            .into_iter()
+            .map(|(pid, tracked)| {
+                let alive = scan.contains_key(&pid);
+                ProcessPower {
+                    pid,
+                    name: tracked.name.clone(),
+                    // An exited process draws nothing. Its window describes
+                    // the past and would otherwise repeat its last power for
+                    // as long as the process stays listed.
+                    power_w: if alive { tracked.window.power_w() } else { 0.0 },
+                    energy_mj: tracked.session_nj as f64 / 1e6,
+                    alive,
+                    disk_read_bytes: tracked.disk_read_bytes,
+                    disk_write_bytes: tracked.disk_write_bytes,
+                    phys_mem_bytes: tracked.phys_mem_bytes,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                }
+            })
+            .collect();
+
+        ProcessReport {
+            processes,
+            total_power_w: self.window.power_w(),
+            total_energy_mj: self.session_nj as f64 / 1e6,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +414,250 @@ mod tests {
             .expect("our own process must be readable");
         assert!(!own.name.is_empty());
         assert!(own.phys_mem_bytes > 0);
+    }
+
+    // ── ProcessTracker ───────────────────────────────────────────────────
+
+    /// Nanojoules per joule.
+    const J: u64 = 1_000_000_000;
+
+    fn scan(processes: &[(i32, &str, u64)]) -> ProcessScan {
+        processes
+            .iter()
+            .map(|&(pid, name, energy_nj)| {
+                let sample = ProcessSample {
+                    name: name.to_string(),
+                    energy_nj,
+                    ..Default::default()
+                };
+                (pid, sample)
+            })
+            .collect()
+    }
+
+    fn row(report: &ProcessReport, pid: i32) -> Option<&ProcessPower> {
+        report.processes.iter().find(|p| p.pid == pid)
+    }
+
+    /// A clock for the tests: `at(3.0)` is three seconds after its start.
+    fn clock() -> impl Fn(f64) -> Instant {
+        let start = Instant::now();
+        move |secs| start + Duration::from_secs_f64(secs)
+    }
+
+    #[test]
+    fn first_sight_only_sets_the_baseline() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        // 50 J were used before we started watching; none of it is ours.
+        let report = tracker.update(&scan(&[(1, "old-timer", 50 * J)]), at(0.0));
+        assert!(report.processes.is_empty());
+        assert_eq!(report.total_energy_mj, 0.0);
+        assert_eq!(report.total_power_w, 0.0);
+    }
+
+    #[test]
+    fn steady_process_reports_power_and_session_energy() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(1, "busy", 50 * J)]), at(0.0));
+
+        let report = tracker.update(&scan(&[(1, "busy", 52 * J)]), at(1.0));
+        let busy = row(&report, 1).expect("listed once it has used energy");
+        assert_eq!(busy.name, "busy");
+        assert!(busy.alive);
+        assert_eq!(busy.power_w, 2.0);
+        assert_eq!(busy.energy_mj, 2000.0);
+        assert_eq!(report.total_power_w, 2.0);
+        assert_eq!(report.total_energy_mj, 2000.0);
+
+        // 3 J over the 2 s seen so far.
+        let report = tracker.update(&scan(&[(1, "busy", 53 * J)]), at(2.0));
+        assert_eq!(row(&report, 1).unwrap().power_w, 1.5);
+        assert_eq!(row(&report, 1).unwrap().energy_mj, 3000.0);
+    }
+
+    #[test]
+    fn power_covers_one_window_and_no_more() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        // 1 W for ten seconds, then 3 W.
+        let energy_at = |sec: u64| {
+            if sec <= 10 {
+                sec * J
+            } else {
+                10 * J + (sec - 10) * 3 * J
+            }
+        };
+        let mut power_at = Vec::new();
+        for sec in 0..=20 {
+            let report = tracker.update(&scan(&[(1, "p", energy_at(sec))]), at(sec as f64));
+            power_at.push(report.total_power_w);
+            assert_eq!(
+                row(&report, 1).map_or(0.0, |p| p.power_w),
+                report.total_power_w,
+                "a lone process is the whole total"
+            );
+        }
+        assert_eq!(power_at[10], 1.0);
+        // Two of the last five seconds at 3 W: (3 * 1 + 2 * 3) / 5.
+        assert!((power_at[12] - 1.8).abs() < 1e-6, "got {}", power_at[12]);
+        // One window after the step the old level is gone. Averaging the
+        // total a second time would still be on its way up here.
+        assert_eq!(power_at[15], 3.0);
+        assert_eq!(power_at[20], 3.0);
+    }
+
+    #[test]
+    fn renamed_pid_is_a_new_process() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(7, "old", 10 * J)]), at(0.0));
+        tracker.update(&scan(&[(7, "old", 12 * J)]), at(1.0));
+
+        // The pid comes back under another name with an unrelated counter.
+        let report = tracker.update(&scan(&[(7, "new", 40 * J)]), at(2.0));
+        assert!(
+            row(&report, 7).is_none(),
+            "the newcomer has used nothing yet"
+        );
+        assert_eq!(
+            report.total_energy_mj, 2000.0,
+            "what `old` used stays counted"
+        );
+
+        let report = tracker.update(&scan(&[(7, "new", 41 * J)]), at(3.0));
+        let new = row(&report, 7).unwrap();
+        assert_eq!(new.name, "new");
+        assert_eq!(new.energy_mj, 1000.0);
+        assert_eq!(new.power_w, 1.0);
+        assert_eq!(report.total_energy_mj, 3000.0);
+    }
+
+    #[test]
+    fn counter_going_backwards_is_a_new_process() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(7, "p", 10 * J)]), at(0.0));
+        tracker.update(&scan(&[(7, "p", 12 * J)]), at(1.0));
+
+        let report = tracker.update(&scan(&[(7, "p", J)]), at(2.0));
+        assert!(row(&report, 7).is_none());
+        assert_eq!(report.total_energy_mj, 2000.0);
+
+        let report = tracker.update(&scan(&[(7, "p", J + J / 2)]), at(3.0));
+        assert_eq!(row(&report, 7).unwrap().energy_mj, 500.0);
+        assert_eq!(report.total_energy_mj, 2500.0);
+    }
+
+    #[test]
+    fn dead_process_draws_nothing_but_keeps_its_energy() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(1, "dies", 10 * J), (2, "lives", 20 * J)]), at(0.0));
+        tracker.update(&scan(&[(1, "dies", 12 * J), (2, "lives", 21 * J)]), at(1.0));
+
+        // Gone from the very next scan: zero power at once, not a repeat of
+        // the 2 W it drew while it lived.
+        let report = tracker.update(&scan(&[(2, "lives", 22 * J)]), at(2.0));
+        let dead = row(&report, 1).expect("stays listed for a while");
+        assert!(!dead.alive);
+        assert_eq!(dead.power_w, 0.0);
+        assert_eq!(dead.energy_mj, 2000.0);
+        assert_eq!(row(&report, 2).unwrap().power_w, 1.0);
+        assert_eq!(report.total_energy_mj, 4000.0);
+
+        // Once the energy it really used has left the window, the total is
+        // the survivor's power alone.
+        let mut report = report;
+        for sec in 3..=8 {
+            report = tracker.update(&scan(&[(2, "lives", (20 + sec) * J)]), at(sec as f64));
+            assert_eq!(row(&report, 1).unwrap().power_w, 0.0);
+            assert_eq!(row(&report, 1).unwrap().energy_mj, 2000.0);
+        }
+        assert_eq!(report.total_power_w, 1.0);
+    }
+
+    #[test]
+    fn forgetting_a_dead_process_does_not_lower_the_total() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(1, "dies", 10 * J), (2, "lives", 20 * J)]), at(0.0));
+        tracker.update(&scan(&[(1, "dies", 15 * J), (2, "lives", 20 * J)]), at(1.0));
+
+        let mut previous_total = 0.0;
+        let mut listed_at = Vec::new();
+        for sec in 2..=40 {
+            let report = tracker.update(&scan(&[(2, "lives", 20 * J)]), at(sec as f64));
+            assert!(report.total_energy_mj >= previous_total);
+            previous_total = report.total_energy_mj;
+            listed_at.push((sec, row(&report, 1).is_some()));
+        }
+        assert_eq!(previous_total, 5000.0);
+        // Last seen at 1 s, so listed until 30 s later and not beyond.
+        assert!(listed_at.contains(&(30, true)));
+        assert!(listed_at.contains(&(31, false)));
+    }
+
+    #[test]
+    fn process_missing_from_one_scan_resumes_without_losing_energy() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(1, "p", 10 * J)]), at(0.0));
+        tracker.update(&scan(&[(1, "p", 11 * J)]), at(1.0));
+        let report = tracker.update(&scan(&[]), at(2.0));
+        assert!(!row(&report, 1).unwrap().alive);
+
+        let report = tracker.update(&scan(&[(1, "p", 13 * J)]), at(3.0));
+        let back = row(&report, 1).unwrap();
+        assert!(back.alive);
+        assert_eq!(back.energy_mj, 3000.0);
+        assert_eq!(back.power_w, 1.0);
+    }
+
+    #[test]
+    fn empty_scan_reports_positive_zero() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        for sec in 0..3 {
+            let report = tracker.update(&ProcessScan::new(), at(sec as f64));
+            assert!(report.processes.is_empty());
+            // Bit patterns, because -0.0 == 0.0 but prints as "-0.0".
+            assert_eq!(report.total_power_w.to_bits(), 0.0f32.to_bits());
+            assert_eq!(report.total_energy_mj.to_bits(), 0.0f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn reports_the_top_processes_by_session_energy() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        let pids = 1..=(MAX_REPORTED as i32 + 10);
+        let before: Vec<_> = pids.clone().map(|pid| (pid, "p", 0)).collect();
+        // Higher pids use more; pids 1 and 2 tie.
+        let after: Vec<_> = pids
+            .clone()
+            .map(|pid| (pid, "p", pid.max(2) as u64 * J))
+            .collect();
+        tracker.update(&scan(&before), at(0.0));
+        let report = tracker.update(&scan(&after), at(1.0));
+
+        assert_eq!(report.processes.len(), MAX_REPORTED);
+        let listed: Vec<i32> = report.processes.iter().map(|p| p.pid).collect();
+        let expected: Vec<i32> = pids.clone().rev().take(MAX_REPORTED).collect();
+        assert_eq!(listed, expected);
+        // The total covers every process, listed or not.
+        let all_joules: u64 = pids.map(|pid| pid.max(2) as u64).sum();
+        assert_eq!(report.total_energy_mj, all_joules as f64 * 1000.0);
+    }
+
+    #[test]
+    fn equal_energies_are_listed_in_pid_order() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        tracker.update(&scan(&[(9, "a", 0), (3, "b", 0), (5, "c", 0)]), at(0.0));
+        let report = tracker.update(&scan(&[(9, "a", J), (3, "b", J), (5, "c", J)]), at(1.0));
+        let listed: Vec<i32> = report.processes.iter().map(|p| p.pid).collect();
+        assert_eq!(listed, [3, 5, 9]);
     }
 }

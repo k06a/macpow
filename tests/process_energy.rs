@@ -2,7 +2,7 @@
 //! the kernel accounts CPU energy per task. Run with
 //! `cargo test --test process_energy`.
 
-use macpow::process_power::read_all_process_energy;
+use macpow::process_power::{read_all_process_energy, ProcessTracker};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -80,4 +80,46 @@ fn busy_child_energy_counter_advances() {
         "a process at 100% CPU should show plausible power, got {watts:.4} W \
          (counter went {before} -> {after} nJ)"
     );
+}
+
+#[test]
+fn tracker_follows_a_busy_child_through_its_death() {
+    if in_vm() {
+        eprintln!("skipped: no per-task energy accounting inside a VM");
+        return;
+    }
+    let child = BusyChild::spawn();
+    let pid = child.pid();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut tracker = ProcessTracker::default();
+    tracker.update(&read_all_process_energy(), Instant::now());
+    std::thread::sleep(Duration::from_secs(1));
+    let report = tracker.update(&read_all_process_energy(), Instant::now());
+    let row = report
+        .processes
+        .iter()
+        .find(|p| p.pid == pid)
+        .expect("a process at 100% CPU must be among the top processes");
+    assert!(row.alive);
+    assert!(
+        (0.1..50.0).contains(&row.power_w),
+        "implausible power for one busy core: {} W",
+        row.power_w
+    );
+    assert!(report.total_power_w >= row.power_w);
+    let (energy_mj, total_mj) = (row.energy_mj, report.total_energy_mj);
+    assert!(energy_mj > 0.0);
+
+    drop(child); // killed and reaped: the pid is gone from the next scan
+    let report = tracker.update(&read_all_process_energy(), Instant::now());
+    let row = report
+        .processes
+        .iter()
+        .find(|p| p.pid == pid)
+        .expect("an exited process stays listed for a while");
+    assert!(!row.alive);
+    assert_eq!(row.power_w, 0.0, "an exited process draws nothing");
+    assert_eq!(row.energy_mj, energy_mj, "its session energy is kept");
+    assert!(report.total_energy_mj >= total_mj);
 }

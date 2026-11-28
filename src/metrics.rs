@@ -1488,105 +1488,25 @@ impl Sampler {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                // (name, energy_nj, session_mj, delta_nj, dt_s, last_seen, disk_r, disk_w, phys_mem)
-                #[allow(clippy::type_complexity)]
-                let mut known: std::collections::HashMap<
-                    i32,
-                    (String, u64, f64, u64, f64, Instant, u64, u64, u64),
-                > = std::collections::HashMap::new();
-                let mut proc_sma: std::collections::HashMap<i32, crate::sma::TimeSma> =
-                    std::collections::HashMap::new();
-                let mut total_sma = crate::sma::TimeSma::new(5.0);
+                let mut tracker = crate::process_power::ProcessTracker::default();
                 while running.load(Ordering::Relaxed) {
-                    let cur = read_all_process_energy();
-                    let net = powermetrics::read_proc_net_counters();
+                    let scan = read_all_process_energy();
+                    // Stamp the scan before anything slower runs, so the time
+                    // between two stamps is the time the energy deltas cover.
                     let now = Instant::now();
+                    let net = powermetrics::read_proc_net_counters();
 
-                    for (&pid, sample) in &cur {
-                        let (name, energy_nj) = (&sample.name, sample.energy_nj);
-                        let (disk_r, disk_w, phys_mem) = (
-                            &sample.disk_read_bytes,
-                            &sample.disk_write_bytes,
-                            &sample.phys_mem_bytes,
-                        );
-                        let entry = known.entry(pid).or_insert_with(|| {
-                            (name.clone(), energy_nj, 0.0, 0, 0.0, now, 0u64, 0u64, 0u64)
-                        });
-                        // Detect PID reuse: name changed or energy counter reset
-                        if entry.0 != *name || energy_nj < entry.1 {
-                            *entry = (
-                                name.clone(),
-                                energy_nj,
-                                0.0,
-                                0,
-                                0.0,
-                                now,
-                                *disk_r,
-                                *disk_w,
-                                *phys_mem,
-                            );
-                            continue;
+                    let mut report = tracker.update(&scan, now);
+                    for p in &mut report.processes {
+                        if let Some(&(rx, tx)) = net.get(&p.pid) {
+                            p.net_rx_bytes = rx;
+                            p.net_tx_bytes = tx;
                         }
-                        let delta_nj = energy_nj.saturating_sub(entry.1);
-                        let dt_s = now.duration_since(entry.5).as_secs_f64();
-                        entry.0 = name.clone();
-                        entry.1 = energy_nj;
-                        entry.2 += delta_nj as f64 / 1e6;
-                        entry.3 = delta_nj;
-                        entry.4 = dt_s;
-                        entry.5 = now;
-                        entry.6 = *disk_r;
-                        entry.7 = *disk_w;
-                        entry.8 = *phys_mem;
                     }
-
-                    known.retain(|_, entry| now.duration_since(entry.5).as_secs() < 30);
-
-                    let mut procs: Vec<ProcessPower> = known
-                        .iter()
-                        .filter(|(_, entry)| entry.2 > 0.0)
-                        .map(|(&pid, entry)| {
-                            let raw_power = if entry.4 > 0.01 {
-                                (entry.3 as f64 / 1e9 / entry.4) as f32
-                            } else {
-                                0.0
-                            };
-                            let sma = proc_sma
-                                .entry(pid)
-                                .or_insert_with(|| crate::sma::TimeSma::new(5.0));
-                            sma.push(raw_power);
-                            let power_w = sma.get();
-                            let alive = cur.contains_key(&pid);
-                            let (net_rx, net_tx) = net.get(&pid).copied().unwrap_or((0, 0));
-                            ProcessPower {
-                                pid,
-                                name: entry.0.clone(),
-                                power_w,
-                                energy_mj: entry.2,
-                                alive,
-                                disk_read_bytes: entry.6,
-                                disk_write_bytes: entry.7,
-                                phys_mem_bytes: entry.8,
-                                net_rx_bytes: net_rx,
-                                net_tx_bytes: net_tx,
-                            }
-                        })
-                        .collect();
-                    proc_sma.retain(|pid, _| known.contains_key(pid));
-                    let total_raw: f32 = procs.iter().map(|p| p.power_w).sum();
-                    total_sma.push(total_raw);
-                    let total_power = total_sma.get();
-                    let total_energy: f64 = procs.iter().map(|p| p.energy_mj).sum();
-                    procs.sort_by(|a, b| {
-                        b.energy_mj
-                            .partial_cmp(&a.energy_mj)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    procs.truncate(50);
                     if let Ok(mut mg) = m.lock() {
-                        mg.all_procs_power_w = total_power;
-                        mg.all_procs_energy_mj = total_energy;
-                        mg.top_processes = procs;
+                        mg.all_procs_power_w = report.total_power_w;
+                        mg.all_procs_energy_mj = report.total_energy_mj;
+                        mg.top_processes = report.processes;
                     }
 
                     std::thread::sleep(dt);
