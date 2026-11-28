@@ -31,7 +31,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u64).range(INTERVAL_MS))]
     interval: u64,
 
-    /// Output JSON to stdout instead of TUI
+    /// Output JSON Lines to stdout instead of the TUI: one compact object per
+    /// line, one line per interval
     #[arg(long)]
     json: bool,
 
