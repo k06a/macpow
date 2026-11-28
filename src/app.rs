@@ -2609,7 +2609,8 @@ impl App {
         let reserved = visible_tree_rows + 5 + chart_slots * CHART_HEIGHT as usize;
         let proc_limit = ((self.term_height as usize).saturating_sub(reserved)).max(10);
         {
-            let sw_color = power_color(m.all_procs_power_w * 1000.0);
+            // Same watt scale as every other row (README colour legend).
+            let sw_color = power_color(m.all_procs_power_w);
             let mut sw_row = TreeRow::pw(
                 "software",
                 None,
@@ -2671,7 +2672,7 @@ impl App {
             } else if p.pid == self_pid {
                 Color::Blue
             } else {
-                power_color(p.power_w * 1000.0)
+                power_color(p.power_w)
             };
             let key = proc_row_keys[i];
             let mem_str = human_bytes(p.phys_mem_bytes as f64);
