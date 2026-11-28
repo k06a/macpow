@@ -42,6 +42,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **Temperatures** — per-component and per-core from SMC sensors (CPU, GPU, ANE, DRAM, SSD, Battery); universal bank-based key mapping for all Apple Silicon generations (M1–M5+, including Ultra dual-die); stale value caching with `~` indicator when sensors temporarily read invalid
 - **Memory** — used/total GB via `host_statistics64` Mach API
 - **Display** — brightness, panel class (SDR/HDR/XDR), refresh rate / ProMotion, live HDR-active indicator from `AppleARMBacklight` IOReport `DPB factor`, plus IOReport SoC display controller and external display power via DISPEXT
+  - `nits` is the brightness slider × the active preset's peak (1600 in "P3-1600 nits"); `panel_nits` (`panel N` in the tree) is the level the built-in panel is actually driven at, read from its framebuffer's `IOMFBBrightnessLevel`, and `null` in `--json` when no built-in panel publishes one (e.g. an external main display)
 - **Keyboard** — backlight brightness and estimated power via IORegistry PWM
 - **Battery** — voltage, amperage, charge %, time remaining, temperature, drain/charge rate
 - **SSD** — model, interconnect (Apple Fabric/PCIe), power estimation from IORegistry disk counters

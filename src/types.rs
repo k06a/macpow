@@ -224,6 +224,14 @@ pub struct DisplayInfo {
     /// Defaults to `preset_max_hdr_nits` if available, otherwise SDR cap.
     /// This is what gets displayed as the "max" in `current/peak nits`.
     pub peak_nits: f32,
+    /// Luminance the built-in panel is driven at, in nits, read from
+    /// `IOMFBBrightnessLevel` (16.16 fixed-point nits) of the built-in panel's
+    /// framebuffer. Unlike `nits` it follows auto-brightness, and it is 0
+    /// while the display sleeps if the driver publishes 0 then. `None` (JSON
+    /// `null`) when no built-in panel publishes a level (external main
+    /// display, virtual machine) or the reading is implausible (negative, not
+    /// finite, or above twice `max_nits`).
+    pub panel_nits: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

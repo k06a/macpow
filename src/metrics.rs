@@ -35,8 +35,10 @@ pub const SSD_MAX_ACTIVE_W: f32 = 2.5;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGDisplayIsBuiltin(display: u32) -> libc::boolean_t;
+    fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetIOFlags(mode: CGDisplayModeRef) -> u32;
     fn CGDisplayScreenSize(display: u32) -> CGSize;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayCopyAllDisplayModes(
@@ -162,6 +164,100 @@ pub fn read_display_linear_brightness() -> Option<f32> {
     }
 }
 
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOServiceNameMatching(name: *const i8) -> *mut libc::c_void;
+    fn IORegistryEntrySearchCFProperty(
+        entry: u32,
+        plane: *const i8,
+        key: core_foundation_sys::string::CFStringRef,
+        allocator: core_foundation_sys::base::CFAllocatorRef,
+        options: u32,
+    ) -> core_foundation_sys::base::CFTypeRef;
+}
+
+/// `kIORegistryIterateRecursively`: also search the entry's children.
+const IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
+
+/// Decode a brightness level published by the framebuffer driver: nits in
+/// 16.16 fixed point. 0 is a real reading (the panel is dark while the display
+/// sleeps). A level the driver has not set is all-ones, which arrives here as
+/// a negative number.
+fn nits_from_fixed_16_16(raw: i64) -> Option<f32> {
+    (raw >= 0).then(|| (raw as f64 / 65536.0) as f32)
+}
+
+/// Whether the main display is the Mac's own panel rather than an external
+/// display.
+fn main_display_is_builtin() -> bool {
+    // SAFETY: both functions take and return plain integers and accept any
+    // display ID, including one that is no longer online.
+    unsafe { CGDisplayIsBuiltin(CGMainDisplayID()) != 0 }
+}
+
+/// Luminance the built-in panel is driven at right now, in nits, as published
+/// by its own framebuffer driver: the `IOMFBBrightnessLevel` property below
+/// the `disp0` device node.
+///
+/// This is the only live source of real nits found so far: it follows the
+/// slider and auto-brightness and is 0 while the display sleeps, whereas
+/// AppleARMBacklight's `BrightnessMilliNits` kept one old value through all
+/// of those changes.
+///
+/// `None` when the main display is not the built-in panel (the level of
+/// `disp0` says nothing about an external display) or the driver does not
+/// publish a level.
+pub fn read_panel_nits() -> Option<f32> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    if !main_display_is_builtin() {
+        return None;
+    }
+    // SAFETY: every pointer handed to IOKit is either a NUL-terminated
+    // literal or a live CFString, and each result is checked before use.
+    // Ownership follows the documented rules: IOServiceGetMatchingService
+    // consumes the matching dictionary, the service port is released once,
+    // and the property (Create rule) is released when `value` is dropped.
+    unsafe {
+        let matching = IOServiceNameMatching(b"disp0\0".as_ptr() as *const i8);
+        if matching.is_null() {
+            return None;
+        }
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+        // The property sits on the framebuffer, a child of `disp0` whose
+        // class name differs between macOS releases, hence the search.
+        let key = CFString::new("IOMFBBrightnessLevel");
+        let value = IORegistryEntrySearchCFProperty(
+            service,
+            b"IOService\0".as_ptr() as *const i8,
+            key.as_concrete_TypeRef(),
+            std::ptr::null(),
+            IO_REGISTRY_ITERATE_RECURSIVELY,
+        );
+        IOObjectRelease(service);
+        if value.is_null() {
+            return None;
+        }
+        let value = CFType::wrap_under_create_rule(value);
+        nits_from_fixed_16_16(value.downcast::<CFNumber>()?.to_i64()?)
+    }
+}
+
+/// Whether a reading of [`read_panel_nits`] is plausible for a panel whose
+/// calibrated peak is `max_nits`: finite, not negative, and at most twice that
+/// peak. The 16.16 decoding has been confirmed on one Mac only; should another
+/// driver publish the level in other units, no number beats a wrong one. The
+/// bound is loose on purpose, so that HDR content and panel-to-panel
+/// calibration never trip it.
+fn panel_nits_plausible(nits: f32, max_nits: f32) -> bool {
+    nits.is_finite() && (0.0..=2.0 * max_nits).contains(&nits)
+}
+
 /// Classify the panel from its peak millinits into static SDR/HDR/XDR class.
 /// Thresholds: ≤500 nits → SDR, 501–999 → HDR, ≥1000 → XDR (Apple flagship mini-LED).
 pub fn classify_panel(max_nits: f32) -> PanelClass {
@@ -188,6 +284,110 @@ pub fn read_display_refresh_hz() -> f32 {
         CGDisplayModeRelease(mode);
         hz
     }
+}
+
+/// `kDisplayModeNativeFlag` (IOKit/graphics/IOGraphicsTypes.h): the mode maps
+/// one-to-one onto the panel's own pixel grid.
+const DISPLAY_MODE_NATIVE_FLAG: u32 = 0x0200_0000;
+
+/// Pixel size and IOKit flags of one display mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModePixels {
+    width: u32,
+    height: u32,
+    io_flags: u32,
+}
+
+impl ModePixels {
+    fn is_native(&self) -> bool {
+        self.io_flags & DISPLAY_MODE_NATIVE_FLAG != 0
+    }
+
+    /// # Safety
+    /// `mode` must be null or point to a live display mode.
+    unsafe fn read(mode: CGDisplayModeRef) -> Self {
+        // SAFETY: the getters only read the mode, which the caller keeps
+        // alive for the call, and all three are declared to accept null.
+        unsafe {
+            ModePixels {
+                width: CGDisplayModeGetPixelWidth(mode) as u32,
+                height: CGDisplayModeGetPixelHeight(mode) as u32,
+                io_flags: CGDisplayModeGetIOFlags(mode),
+            }
+        }
+    }
+}
+
+/// Pick the panel's own pixel grid out of a display's modes.
+///
+/// A mode's pixel size is the size its frame is rendered at. That is the
+/// panel's size only in the modes the driver flags as native; every scaled
+/// mode is rendered at another size and resampled to the panel. On a
+/// 3024 x 1964 panel the "More Space" mode renders 3600 x 2338 and a
+/// larger-text mode 2294 x 1490, so the current mode alone cannot be trusted.
+///
+/// The current mode is taken when it is flagged native. Otherwise the first
+/// flagged mode of the display is, and `all_modes` is only asked for in that
+/// case, because listing the modes costs more than reading one. A display
+/// that flags no mode at all falls back to the current mode's size, the best
+/// that is known about it.
+fn native_pixel_size(
+    current: Option<ModePixels>,
+    all_modes: impl FnOnce() -> Vec<ModePixels>,
+) -> Option<(u32, u32)> {
+    current
+        .filter(ModePixels::is_native)
+        .or_else(|| all_modes().into_iter().find(ModePixels::is_native))
+        .or(current)
+        .map(|mode| (mode.width, mode.height))
+}
+
+/// Every mode the main display offers.
+fn read_all_display_modes() -> Vec<ModePixels> {
+    // SAFETY: `CGDisplayCopyAllDisplayModes` returns null or an array we own
+    // (Copy rule), released exactly once below. Its elements are display
+    // modes that stay alive as long as the array does.
+    unsafe {
+        let modes = CGDisplayCopyAllDisplayModes(CGMainDisplayID(), std::ptr::null());
+        if modes.is_null() {
+            return Vec::new();
+        }
+        let all = (0..core_foundation_sys::array::CFArrayGetCount(modes))
+            .map(|i| {
+                let mode = core_foundation_sys::array::CFArrayGetValueAtIndex(modes, i);
+                ModePixels::read(mode as CGDisplayModeRef)
+            })
+            .collect();
+        cf_utils::cf_release(modes as _);
+        all
+    }
+}
+
+/// Width and height of the main display's panel in physical pixels
+/// (3024 x 1964 on a 14" MacBook Pro), whatever scaling the user has chosen:
+/// see [`native_pixel_size`]. This is the "Resolution" that `system_profiler`
+/// prints for an Apple panel.
+///
+/// `CGDisplayPixelsWide/High` must not be used for this: despite the name they
+/// return the current mode's size in points, which on a HiDPI ("Retina") mode
+/// is half the pixel size in each direction (1512 x 982 on the same panel).
+///
+/// `None` if the display has neither a current mode nor a native one.
+pub fn read_display_native_pixel_size() -> Option<(u32, u32)> {
+    // SAFETY: `CGDisplayCopyDisplayMode` returns either null or a mode we own
+    // (Copy rule). It is null-checked, only read while we hold it, and
+    // released exactly once.
+    let current = unsafe {
+        let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        if mode.is_null() {
+            None
+        } else {
+            let pixels = ModePixels::read(mode);
+            CGDisplayModeRelease(mode);
+            Some(pixels)
+        }
+    };
+    native_pixel_size(current, read_all_display_modes)
 }
 
 /// Detect ProMotion support by checking if any available display mode reports a
@@ -441,6 +641,141 @@ pub fn read_backlight_current() -> Option<(i64, i64)> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    fn assert_nits(actual: Option<f32>, expected: f32) {
+        let actual = actual.expect("a value, got None");
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{actual} nits, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn framebuffer_level_decodes_from_16_16_fixed_point() {
+        // Registry values of an M5 Max MacBook Pro at 73 % and 100 % slider.
+        assert_nits(nits_from_fixed_16_16(12_126_980), 185.04);
+        assert_nits(nits_from_fixed_16_16(23_592_960), 360.0);
+        // The unused external framebuffers of the same machine read 1 nit.
+        assert_nits(nits_from_fixed_16_16(65_536), 1.0);
+        // Display asleep: a real reading of darkness, not a missing one.
+        assert_eq!(nits_from_fixed_16_16(0), Some(0.0));
+        // Unset levels are published as u64::MAX.
+        assert_eq!(nits_from_fixed_16_16(u64::MAX as i64), None);
+    }
+
+    /// Calibrated peak of the XDR panel of an M5 Max MacBook Pro:
+    /// `BrightnessMilliNits.max` = 1599999.
+    const XDR_MAX_NITS: f32 = 1600.0;
+
+    #[test]
+    fn plausible_panel_readings_are_kept() {
+        // Dark (display asleep), the external framebuffers' 1 nit, a reading
+        // of that Mac, its SDR cap, its peak, and the bound itself.
+        for nits in [0.0, 1.0, 111.79, 600.0, 1600.0, 3200.0] {
+            assert!(panel_nits_plausible(nits, XDR_MAX_NITS), "{nits}");
+        }
+    }
+
+    #[test]
+    fn implausible_panel_readings_are_dropped() {
+        for nits in [
+            -1.0,
+            3200.5,
+            // That Mac's 111.79 nits, had a driver published millinits.
+            111_790.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            assert!(!panel_nits_plausible(nits, XDR_MAX_NITS), "{nits}");
+        }
+        // The bound follows the panel: twice 500 nits for a 500-nit panel.
+        assert!(panel_nits_plausible(1000.0, 500.0));
+        assert!(!panel_nits_plausible(1000.5, 500.0));
+    }
+
+    // IO flags as CoreGraphics reports them on a 14" MacBook Pro (M5 Max):
+    // valid + safe, plus the native bit on the modes that match the panel,
+    // plus the default bit on the mode macOS picks out of the box.
+    const SCALED: u32 = 0x0000_0003;
+    const NATIVE: u32 = 0x0200_0003;
+    const NATIVE_DEFAULT: u32 = 0x0200_0007;
+
+    fn mode(width: u32, height: u32, io_flags: u32) -> ModePixels {
+        ModePixels {
+            width,
+            height,
+            io_flags,
+        }
+    }
+
+    /// Pixel sizes of that Mac's mode list (`CGDisplayCopyAllDisplayModes`
+    /// with no options), one entry per size, in the order it is returned.
+    fn macbook_pro_14_modes() -> Vec<ModePixels> {
+        vec![
+            mode(1920, 1200, SCALED),
+            mode(2048, 1330, SCALED),
+            mode(2294, 1490, SCALED),
+            mode(2560, 1600, SCALED),
+            mode(2704, 1756, SCALED),
+            mode(3024, 1890, SCALED),
+            mode(3024, 1964, NATIVE),
+        ]
+    }
+
+    #[test]
+    fn native_current_mode_is_the_panel_size() {
+        // Default scaling: 1512 x 982 points rendered at 3024 x 1964. The
+        // mode list is not needed and must not be fetched.
+        let current = mode(3024, 1964, NATIVE_DEFAULT);
+        assert_eq!(
+            native_pixel_size(Some(current), || panic!("mode list was fetched")),
+            Some((3024, 1964))
+        );
+    }
+
+    #[test]
+    fn scaled_current_mode_yields_the_native_mode_of_the_list() {
+        // "More Space": 1800 x 1169 points rendered at 3600 x 2338 and
+        // resampled to the panel. Reporting the rendered size would describe
+        // a panel that does not exist.
+        let more_space = mode(3600, 2338, SCALED);
+        assert_eq!(
+            native_pixel_size(Some(more_space), macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+        // The same from the other side: 1147 x 745 points at 2294 x 1490.
+        let larger_text = mode(2294, 1490, SCALED);
+        assert_eq!(
+            native_pixel_size(Some(larger_text), macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+        // No current mode at all, but the list still knows the panel.
+        assert_eq!(
+            native_pixel_size(None, macbook_pro_14_modes),
+            Some((3024, 1964))
+        );
+    }
+
+    #[test]
+    fn without_a_native_mode_the_current_mode_is_reported() {
+        let unflagged = || vec![mode(1920, 1080, SCALED), mode(3840, 2160, SCALED)];
+        assert_eq!(
+            native_pixel_size(Some(mode(3840, 2160, SCALED)), unflagged),
+            Some((3840, 2160))
+        );
+        assert_eq!(
+            native_pixel_size(Some(mode(1920, 1080, SCALED)), Vec::new),
+            Some((1920, 1080))
+        );
+        assert_eq!(native_pixel_size(None, unflagged), None);
+        assert_eq!(native_pixel_size(None, Vec::new), None);
     }
 }
 
@@ -1387,10 +1722,16 @@ impl Sampler {
             handles.push(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     let brightness = read_display_brightness();
+                    let panel_nits =
+                        read_panel_nits().filter(|&nits| panel_nits_plausible(nits, max_nits));
                     let backlight_current = read_backlight_current();
                     let refresh_hz = read_display_refresh_hz();
+                    let pixel_size = read_display_native_pixel_size();
                     let preset = read_display_preset();
                     if let Ok(mut mg) = m.lock() {
+                        // The measured level, independent of the slider-based
+                        // `nits` below.
+                        mg.display.panel_nits = panel_nits;
                         if let Some(br) = brightness {
                             mg.display.available = true;
                             mg.display.brightness_pct = br * 100.0;
@@ -1453,8 +1794,12 @@ impl Sampler {
                                     br * MAX_DISPLAY_W
                                 };
                             let display = unsafe { CGMainDisplayID() };
-                            mg.display.width_px = unsafe { CGDisplayPixelsWide(display) } as u32;
-                            mg.display.height_px = unsafe { CGDisplayPixelsHigh(display) } as u32;
+                            // The panel's native pixels; 0 x 0 = unknown.
+                            (mg.display.width_px, mg.display.height_px) =
+                                pixel_size.unwrap_or_default();
+                            // The diagonal is derived from the panel's physical
+                            // size in millimetres, so it does not depend on
+                            // the display mode either.
                             let size_mm = unsafe { CGDisplayScreenSize(display) };
                             let diag_mm = (size_mm.width.powi(2) + size_mm.height.powi(2)).sqrt();
                             mg.display.diagonal_inches =
