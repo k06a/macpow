@@ -277,6 +277,76 @@ unsafe fn send_f64(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> f64 {
     send(obj, sel_registerName(sel.as_ptr()))
 }
 
+// ── Link carrier via SIOCGIFMEDIA ────────────────────────────────────────────
+
+/// `struct ifmediareq` from <net/if_media.h>, which is laid out under
+/// `#pragma pack(4)`. Only `name` (in) and `status` (out) are used here.
+#[repr(C, packed(4))]
+struct IfMediaReq {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    _current: libc::c_int,
+    _mask: libc::c_int,
+    status: libc::c_int,
+    _active: libc::c_int,
+    _count: libc::c_int,
+    _ulist: *mut libc::c_int,
+}
+
+/// `_IOWR('i', 56, struct ifmediareq)`.
+const SIOCGIFMEDIA: libc::c_ulong = 0xc02c_6938;
+
+// The request code carries the struct size and the kernel copies exactly that
+// many bytes in and out, so the layout above has to agree with it.
+const _: () =
+    assert!(std::mem::size_of::<IfMediaReq>() == ((SIOCGIFMEDIA >> 16) & 0x1fff) as usize);
+
+/// The driver filled in the status word.
+const IFM_AVALID: libc::c_int = 0x1;
+/// The link has carrier.
+const IFM_ACTIVE: libc::c_int = 0x2;
+
+/// What `ifconfig` prints as "status: active".
+fn media_status_is_active(status: libc::c_int) -> bool {
+    status & IFM_AVALID != 0 && status & IFM_ACTIVE != 0
+}
+
+/// True when `iface` has carrier, i.e. a peer on the other end of the link.
+///
+/// IFF_UP | IFF_RUNNING does not say that: idle Thunderbolt and USB-C (NCM)
+/// ports keep both flags set with nothing plugged in.
+fn link_is_active(iface: &str) -> bool {
+    let mut req = IfMediaReq {
+        name: [0; libc::IFNAMSIZ],
+        _current: 0,
+        _mask: 0,
+        status: 0,
+        _active: 0,
+        _count: 0,
+        _ulist: std::ptr::null_mut(),
+    };
+    // The kernel expects a NUL-terminated name, so one byte must stay zero.
+    if iface.is_empty() || iface.len() >= req.name.len() {
+        return false;
+    }
+    for (dst, src) in req.name.iter_mut().zip(iface.bytes()) {
+        *dst = src as libc::c_char;
+    }
+
+    // SAFETY: `req` is a writable `ifmediareq` of the size encoded in the
+    // request code, and with `_count == 0` the kernel does not follow
+    // `_ulist`. The socket only gives the ioctl something to be issued on;
+    // it is closed on every path that opened it.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let answered = libc::ioctl(fd, SIOCGIFMEDIA, &mut req as *mut IfMediaReq) == 0;
+        libc::close(fd);
+        answered && media_status_is_active(req.status)
+    }
+}
+
 // ── Ethernet detection via getifaddrs ─────────────────────────────────────────
 
 pub fn read_ethernet_info(wifi_iface: &str) -> EthernetInfo {
@@ -326,6 +396,11 @@ pub fn read_ethernet_info(wifi_iface: &str) -> EthernetInfo {
             let up = (flags & libc::IFF_UP as u32) != 0;
             let running = (flags & libc::IFF_RUNNING as u32) != 0;
             if !up || !running {
+                continue;
+            }
+            // UP and RUNNING are set on idle ports too; only carrier means a
+            // link. Asked last because it costs a socket and an ioctl.
+            if !link_is_active(&name) {
                 continue;
             }
             let speed_mbps = data.ifi_baudrate / 1_000_000;
@@ -462,6 +537,33 @@ pub fn read_wifi_info() -> WifiInfo {
         info.estimated_power_w = 0.1 + (1.0 - signal_quality) * 0.7;
 
         info
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn link_is_active_only_with_valid_status_and_carrier() {
+        // 0x1 is what the idle Thunderbolt / USB-C NCM ports report: the
+        // status is valid and says "no carrier".
+        assert!(!media_status_is_active(IFM_AVALID));
+        assert!(media_status_is_active(IFM_AVALID | IFM_ACTIVE));
+        // Without IFM_AVALID the driver did not fill in the other bits.
+        assert!(!media_status_is_active(IFM_ACTIVE));
+        assert!(!media_status_is_active(0));
+        // Unrelated status bits do not change the answer.
+        assert!(media_status_is_active(0x70 | IFM_AVALID | IFM_ACTIVE));
+        assert!(!media_status_is_active(0x70 | IFM_AVALID));
+    }
+
+    #[test]
+    fn link_is_active_rejects_names_the_kernel_cannot_take() {
+        assert!(!link_is_active(""));
+        // IFNAMSIZ bytes leave no room for the terminating NUL.
+        assert!(!link_is_active(&"e".repeat(libc::IFNAMSIZ)));
+        assert!(!link_is_active("no-such-if0"));
     }
 }
 
