@@ -51,7 +51,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Unit tests
-        run: cargo test --locked --lib --bins
+        run: cargo test --locked --lib --bins --test cf_utils --test cli
 
       - name: Hardware tests (informational)
         continue-on-error: true

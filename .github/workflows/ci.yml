@@ -49,13 +49,17 @@ jobs:
       # is also the command to run locally. --all-targets keeps tests/, benches/ and
       # examples/ compiling and linted.
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # The hermetic tests of the library and of the binary. tests/integration.rs reads
-      # IOReport and the SMC, which a hosted runner (a virtual machine) does not have.
-      - run: cargo test --locked --lib --bins
+      # The tests that need no hardware: the library's and the binary's unit tests, the
+      # CoreFoundation type checks and the CLI contract. tests/integration.rs and the other
+      # files in tests/ read IOReport and the SMC, which a hosted runner (a virtual
+      # machine) does not have.
+      - run: cargo test --locked --lib --bins --test cf_utils --test cli
       # The library must build without the TUI, that is without the `cli` feature.
       - run: cargo check --locked --no-default-features --lib
       - run: cargo build --release --locked
-      # Fails if the crate cannot be packaged and prints the file list `cargo publish` uploads.
+      # Packs the crate exactly as `cargo publish` would and builds it from the package,
+      # so a file missing from the include list fails here and not at release time.
+      - run: cargo package --locked
       - run: cargo package --locked --list
 
   release:

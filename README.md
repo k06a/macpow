@@ -62,8 +62,10 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 ### With cargo
 
 ```bash
-cargo install macpow
+cargo install --locked macpow
 ```
+
+`--locked` installs the dependency versions this release was tested with (see `Cargo.lock`).
 
 ### From source
 
