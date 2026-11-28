@@ -5,10 +5,22 @@ edition = "2021"
 description = "Real-time power consumption monitor for Apple Silicon Macs"
 license = "MIT"
 repository = "https://github.com/k06a/macpow"
-homepage = "https://github.com/k06a/macpow"
 keywords = ["apple-silicon", "power", "monitor", "tui", "macos"]
 categories = ["command-line-utilities", "hardware-support"]
 readme = "README.md"
+# Allow-list of what `cargo publish` uploads. Without one, cargo packages every file in the
+# directory that git does not ignore, tracked or not, so a local draft or a diagnostics dump
+# ends up on crates.io, where uploads cannot be deleted.
+include = [
+    "/src/**",
+    "/tests/**",
+    "/benches/**",
+    "/examples/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
 
 [lib]
 name = "macpow"
