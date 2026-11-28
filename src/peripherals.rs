@@ -233,9 +233,148 @@ unsafe fn list_assertions_inner() -> Option<Vec<PowerAssertion>> {
 extern "C" {}
 
 extern "C" {
-    fn objc_getClass(name: *const i8) -> *mut libc::c_void;
-    fn sel_registerName(name: *const i8) -> *mut libc::c_void;
-    fn objc_msgSend(obj: *mut libc::c_void, sel: *mut libc::c_void, ...) -> *mut libc::c_void;
+    fn objc_getClass(name: *const libc::c_char) -> *mut libc::c_void;
+    fn sel_registerName(name: *const libc::c_char) -> *mut libc::c_void;
+    // Declared without a signature on purpose, as in <objc/message.h>:
+    // objc_msgSend jumps straight into the method, so every call has to go
+    // through a pointer typed like that method (`send_obj` / `send_int` /
+    // `send_f64` below), never through a variadic prototype.
+    fn objc_msgSend();
+    fn objc_autoreleasePoolPush() -> *mut libc::c_void;
+    fn objc_autoreleasePoolPop(pool: *mut libc::c_void);
+}
+
+/// `objc_msgSend` typed as a method that takes no arguments and returns `R`.
+///
+/// The caller's prototype decides which register the result is read from (x0
+/// for pointers and integers, d0 for doubles), so `R` has to be the method's
+/// real return type. Reading a `double` through a pointer-returning prototype
+/// is how `transmitRate` used to come back as NaN.
+type MsgSend<R> = unsafe extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> R;
+
+// Safety contract shared by the three helpers below: `obj` is a live object
+// or class (or nil, which answers zero), and the method named by `sel` takes
+// no arguments and returns exactly the helper's return type.
+
+/// Sends a message whose method returns an object pointer.
+unsafe fn send_obj(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> *mut libc::c_void {
+    // SAFETY: only the pointer's type changes; per the contract above it now
+    // matches the method that objc_msgSend dispatches to.
+    let send: MsgSend<*mut libc::c_void> =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send(obj, sel_registerName(sel.as_ptr()))
+}
+
+/// Sends a message whose method returns an `NSInteger` (or an `NSInteger` enum).
+unsafe fn send_int(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> isize {
+    // SAFETY: as in `send_obj`.
+    let send: MsgSend<isize> = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send(obj, sel_registerName(sel.as_ptr()))
+}
+
+/// Sends a message whose method returns a `double`.
+unsafe fn send_f64(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> f64 {
+    // SAFETY: as in `send_obj`.
+    let send: MsgSend<f64> = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send(obj, sel_registerName(sel.as_ptr()))
+}
+
+/// Releases, when dropped, the Objective-C objects that were autoreleased
+/// while it was alive.
+///
+/// The sampler threads are plain Rust threads: nothing drains autoreleased
+/// objects for them, so without a pool every CoreWLAN call leaks its
+/// temporaries until the process exits.
+///
+/// Keep it a scoped local. Pools have to be popped in the reverse order of
+/// their creation, on the thread that pushed them; locals are dropped in
+/// reverse declaration order, and the raw pointer keeps the guard `!Send`.
+struct AutoreleasePool(*mut libc::c_void);
+
+impl AutoreleasePool {
+    fn new() -> Self {
+        // SAFETY: pushing a pool has no preconditions; the token goes back
+        // to the runtime exactly once, in `drop`.
+        Self(unsafe { objc_autoreleasePoolPush() })
+    }
+}
+
+impl Drop for AutoreleasePool {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the token of a pool pushed on this thread and
+        // not popped yet (see the type's doc comment).
+        unsafe { objc_autoreleasePoolPop(self.0) }
+    }
+}
+
+// ── Link carrier via SIOCGIFMEDIA ────────────────────────────────────────────
+
+/// `struct ifmediareq` from <net/if_media.h>, which is laid out under
+/// `#pragma pack(4)`. Only `name` (in) and `status` (out) are used here.
+#[repr(C, packed(4))]
+struct IfMediaReq {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    _current: libc::c_int,
+    _mask: libc::c_int,
+    status: libc::c_int,
+    _active: libc::c_int,
+    _count: libc::c_int,
+    _ulist: *mut libc::c_int,
+}
+
+/// `_IOWR('i', 56, struct ifmediareq)`.
+const SIOCGIFMEDIA: libc::c_ulong = 0xc02c_6938;
+
+// The request code carries the struct size and the kernel copies exactly that
+// many bytes in and out, so the layout above has to agree with it.
+const _: () =
+    assert!(std::mem::size_of::<IfMediaReq>() == ((SIOCGIFMEDIA >> 16) & 0x1fff) as usize);
+
+/// The driver filled in the status word.
+const IFM_AVALID: libc::c_int = 0x1;
+/// The link has carrier.
+const IFM_ACTIVE: libc::c_int = 0x2;
+
+/// What `ifconfig` prints as "status: active".
+fn media_status_is_active(status: libc::c_int) -> bool {
+    status & IFM_AVALID != 0 && status & IFM_ACTIVE != 0
+}
+
+/// True when `iface` has carrier, i.e. a peer on the other end of the link.
+///
+/// IFF_UP | IFF_RUNNING does not say that: idle Thunderbolt and USB-C (NCM)
+/// ports keep both flags set with nothing plugged in.
+fn link_is_active(iface: &str) -> bool {
+    let mut req = IfMediaReq {
+        name: [0; libc::IFNAMSIZ],
+        _current: 0,
+        _mask: 0,
+        status: 0,
+        _active: 0,
+        _count: 0,
+        _ulist: std::ptr::null_mut(),
+    };
+    // The kernel expects a NUL-terminated name, so one byte must stay zero.
+    if iface.is_empty() || iface.len() >= req.name.len() {
+        return false;
+    }
+    for (dst, src) in req.name.iter_mut().zip(iface.bytes()) {
+        *dst = src as libc::c_char;
+    }
+
+    // SAFETY: `req` is a writable `ifmediareq` of the size encoded in the
+    // request code, and with `_count == 0` the kernel does not follow
+    // `_ulist`. The socket only gives the ioctl something to be issued on;
+    // it is closed on every path that opened it.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let answered = libc::ioctl(fd, SIOCGIFMEDIA, &mut req as *mut IfMediaReq) == 0;
+        libc::close(fd);
+        answered && media_status_is_active(req.status)
+    }
 }
 
 // ── Ethernet detection via getifaddrs ─────────────────────────────────────────
@@ -289,6 +428,11 @@ pub fn read_ethernet_info(wifi_iface: &str) -> EthernetInfo {
             if !up || !running {
                 continue;
             }
+            // UP and RUNNING are set on idle ports too; only carrier means a
+            // link. Asked last because it costs a socket and an ioctl.
+            if !link_is_active(&name) {
+                continue;
+            }
             let speed_mbps = data.ifi_baudrate / 1_000_000;
             if best.is_none() || speed_mbps > best.as_ref().unwrap().1 {
                 best = Some((name.into_owned(), speed_mbps));
@@ -322,18 +466,15 @@ fn phy_mode_str(mode: i64) -> &'static str {
     }
 }
 
-fn read_wifi_ssid_ipconfig(iface_name: &str) -> Option<String> {
-    let output = command_output_timeout(
-        "ipconfig",
-        &["getsummary", iface_name],
-        std::time::Duration::from_millis(1000),
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
+/// The network name in the output of `ipconfig getsummary`, if it has one.
+fn parse_ipconfig_ssid(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(ssid) = trimmed.strip_prefix("SSID : ") {
             let s = ssid.trim().to_string();
-            if !s.is_empty() {
+            // macOS prints this placeholder instead of the name to callers
+            // without Location permission. It means "unknown".
+            if !s.is_empty() && s != "<redacted>" {
                 return Some(s);
             }
         }
@@ -341,57 +482,122 @@ fn read_wifi_ssid_ipconfig(iface_name: &str) -> Option<String> {
     None
 }
 
+fn read_wifi_ssid_ipconfig(iface_name: &str) -> Option<String> {
+    // Absolute path, so the answer does not depend on the caller's PATH.
+    let output = command_output_timeout(
+        "/usr/sbin/ipconfig",
+        &["getsummary", iface_name],
+        std::time::Duration::from_millis(1000),
+    )?;
+    parse_ipconfig_ssid(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// How long one `ipconfig` answer is reused. The SSID only goes into the JSON
+/// output, so a stale name for half a minute after a silent roam is harmless,
+/// while asking on every tick meant about four process spawns a second.
+const SSID_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wi-Fi source for the periodic sampler. It holds the one thing the reads
+/// have to remember between ticks: the last `ipconfig` SSID answer.
+#[derive(Default)]
+pub struct WifiReader {
+    /// When `ipconfig` was last asked and what it answered ("" = unknown).
+    ssid_lookup: Option<(std::time::Instant, String)>,
+}
+
+impl WifiReader {
+    /// The current Wi-Fi state.
+    pub fn read(&mut self) -> WifiInfo {
+        let mut info = read_wifi_corewlan();
+        self.fill_ssid(
+            &mut info,
+            std::time::Instant::now(),
+            read_wifi_ssid_ipconfig,
+        );
+        info
+    }
+
+    /// Completes `info.ssid` when CoreWLAN withheld it, running `lookup` at
+    /// most once per `SSID_REFRESH` for as long as the link stays up.
+    fn fill_ssid(
+        &mut self,
+        info: &mut WifiInfo,
+        now: std::time::Instant,
+        lookup: impl FnOnce(&str) -> Option<String>,
+    ) {
+        if !info.connected {
+            // The next association may be with another network: ask again then.
+            self.ssid_lookup = None;
+        } else if info.ssid.is_empty() {
+            match &self.ssid_lookup {
+                Some((asked, answer)) if now.duration_since(*asked) < SSID_REFRESH => {
+                    info.ssid = answer.clone();
+                }
+                _ => {
+                    info.ssid = lookup(&info.interface_name).unwrap_or_default();
+                    self.ssid_lookup = Some((now, info.ssid.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// One-off Wi-Fi snapshot. A periodic caller should keep a `WifiReader`
+/// instead, so that the SSID fallback is not run again on every call.
 pub fn read_wifi_info() -> WifiInfo {
+    WifiReader::default().read()
+}
+
+/// What CoreWLAN and the link state say. `ssid` stays empty when macOS
+/// withholds it.
+fn read_wifi_corewlan() -> WifiInfo {
+    // Declared first, so it is dropped last: by then everything CoreWLAN
+    // returned has been copied into the owned `WifiInfo` that is handed back.
+    let _pool = AutoreleasePool::new();
+
+    // SAFETY: every message goes to a class or object that was just obtained
+    // and checked for nil, through the helper matching the return type the
+    // CoreWLAN headers declare for that method (object, NSInteger or double).
     unsafe {
         let no_hardware = WifiInfo {
             phy_mode: "none".into(),
             ..Default::default()
         };
 
-        let cls = objc_getClass(b"CWWiFiClient\0".as_ptr() as _);
+        let cls = objc_getClass(c"CWWiFiClient".as_ptr());
         if cls.is_null() {
             return no_hardware;
         }
-        let sel_shared = sel_registerName(b"sharedWiFiClient\0".as_ptr() as _);
-        let client = objc_msgSend(cls, sel_shared);
+        let client = send_obj(cls, c"sharedWiFiClient");
         if client.is_null() {
             return no_hardware;
         }
-        let sel_iface = sel_registerName(b"interface\0".as_ptr() as _);
-        let iface = objc_msgSend(client, sel_iface);
+        let iface = send_obj(client, c"interface");
         if iface.is_null() {
             return no_hardware;
         }
 
-        // Get the actual interface name (e.g. en0 on laptops, en1 on Mac Studio)
-        // so the ipconfig fallback queries the right interface.
-        let sel_iface_name = sel_registerName(b"interfaceName\0".as_ptr() as _);
-        let iface_name_ns = objc_msgSend(iface, sel_iface_name);
+        // Get the actual interface name (e.g. en0 on laptops, en1 on Mac Studio).
+        let iface_name_ns = send_obj(iface, c"interfaceName");
         let iface_name = if !iface_name_ns.is_null() {
             cf_utils::cfstring_to_string(iface_name_ns as _).unwrap_or_default()
         } else {
             String::new()
         };
 
-        // ssid requires location permission (nil for unsigned binaries since Sonoma)
-        // Fall back to ipconfig getsummary for SSID
-        let sel_ssid = sel_registerName(b"ssid\0".as_ptr() as _);
-        let ssid_ns = objc_msgSend(iface, sel_ssid);
-        let ssid = if !ssid_ns.is_null() {
-            cf_utils::cfstring_to_string(ssid_ns as _).unwrap_or_default()
-        } else if !iface_name.is_empty() {
-            read_wifi_ssid_ipconfig(&iface_name).unwrap_or_default()
-        } else {
-            read_wifi_ssid_ipconfig("en0").unwrap_or_default()
-        };
-
-        let connected = !ssid.is_empty();
-        if !connected {
+        // Associated or not is a property of the link, not of the name: the
+        // SSID is withheld without Location permission while the link is up.
+        if !link_is_active(&iface_name) {
             return WifiInfo {
                 interface_name: iface_name,
                 ..Default::default()
             };
         }
+
+        // ssid requires location permission (nil for unsigned binaries since
+        // Sonoma); `WifiReader` then falls back to ipconfig getsummary.
+        let ssid_ns = send_obj(iface, c"ssid");
+        let ssid = cf_utils::cfstring_to_string(ssid_ns as _).unwrap_or_default();
 
         let mut info = WifiInfo {
             connected: true,
@@ -400,27 +606,15 @@ pub fn read_wifi_info() -> WifiInfo {
             ..Default::default()
         };
 
-        let sel_rssi = sel_registerName(b"rssiValue\0".as_ptr() as _);
-        info.rssi_dbm = objc_msgSend(iface, sel_rssi) as i64 as i32;
+        info.rssi_dbm = send_int(iface, c"rssiValue") as i32;
+        info.noise_dbm = send_int(iface, c"noiseMeasurement") as i32;
+        info.tx_rate_mbps = send_f64(iface, c"transmitRate") as f32;
+        info.phy_mode = phy_mode_str(send_int(iface, c"activePHYMode") as i64).to_string();
 
-        let sel_noise = sel_registerName(b"noiseMeasurement\0".as_ptr() as _);
-        info.noise_dbm = objc_msgSend(iface, sel_noise) as i64 as i32;
-
-        let sel_tx = sel_registerName(b"transmitRate\0".as_ptr() as _);
-        let tx_raw = objc_msgSend(iface, sel_tx) as u64;
-        info.tx_rate_mbps = f64::from_bits(tx_raw) as f32;
-
-        let sel_phy = sel_registerName(b"activePHYMode\0".as_ptr() as _);
-        let phy_mode = objc_msgSend(iface, sel_phy) as i64;
-        info.phy_mode = phy_mode_str(phy_mode).to_string();
-
-        let sel_chan = sel_registerName(b"wlanChannel\0".as_ptr() as _);
-        let channel = objc_msgSend(iface, sel_chan);
+        let channel = send_obj(iface, c"wlanChannel");
         if !channel.is_null() {
-            let sel_num = sel_registerName(b"channelNumber\0".as_ptr() as _);
-            let sel_band = sel_registerName(b"channelBand\0".as_ptr() as _);
-            let ch_num = objc_msgSend(channel, sel_num) as i64;
-            let ch_band = objc_msgSend(channel, sel_band) as i64;
+            let ch_num = send_int(channel, c"channelNumber");
+            let ch_band = send_int(channel, c"channelBand");
             let band_str = match ch_band {
                 1 => "2GHz",
                 2 => "5GHz",
@@ -439,6 +633,167 @@ pub fn read_wifi_info() -> WifiInfo {
         info.estimated_power_w = 0.1 + (1.0 - signal_quality) * 0.7;
 
         info
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn link_is_active_only_with_valid_status_and_carrier() {
+        // 0x1 is what the idle Thunderbolt / USB-C NCM ports report: the
+        // status is valid and says "no carrier".
+        assert!(!media_status_is_active(IFM_AVALID));
+        assert!(media_status_is_active(IFM_AVALID | IFM_ACTIVE));
+        // Without IFM_AVALID the driver did not fill in the other bits.
+        assert!(!media_status_is_active(IFM_ACTIVE));
+        assert!(!media_status_is_active(0));
+        // Unrelated status bits do not change the answer.
+        assert!(media_status_is_active(0x70 | IFM_AVALID | IFM_ACTIVE));
+        assert!(!media_status_is_active(0x70 | IFM_AVALID));
+    }
+
+    #[test]
+    fn link_is_active_rejects_names_the_kernel_cannot_take() {
+        assert!(!link_is_active(""));
+        // IFNAMSIZ bytes leave no room for the terminating NUL.
+        assert!(!link_is_active(&"e".repeat(libc::IFNAMSIZ)));
+        assert!(!link_is_active("no-such-if0"));
+    }
+
+    #[test]
+    fn autorelease_pool_releases_its_objects_on_drop() {
+        extern "C" {
+            fn objc_storeWeak(
+                location: *mut *mut libc::c_void,
+                obj: *mut libc::c_void,
+            ) -> *mut libc::c_void;
+            fn objc_loadWeak(location: *mut *mut libc::c_void) -> *mut libc::c_void;
+            fn objc_destroyWeak(location: *mut *mut libc::c_void);
+        }
+
+        // SAFETY: NSObject's alloc, init and autorelease all return an
+        // object pointer, and `weak` is a live weak-reference slot from
+        // objc_storeWeak until objc_destroyWeak.
+        unsafe {
+            let mut weak: *mut libc::c_void = std::ptr::null_mut();
+            {
+                let _pool = AutoreleasePool::new();
+                let class = objc_getClass(c"NSObject".as_ptr());
+                let obj = send_obj(send_obj(class, c"alloc"), c"init");
+                objc_storeWeak(&mut weak, obj);
+                // Hand the only strong reference over to the pool.
+                send_obj(obj, c"autorelease");
+                assert!(!objc_loadWeak(&mut weak).is_null());
+            }
+            let outlived_the_pool = !objc_loadWeak(&mut weak).is_null();
+            objc_destroyWeak(&mut weak);
+            assert!(!outlived_the_pool);
+        }
+    }
+
+    /// `ipconfig getsummary` output, cut down to its top-level Wi-Fi keys.
+    fn ipconfig_summary(bssid: &str, ssid: &str) -> String {
+        format!(
+            "<dictionary> {{\n  BSSID : {bssid}\n  InterfaceType : WiFi\n  \
+             LinkStatusActive : TRUE\n  SSID : {ssid}\n  Security : WPA3_SAE\n}}\n"
+        )
+    }
+
+    #[test]
+    fn ipconfig_ssid_is_parsed() {
+        let summary = ipconfig_summary("11:22:33:44:55:66", "Home Network");
+        assert_eq!(
+            parse_ipconfig_ssid(&summary).as_deref(),
+            Some("Home Network")
+        );
+        assert_eq!(parse_ipconfig_ssid(&ipconfig_summary("", "")), None);
+        assert_eq!(parse_ipconfig_ssid("  InterfaceType : WiFi\n"), None);
+    }
+
+    #[test]
+    fn redacted_ipconfig_ssid_is_unknown() {
+        // What macOS 27 answers to a caller without Location permission.
+        let summary = ipconfig_summary("<redacted>", "<redacted>");
+        assert_eq!(parse_ipconfig_ssid(&summary), None);
+    }
+
+    fn connected_wifi(ssid: &str) -> WifiInfo {
+        WifiInfo {
+            connected: true,
+            interface_name: "en0".into(),
+            ssid: ssid.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ssid_lookup_runs_once_per_refresh_period() {
+        let mut reader = WifiReader::default();
+        let start = std::time::Instant::now();
+        let mut lookups = 0;
+        // One minute of sampling at the default 250 ms interval.
+        for tick in 0..240 {
+            let mut info = connected_wifi("");
+            let now = start + std::time::Duration::from_millis(250 * tick);
+            reader.fill_ssid(&mut info, now, |iface| {
+                assert_eq!(iface, "en0");
+                lookups += 1;
+                Some("Home Network".into())
+            });
+            assert_eq!(info.ssid, "Home Network", "tick {tick}");
+        }
+        // At 0 s and at 30 s; it used to be once per tick.
+        assert_eq!(lookups, 2);
+    }
+
+    #[test]
+    fn unknown_ssid_is_remembered_too() {
+        let mut reader = WifiReader::default();
+        let start = std::time::Instant::now();
+        let mut lookups = 0;
+        for tick in 0..100 {
+            let mut info = connected_wifi("");
+            let now = start + std::time::Duration::from_millis(250 * tick);
+            reader.fill_ssid(&mut info, now, |_| {
+                lookups += 1;
+                None
+            });
+            // No name is not "disconnected".
+            assert!(info.connected);
+            assert_eq!(info.ssid, "");
+        }
+        assert_eq!(lookups, 1);
+    }
+
+    #[test]
+    fn ssid_is_looked_up_again_after_the_link_drops() {
+        let mut reader = WifiReader::default();
+        let now = std::time::Instant::now();
+
+        let mut info = connected_wifi("");
+        reader.fill_ssid(&mut info, now, |_| Some("Home Network".into()));
+        assert_eq!(info.ssid, "Home Network");
+
+        let mut down = WifiInfo::default();
+        reader.fill_ssid(&mut down, now, |_| panic!("no lookup without a link"));
+        assert_eq!(down.ssid, "");
+
+        // Well inside the refresh period, but it may be another network now.
+        let mut info = connected_wifi("");
+        reader.fill_ssid(&mut info, now, |_| Some("Office".into()));
+        assert_eq!(info.ssid, "Office");
+    }
+
+    #[test]
+    fn ssid_from_corewlan_needs_no_lookup() {
+        let mut reader = WifiReader::default();
+        let mut info = connected_wifi("Home Network");
+        reader.fill_ssid(&mut info, std::time::Instant::now(), |_| {
+            panic!("CoreWLAN already answered")
+        });
+        assert_eq!(info.ssid, "Home Network");
     }
 }
 

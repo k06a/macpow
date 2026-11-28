@@ -1446,8 +1446,9 @@ impl Sampler {
         {
             let m = shared.clone();
             let running = running.clone();
+            let mut wifi_reader = peripherals::WifiReader::default();
             spawn_periodic(&mut handles, &running, dt, move || {
-                let wifi = peripherals::read_wifi_info();
+                let wifi = wifi_reader.read();
                 let ethernet = peripherals::read_ethernet_info(&wifi.interface_name);
                 if let Ok(mut mg) = m.lock() {
                     mg.wifi = wifi;
