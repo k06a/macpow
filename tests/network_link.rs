@@ -6,7 +6,7 @@
 //!
 //! Run with: cargo test --test network_link -- --test-threads=1
 
-use macpow::peripherals::{read_ethernet_info, read_wifi_info};
+use macpow::peripherals::{read_ethernet_info, read_wifi_info, WifiReader};
 use std::process::Command;
 
 /// Names of all `en*` interfaces, from `ifconfig -l`.
@@ -113,4 +113,45 @@ fn wifi_tx_rate_is_a_real_rate() {
     } else {
         assert_eq!(wifi.tx_rate_mbps, 0.0);
     }
+}
+
+/// Memory this process is charged for, in bytes (Activity Monitor's "Memory").
+fn phys_footprint() -> u64 {
+    // SAFETY: an all-zero `rusage_info_v2` is a valid value, and it is the
+    // buffer layout that RUSAGE_INFO_V2 asks the kernel to fill in.
+    unsafe {
+        let mut info: libc::rusage_info_v2 = std::mem::zeroed();
+        let rc = libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V2,
+            &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        );
+        assert_eq!(rc, 0, "proc_pid_rusage failed");
+        info.ri_phys_footprint
+    }
+}
+
+#[test]
+fn wifi_reads_do_not_leak() {
+    // A test thread is like a sampler thread: nobody drains autoreleased
+    // Objective-C objects for it.
+    let mut reader = WifiReader::default();
+    // One-time costs first: the XPC connection, selector and class caches.
+    for _ in 0..50 {
+        reader.read();
+    }
+
+    // A read takes about 10 ms, so the loop is kept short.
+    const READS: u64 = 400;
+    let before = phys_footprint();
+    for _ in 0..READS {
+        reader.read();
+    }
+    let grown = phys_footprint().saturating_sub(before);
+    // Without a pool a read leaks about 1.7 KB of CoreWLAN temporaries;
+    // with one the footprint moves by a few pages at most.
+    assert!(
+        grown < READS * 400,
+        "footprint grew by {grown} bytes over {READS} reads"
+    );
 }

@@ -240,6 +240,8 @@ extern "C" {
     // through a pointer typed like that method (`send_obj` / `send_int` /
     // `send_f64` below), never through a variadic prototype.
     fn objc_msgSend();
+    fn objc_autoreleasePoolPush() -> *mut libc::c_void;
+    fn objc_autoreleasePoolPop(pool: *mut libc::c_void);
 }
 
 /// `objc_msgSend` typed as a method that takes no arguments and returns `R`.
@@ -275,6 +277,34 @@ unsafe fn send_f64(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> f64 {
     // SAFETY: as in `send_obj`.
     let send: MsgSend<f64> = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(obj, sel_registerName(sel.as_ptr()))
+}
+
+/// Releases, when dropped, the Objective-C objects that were autoreleased
+/// while it was alive.
+///
+/// The sampler threads are plain Rust threads: nothing drains autoreleased
+/// objects for them, so without a pool every CoreWLAN call leaks its
+/// temporaries until the process exits.
+///
+/// Keep it a scoped local. Pools have to be popped in the reverse order of
+/// their creation, on the thread that pushed them; locals are dropped in
+/// reverse declaration order, and the raw pointer keeps the guard `!Send`.
+struct AutoreleasePool(*mut libc::c_void);
+
+impl AutoreleasePool {
+    fn new() -> Self {
+        // SAFETY: pushing a pool has no preconditions; the token goes back
+        // to the runtime exactly once, in `drop`.
+        Self(unsafe { objc_autoreleasePoolPush() })
+    }
+}
+
+impl Drop for AutoreleasePool {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the token of a pool pushed on this thread and
+        // not popped yet (see the type's doc comment).
+        unsafe { objc_autoreleasePoolPop(self.0) }
+    }
 }
 
 // ── Link carrier via SIOCGIFMEDIA ────────────────────────────────────────────
@@ -521,6 +551,10 @@ pub fn read_wifi_info() -> WifiInfo {
 /// What CoreWLAN and the link state say. `ssid` stays empty when macOS
 /// withholds it.
 fn read_wifi_corewlan() -> WifiInfo {
+    // Declared first, so it is dropped last: by then everything CoreWLAN
+    // returned has been copied into the owned `WifiInfo` that is handed back.
+    let _pool = AutoreleasePool::new();
+
     // SAFETY: every message goes to a class or object that was just obtained
     // and checked for nil, through the helper matching the return type the
     // CoreWLAN headers declare for that method (object, NSInteger or double).
@@ -626,6 +660,37 @@ mod network_tests {
         // IFNAMSIZ bytes leave no room for the terminating NUL.
         assert!(!link_is_active(&"e".repeat(libc::IFNAMSIZ)));
         assert!(!link_is_active("no-such-if0"));
+    }
+
+    #[test]
+    fn autorelease_pool_releases_its_objects_on_drop() {
+        extern "C" {
+            fn objc_storeWeak(
+                location: *mut *mut libc::c_void,
+                obj: *mut libc::c_void,
+            ) -> *mut libc::c_void;
+            fn objc_loadWeak(location: *mut *mut libc::c_void) -> *mut libc::c_void;
+            fn objc_destroyWeak(location: *mut *mut libc::c_void);
+        }
+
+        // SAFETY: NSObject's alloc, init and autorelease all return an
+        // object pointer, and `weak` is a live weak-reference slot from
+        // objc_storeWeak until objc_destroyWeak.
+        unsafe {
+            let mut weak: *mut libc::c_void = std::ptr::null_mut();
+            {
+                let _pool = AutoreleasePool::new();
+                let class = objc_getClass(c"NSObject".as_ptr());
+                let obj = send_obj(send_obj(class, c"alloc"), c"init");
+                objc_storeWeak(&mut weak, obj);
+                // Hand the only strong reference over to the pool.
+                send_obj(obj, c"autorelease");
+                assert!(!objc_loadWeak(&mut weak).is_null());
+            }
+            let outlived_the_pool = !objc_loadWeak(&mut weak).is_null();
+            objc_destroyWeak(&mut weak);
+            assert!(!outlived_the_pool);
+        }
     }
 
     /// `ipconfig getsummary` output, cut down to its top-level Wi-Fi keys.
