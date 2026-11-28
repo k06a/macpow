@@ -1121,6 +1121,7 @@ impl Sampler {
                     return;
                 };
                 let mut prev = ior.sample().ok();
+                let mut stall = crate::types::StallDetector::default();
                 // Remembers across ticks whether the Energy Model is gated
                 // (macOS 27+) and which live source replaces it.
                 let mut estimator = ior.estimator();
@@ -1134,11 +1135,13 @@ impl Sampler {
                         if let Some(ref p) = prev {
                             if let Ok(raw) = ior.parse_raw(p, &cur) {
                                 let mut soc = estimator.assemble(raw);
+                                let stalled = stall.update(&soc, dt.as_millis() as u64);
                                 if let Ok(mut mg) = m.lock() {
                                     // The SMC thread owns these two fields.
                                     soc.gpu_util_renderer = mg.soc.gpu_util_renderer;
                                     soc.gpu_util_tiler = mg.soc.gpu_util_tiler;
                                     mg.soc = soc;
+                                    mg.energy_counters_stalled = stalled;
                                     let dpb = backlight.dpb_factor();
                                     mg.display.dpb_factor = dpb;
                                     // Treat anything materially above 1.0 as

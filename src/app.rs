@@ -3094,7 +3094,7 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let footer = Paragraph::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled(" q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit  "),
             Span::styled("r", Style::default().fg(Color::Yellow)),
@@ -3107,15 +3107,27 @@ impl App {
             Span::raw(" tree  "),
             Span::styled("space", Style::default().fg(Color::Yellow)),
             Span::raw(" pin    "),
-            Span::styled("■", Style::default().fg(Color::Rgb(46, 139, 87))),
-            Span::raw("<1W "),
-            Span::styled("■", Style::default().fg(Color::Rgb(220, 180, 0))),
-            Span::raw("<5W "),
-            Span::styled("■", Style::default().fg(Color::Rgb(255, 140, 0))),
-            Span::raw("<10W "),
-            Span::styled("■", Style::default().fg(Color::Rgb(255, 50, 50))),
-            Span::raw("≥10W"),
-        ]));
+        ];
+        if self.metrics.energy_counters_stalled {
+            // The color legend is meaningless when CPU/DRAM read 0 W, so the
+            // warning takes its place.
+            spans.push(Span::styled(
+                "⚠ SoC energy counters stalled: CPU/DRAM 0 W is not real (see README)",
+                Style::default().fg(Color::Rgb(255, 50, 50)),
+            ));
+        } else {
+            spans.extend([
+                Span::styled("■", Style::default().fg(Color::Rgb(46, 139, 87))),
+                Span::raw("<1W "),
+                Span::styled("■", Style::default().fg(Color::Rgb(220, 180, 0))),
+                Span::raw("<5W "),
+                Span::styled("■", Style::default().fg(Color::Rgb(255, 140, 0))),
+                Span::raw("<10W "),
+                Span::styled("■", Style::default().fg(Color::Rgb(255, 50, 50))),
+                Span::raw("≥10W"),
+            ]);
+        }
+        let footer = Paragraph::new(Line::from(spans));
         f.render_widget(footer, area);
     }
 }
