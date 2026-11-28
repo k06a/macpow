@@ -1480,7 +1480,9 @@ impl Sampler {
                 if let Ok(mut mg) = m.lock() {
                     mg.usb_devices = usb;
                     mg.power_assertions = asserts;
-                    mg.usb_power_out_w = usb_ports.iter().map(|p| p.power_w).sum();
+                    // Not `.sum()`: a float sum over no ports is -0.0, which
+                    // JSON prints as "-0.0".
+                    mg.usb_power_out_w = usb_ports.iter().fold(0.0, |w, p| w + p.power_w);
                     mg.usb_power_per_port = usb_ports;
                 }
             });
