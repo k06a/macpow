@@ -278,7 +278,11 @@ pub struct ProcessReport {
     /// Top processes by session energy, highest first. Network counters are
     /// left at zero; the tracker does not know them.
     pub processes: Vec<ProcessPower>,
-    /// Power of all tracked processes together, averaged like each process's.
+    /// Power of all tracked processes together: their energy over the last
+    /// [`POWER_WINDOW`] divided by that whole window. A process's own power is
+    /// divided only by the part of the window it has been seen in, so for one
+    /// window after a process appears the total counts it at less than its
+    /// row (and for one window after it exits, at more).
     pub total_power_w: f32,
     /// Energy of all tracked processes since the tracker started. Never
     /// decreases, also not when exited processes are forgotten.
@@ -594,6 +598,27 @@ mod tests {
             assert_eq!(row(&report, 1).unwrap().energy_mj, 2000.0);
         }
         assert_eq!(report.total_power_w, 1.0);
+    }
+
+    #[test]
+    fn total_catches_up_with_a_new_process_within_one_window() {
+        let at = clock();
+        let mut tracker = ProcessTracker::default();
+        // An idle process for ten seconds, then one drawing 2 W appears.
+        for sec in 0..10 {
+            tracker.update(&scan(&[(1, "idle", J)]), at(sec as f64));
+        }
+        let report = tracker.update(&scan(&[(1, "idle", J), (2, "new", 0)]), at(10.0));
+        assert!(row(&report, 2).is_none(), "first sight sets the baseline");
+
+        let report = tracker.update(&scan(&[(1, "idle", J), (2, "new", 2 * J)]), at(11.0));
+        // The row is its true rate; the total spreads 2 J over the 5 s window.
+        assert_eq!(row(&report, 2).unwrap().power_w, 2.0);
+        assert_eq!(report.total_power_w, 0.4);
+
+        let report = tracker.update(&scan(&[(1, "idle", J), (2, "new", 10 * J)]), at(15.0));
+        assert_eq!(row(&report, 2).unwrap().power_w, 2.0);
+        assert_eq!(report.total_power_w, 2.0);
     }
 
     #[test]
