@@ -233,9 +233,48 @@ unsafe fn list_assertions_inner() -> Option<Vec<PowerAssertion>> {
 extern "C" {}
 
 extern "C" {
-    fn objc_getClass(name: *const i8) -> *mut libc::c_void;
-    fn sel_registerName(name: *const i8) -> *mut libc::c_void;
-    fn objc_msgSend(obj: *mut libc::c_void, sel: *mut libc::c_void, ...) -> *mut libc::c_void;
+    fn objc_getClass(name: *const libc::c_char) -> *mut libc::c_void;
+    fn sel_registerName(name: *const libc::c_char) -> *mut libc::c_void;
+    // Declared without a signature on purpose, as in <objc/message.h>:
+    // objc_msgSend jumps straight into the method, so every call has to go
+    // through a pointer typed like that method (`send_obj` / `send_int` /
+    // `send_f64` below), never through a variadic prototype.
+    fn objc_msgSend();
+}
+
+/// `objc_msgSend` typed as a method that takes no arguments and returns `R`.
+///
+/// The caller's prototype decides which register the result is read from (x0
+/// for pointers and integers, d0 for doubles), so `R` has to be the method's
+/// real return type. Reading a `double` through a pointer-returning prototype
+/// is how `transmitRate` used to come back as NaN.
+type MsgSend<R> = unsafe extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> R;
+
+// Safety contract shared by the three helpers below: `obj` is a live object
+// or class (or nil, which answers zero), and the method named by `sel` takes
+// no arguments and returns exactly the helper's return type.
+
+/// Sends a message whose method returns an object pointer.
+unsafe fn send_obj(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> *mut libc::c_void {
+    // SAFETY: only the pointer's type changes; per the contract above it now
+    // matches the method that objc_msgSend dispatches to.
+    let send: MsgSend<*mut libc::c_void> =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send(obj, sel_registerName(sel.as_ptr()))
+}
+
+/// Sends a message whose method returns an `NSInteger` (or an `NSInteger` enum).
+unsafe fn send_int(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> isize {
+    // SAFETY: as in `send_obj`.
+    let send: MsgSend<isize> = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send(obj, sel_registerName(sel.as_ptr()))
+}
+
+/// Sends a message whose method returns a `double`.
+unsafe fn send_f64(obj: *mut libc::c_void, sel: &std::ffi::CStr) -> f64 {
+    // SAFETY: as in `send_obj`.
+    let send: MsgSend<f64> = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send(obj, sel_registerName(sel.as_ptr()))
 }
 
 // ── Ethernet detection via getifaddrs ─────────────────────────────────────────
@@ -348,25 +387,22 @@ pub fn read_wifi_info() -> WifiInfo {
             ..Default::default()
         };
 
-        let cls = objc_getClass(b"CWWiFiClient\0".as_ptr() as _);
+        let cls = objc_getClass(c"CWWiFiClient".as_ptr());
         if cls.is_null() {
             return no_hardware;
         }
-        let sel_shared = sel_registerName(b"sharedWiFiClient\0".as_ptr() as _);
-        let client = objc_msgSend(cls, sel_shared);
+        let client = send_obj(cls, c"sharedWiFiClient");
         if client.is_null() {
             return no_hardware;
         }
-        let sel_iface = sel_registerName(b"interface\0".as_ptr() as _);
-        let iface = objc_msgSend(client, sel_iface);
+        let iface = send_obj(client, c"interface");
         if iface.is_null() {
             return no_hardware;
         }
 
         // Get the actual interface name (e.g. en0 on laptops, en1 on Mac Studio)
         // so the ipconfig fallback queries the right interface.
-        let sel_iface_name = sel_registerName(b"interfaceName\0".as_ptr() as _);
-        let iface_name_ns = objc_msgSend(iface, sel_iface_name);
+        let iface_name_ns = send_obj(iface, c"interfaceName");
         let iface_name = if !iface_name_ns.is_null() {
             cf_utils::cfstring_to_string(iface_name_ns as _).unwrap_or_default()
         } else {
@@ -375,8 +411,7 @@ pub fn read_wifi_info() -> WifiInfo {
 
         // ssid requires location permission (nil for unsigned binaries since Sonoma)
         // Fall back to ipconfig getsummary for SSID
-        let sel_ssid = sel_registerName(b"ssid\0".as_ptr() as _);
-        let ssid_ns = objc_msgSend(iface, sel_ssid);
+        let ssid_ns = send_obj(iface, c"ssid");
         let ssid = if !ssid_ns.is_null() {
             cf_utils::cfstring_to_string(ssid_ns as _).unwrap_or_default()
         } else if !iface_name.is_empty() {
@@ -400,27 +435,15 @@ pub fn read_wifi_info() -> WifiInfo {
             ..Default::default()
         };
 
-        let sel_rssi = sel_registerName(b"rssiValue\0".as_ptr() as _);
-        info.rssi_dbm = objc_msgSend(iface, sel_rssi) as i64 as i32;
+        info.rssi_dbm = send_int(iface, c"rssiValue") as i32;
+        info.noise_dbm = send_int(iface, c"noiseMeasurement") as i32;
+        info.tx_rate_mbps = send_f64(iface, c"transmitRate") as f32;
+        info.phy_mode = phy_mode_str(send_int(iface, c"activePHYMode") as i64).to_string();
 
-        let sel_noise = sel_registerName(b"noiseMeasurement\0".as_ptr() as _);
-        info.noise_dbm = objc_msgSend(iface, sel_noise) as i64 as i32;
-
-        let sel_tx = sel_registerName(b"transmitRate\0".as_ptr() as _);
-        let tx_raw = objc_msgSend(iface, sel_tx) as u64;
-        info.tx_rate_mbps = f64::from_bits(tx_raw) as f32;
-
-        let sel_phy = sel_registerName(b"activePHYMode\0".as_ptr() as _);
-        let phy_mode = objc_msgSend(iface, sel_phy) as i64;
-        info.phy_mode = phy_mode_str(phy_mode).to_string();
-
-        let sel_chan = sel_registerName(b"wlanChannel\0".as_ptr() as _);
-        let channel = objc_msgSend(iface, sel_chan);
+        let channel = send_obj(iface, c"wlanChannel");
         if !channel.is_null() {
-            let sel_num = sel_registerName(b"channelNumber\0".as_ptr() as _);
-            let sel_band = sel_registerName(b"channelBand\0".as_ptr() as _);
-            let ch_num = objc_msgSend(channel, sel_num) as i64;
-            let ch_band = objc_msgSend(channel, sel_band) as i64;
+            let ch_num = send_int(channel, c"channelNumber");
+            let ch_band = send_int(channel, c"channelBand");
             let band_str = match ch_band {
                 1 => "2GHz",
                 2 => "5GHz",
