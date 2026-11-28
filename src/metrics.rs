@@ -913,39 +913,15 @@ pub fn read_mem_used_gb() -> f32 {
     (mem_used_pages(&vm) * page_size as u64) as f32 / (1024.0 * 1024.0 * 1024.0)
 }
 
+/// (device, renderer, tiler) utilisation in percent as the GPU driver reports
+/// them; all zero when there is no such driver (virtual machines).
 pub fn read_gpu_utilization() -> (u32, u32, u32) {
-    static GPU_CLASS: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-
-    let cached = GPU_CLASS.get_or_init(|| {
-        for gen in (13..=19).rev() {
-            for suffix in &["X\0", "G\0", "P\0"] {
-                let name = format!("AGXAcceleratorG{}{}", gen, suffix);
-                let matched = unsafe {
-                    let m = IOServiceMatching(name.as_ptr() as *const i8);
-                    if m.is_null() {
-                        false
-                    } else {
-                        let s = IOServiceGetMatchingService(0, m);
-                        if s != 0 {
-                            IOObjectRelease(s);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                };
-                if matched {
-                    return Some(name.into_bytes());
-                }
-            }
-        }
-        None
-    });
-
-    match cached {
-        Some(name) => unsafe { try_gpu_util_class(name) },
-        None => (0, 0, 0),
-    }
+    // Every Apple GPU driver (AGXAcceleratorG13G ... AGXAcceleratorG17X) is a
+    // subclass of IOAccelerator, so matching the base class also finds the
+    // generations that do not exist yet.
+    // SAFETY: the class name is NUL-terminated, the only thing
+    // try_gpu_util_class requires of its argument.
+    unsafe { try_gpu_util_class(b"IOAccelerator\0") }
 }
 
 unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
@@ -963,7 +939,12 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
     {
         let dict = props as core_foundation_sys::dictionary::CFDictionaryRef;
         let stats = cf_utils::cfdict_get(dict, "PerformanceStatistics");
-        if !stats.is_null() {
+        // Any IOAccelerator can match, so do not take it on trust that the
+        // property is the dictionary the Apple GPU drivers publish.
+        if !stats.is_null()
+            && core_foundation_sys::base::CFGetTypeID(stats)
+                == core_foundation_sys::dictionary::CFDictionaryGetTypeID()
+        {
             let sd = stats as core_foundation_sys::dictionary::CFDictionaryRef;
             let dev = cf_utils::cfdict_get_i64(sd, "Device Utilization %").unwrap_or(0) as u32;
             let ren = cf_utils::cfdict_get_i64(sd, "Renderer Utilization %").unwrap_or(0) as u32;
@@ -980,6 +961,47 @@ unsafe fn try_gpu_util_class(class_name: &[u8]) -> (u32, u32, u32) {
     }
     IOObjectRelease(service);
     result
+}
+
+/// IOReport GPU residency (percent) from which all zeros from the driver
+/// cannot be a GPU that had nothing to do.
+const GPU_BUSY_MIN_PCT: u32 = 5;
+/// Collided readings in a row that keep the last good values. After that the
+/// values would be too old to pass for a measurement and the zeros go out.
+const GPU_MAX_BRIDGED_READS: u32 = 5;
+
+/// Tells driver readings that lost a race from real ones.
+///
+/// The GPU driver refreshes its utilisation figures only every 130-270 ms
+/// (measured on an M5 Max) and a read clears them until the next refresh.
+/// Whoever reads second in between gets 0/0/0: another macpow, Activity
+/// Monitor, ioreg, or this process itself at a short sampling interval.
+/// IOReport's GPU residency is not affected, so all zeros while IOReport
+/// shows a busy GPU mean "no data", not "idle". Reading again would not
+/// help: it takes the next refresh away from the other reader.
+#[derive(Default)]
+struct GpuCollisionFilter {
+    bridged_reads: u32,
+}
+
+impl GpuCollisionFilter {
+    /// The (renderer, tiler) pair to publish for a driver reading, or `None`
+    /// when the reading collided and the last published pair should stay.
+    fn accept(
+        &mut self,
+        (device, renderer, tiler): (u32, u32, u32),
+        ioreport_device_pct: u32,
+    ) -> Option<(u32, u32)> {
+        let collided =
+            (device, renderer, tiler) == (0, 0, 0) && ioreport_device_pct >= GPU_BUSY_MIN_PCT;
+        if !collided {
+            self.bridged_reads = 0;
+        } else if self.bridged_reads < GPU_MAX_BRIDGED_READS {
+            self.bridged_reads += 1;
+            return None;
+        }
+        Some((renderer, tiler))
+    }
 }
 
 // ── System stats: CPU usage, memory, GPU utilisation ─────────────────────────
@@ -1278,15 +1300,19 @@ impl Sampler {
         {
             let m = shared.clone();
             let mut reader = SystemStatsReader::default();
+            let mut gpu_filter = GpuCollisionFilter::default();
             spawn_periodic(&mut handles, &running, dt, move || {
                 // Every system call is made here, before the lock is taken.
                 let stats = reader.read();
                 if let Ok(mut mg) = m.lock() {
                     mg.cpu_usage_pct = stats.cpu_usage_pct;
                     mg.mem_used_gb = stats.mem_used_gb;
-                    let (_, renderer, tiler) = stats.gpu_util;
-                    mg.soc.gpu_util_renderer = renderer;
-                    mg.soc.gpu_util_tiler = tiler;
+                    if let Some((renderer, tiler)) =
+                        gpu_filter.accept(stats.gpu_util, mg.soc.gpu_util_device)
+                    {
+                        mg.soc.gpu_util_renderer = renderer;
+                        mg.soc.gpu_util_tiler = tiler;
+                    }
                 }
             });
         }
@@ -1752,6 +1778,42 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_filter_publishes_real_readings() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((24, 17, 10), 22), Some((17, 10)));
+        // Busy device with an idle renderer and tiler is a reading too.
+        assert_eq!(filter.accept((30, 0, 0), 30), Some((0, 0)));
+    }
+
+    #[test]
+    fn gpu_filter_keeps_last_values_when_a_read_collides() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((0, 0, 0), 22), None);
+        assert_eq!(filter.accept((0, 0, 0), GPU_BUSY_MIN_PCT), None);
+    }
+
+    #[test]
+    fn gpu_filter_publishes_zeros_of_an_idle_gpu() {
+        let mut filter = GpuCollisionFilter::default();
+        assert_eq!(filter.accept((0, 0, 0), 0), Some((0, 0)));
+        assert_eq!(filter.accept((0, 0, 0), GPU_BUSY_MIN_PCT - 1), Some((0, 0)));
+    }
+
+    #[test]
+    fn gpu_filter_gives_up_on_a_long_run_of_collisions() {
+        let mut filter = GpuCollisionFilter::default();
+        for _ in 0..GPU_MAX_BRIDGED_READS {
+            assert_eq!(filter.accept((0, 0, 0), 40), None);
+        }
+        // The kept values are too old by now: say "no data" instead.
+        assert_eq!(filter.accept((0, 0, 0), 40), Some((0, 0)));
+        assert_eq!(filter.accept((0, 0, 0), 40), Some((0, 0)));
+        // A real reading starts a fresh run.
+        assert_eq!(filter.accept((41, 35, 6), 40), Some((35, 6)));
+        assert_eq!(filter.accept((0, 0, 0), 40), None);
+    }
 
     // Counters of an M5 Max with 128 GB as vm_stat printed them, in pages of
     // 16 KiB: Activity Monitor showed 82.3 GiB used while active + inactive +
