@@ -3,6 +3,12 @@
 //! start the samplers, so they need a Mac; every wait is bounded, so a
 //! regression fails the test instead of hanging it.
 
+// The `macpow` binary exists only with the `cli` feature (`required-features`
+// in Cargo.toml), but cargo compiles this file and sets `CARGO_BIN_EXE_macpow`
+// either way. Without the feature there is no binary to test, so the file
+// compiles to nothing instead of failing to start one.
+#![cfg(feature = "cli")]
+
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::FromRawFd;
