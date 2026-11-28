@@ -69,27 +69,32 @@ fn fourcc_to_str(v: u32) -> String {
 
 /// FourCC for `flt ` (IEEE 754 float, with trailing space).
 const TYPE_FLT: u32 = 0x666c7420; // 'f','l','t',' '
-/// FourCC for `iof ` (IO float).
-const TYPE_IOF: u32 = 0x696f6620;
+/// FourCC for `ioft` (unsigned fixed-point 48.16, little-endian).
+const TYPE_IOFT: u32 = u32::from_be_bytes(*b"ioft");
 /// FourCC for `sp78` (signed fixed-point 7.8).
 const TYPE_SP78: u32 = 0x73703738;
 /// FourCC for `ui32`.
 #[allow(dead_code)]
 const TYPE_UI32: u32 = 0x75693332;
 
-fn bytes_to_f32_le(b: &[u8]) -> f32 {
-    if b.len() < 4 {
-        return 0.0;
+/// Decode the payload of a numeric SMC key (`flt `, `ioft`, `sp78`).
+///
+/// Returns `None` for any other type and for a payload shorter than its type
+/// needs: reading such bytes as a float would produce a number that looks
+/// like a measurement but is not one.
+fn decode_f32(data_type: u32, payload: &[u8]) -> Option<f32> {
+    match data_type {
+        TYPE_FLT => Some(f32::from_le_bytes(payload.get(..4)?.try_into().ok()?)),
+        TYPE_IOFT => {
+            let raw = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+            Some(raw as f32 / 65536.0)
+        }
+        TYPE_SP78 => {
+            let raw = i16::from_be_bytes(payload.get(..2)?.try_into().ok()?);
+            Some(raw as f32 / 256.0)
+        }
+        _ => None,
     }
-    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-fn bytes_to_sp78(b: &[u8]) -> f32 {
-    if b.len() < 2 {
-        return 0.0;
-    }
-    let raw = i16::from_be_bytes([b[0], b[1]]);
-    raw as f32 / 256.0
 }
 
 // ── Raw key dump ─────────────────────────────────────────────────────────────
@@ -383,15 +388,20 @@ impl SmcConnection {
         Ok((info, out.bytes))
     }
 
-    /// Read a float value from an SMC key (handles `flt `, `iof `, `sp78` types).
+    /// Read a float value from an SMC key (handles `flt `, `ioft`, `sp78` types).
+    /// Fails for a key of any other type.
     pub fn read_f32(&mut self, key_str: &str) -> Result<f32> {
         let (info, bytes) = self.read_key_raw(key_str)?;
-        let val = match info.data_type {
-            TYPE_FLT | TYPE_IOF => bytes_to_f32_le(&bytes),
-            TYPE_SP78 => bytes_to_sp78(&bytes),
-            _ => bytes_to_f32_le(&bytes),
-        };
-        Ok(val)
+        let size = (info.data_size as usize).min(bytes.len());
+        match decode_f32(info.data_type, &bytes[..size]) {
+            Some(val) => Ok(val),
+            None => bail!(
+                "SMC key {:?}: cannot read type {:?} ({} bytes) as a float",
+                key_str,
+                fourcc_to_str(info.data_type),
+                info.data_size
+            ),
+        }
     }
 
     // ── SMC key enumeration ────────────────────────────────────────────────
@@ -528,7 +538,7 @@ impl SmcConnection {
                 ((key_fcc >> 24) as u8 == b'T').then_some(())?;
                 let key_str = fourcc_to_str(key_fcc);
                 let info = self.read_key_info(key_fcc).ok()?;
-                matches!(info.data_type, TYPE_FLT | TYPE_IOF | TYPE_SP78).then_some(())?;
+                matches!(info.data_type, TYPE_FLT | TYPE_IOFT | TYPE_SP78).then_some(())?;
                 let category = prefixes
                     .iter()
                     .find(|(p, _)| key_str.starts_with(p))
@@ -605,5 +615,81 @@ impl Drop for SmcConnection {
         unsafe {
             IOServiceClose(self.conn);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Payload bytes in these tests were captured with `macpow --dump-smc` on a
+    // MacBook Pro Mac17,7 (M5 Max).
+
+    #[test]
+    fn type_tags_spell_their_names() {
+        assert_eq!(TYPE_FLT, fourcc("flt "));
+        assert_eq!(TYPE_IOFT, fourcc("ioft"));
+        assert_eq!(TYPE_SP78, fourcc("sp78"));
+        assert_eq!(TYPE_UI32, fourcc("ui32"));
+        assert_eq!(fourcc_to_str(TYPE_IOFT), "ioft");
+    }
+
+    #[test]
+    fn decode_f32_reads_flt_little_endian() {
+        // F0Ac: fan at 2330 rpm.
+        assert_eq!(
+            decode_f32(TYPE_FLT, &[0x00, 0xa0, 0x11, 0x45]),
+            Some(2330.0)
+        );
+    }
+
+    #[test]
+    fn decode_f32_reads_ioft_as_48_16_fixed_point() {
+        // TG0C and TG2B.
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0x00, 0x00, 0x22, 0, 0, 0, 0, 0]),
+            Some(34.0)
+        );
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0x00, 0x80, 0x22, 0, 0, 0, 0, 0]),
+            Some(34.5)
+        );
+        // TG0B (ioft) and TB0T (flt) are the same battery temperature, read
+        // in one dump: both payloads must decode to the same 36.8 °C.
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0xcc, 0xcc, 0x24, 0, 0, 0, 0, 0]),
+            decode_f32(TYPE_FLT, &[0x30, 0x33, 0x13, 0x42])
+        );
+        // The integer part is not limited to the low 32 bits.
+        assert_eq!(
+            decode_f32(TYPE_IOFT, &[0, 0, 0, 0, 0x01, 0, 0, 0]),
+            Some(65536.0)
+        );
+    }
+
+    #[test]
+    fn decode_f32_reads_sp78_big_endian() {
+        assert_eq!(decode_f32(TYPE_SP78, &[0x1e, 0x80]), Some(30.5));
+        assert_eq!(decode_f32(TYPE_SP78, &[0xff, 0x80]), Some(-0.5));
+    }
+
+    #[test]
+    fn decode_f32_rejects_types_that_are_not_floats() {
+        // B0CT (battery cycle count) and #KEY (number of keys) are integers.
+        assert_eq!(decode_f32(fourcc("ui16"), &[0xf1, 0x00]), None);
+        assert_eq!(decode_f32(TYPE_UI32, &[0x00, 0x00, 0x0f, 0x18]), None);
+        // "iof " with a space is not an SMC type, only "ioft" is.
+        assert_eq!(
+            decode_f32(fourcc("iof "), &[0x33, 0x33, 0x23, 0, 0, 0, 0, 0]),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_f32_rejects_payloads_shorter_than_the_type() {
+        assert_eq!(decode_f32(TYPE_FLT, &[0x00, 0xa0, 0x11]), None);
+        assert_eq!(decode_f32(TYPE_IOFT, &[0x33, 0x33, 0x23, 0x00]), None);
+        assert_eq!(decode_f32(TYPE_SP78, &[0x1e]), None);
+        assert_eq!(decode_f32(TYPE_FLT, &[]), None);
     }
 }
