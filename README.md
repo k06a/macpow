@@ -135,7 +135,7 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 |                  | USB devices, SSD model, disk I/O counters   |
 | CoreAudio        | Volume level, mute state                    |
 | Mach API         | Per-CPU utilization ticks, memory stats     |
-| proc_pid_rusage  | Per-process billed energy                   |
+| proc_pid_rusage  | Per-process CPU energy                      |
 | getifaddrs       | Network traffic byte counters               |
 | CoreWLAN/pmset   | WiFi info, Bluetooth devices                |
 | IOPMAssertions   | Power assertions, audio playback detection  |
@@ -156,7 +156,7 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 | Power adapter | SMC PDTR | Direct power delivery measurement |
 | System total | SMC PSTR | Direct power rail measurement |
 | Battery | IORegistry | V * I calculation |
-| Per-process | Kernel | `ri_billed_energy` from rusage_info_v4 |
+| Per-process | Kernel | `ri_energy_nj` (CPU energy) from rusage_info_v6, or `ri_billed_energy` from rusage_info_v4 on kernels without v6; without root only the current user's processes are readable |
 | Per-process disk I/O | Kernel | `ri_diskio_bytesread/written` from rusage_info_v4 |
 | Per-process memory | Kernel | `ri_phys_footprint` from rusage_info_v4 |
 | Per-process network | nettop | Cumulative bytes per process (~18ms subprocess) |

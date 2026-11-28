@@ -719,67 +719,9 @@ fn read_gpu_core_count() -> u32 {
 
 // ── Per-process energy via proc_pid_rusage ───────────────────────────────────
 
-extern "C" {
-    fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
-    fn proc_name(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
-}
-
-const RUSAGE_INFO_V4: i32 = 4;
-// rusage_info_v4: 16-byte UUID + 35 uint64_t fields = 296 bytes
-// ri_billed_energy is field #31 (0-indexed) after the UUID
-const BILLED_ENERGY_OFFSET: usize = 16 + 31 * 8; // = 264
-const DISKIO_READ_OFFSET: usize = 16 + 16 * 8; // = 144 (ri_diskio_bytesread)
-const DISKIO_WRITE_OFFSET: usize = 16 + 17 * 8; // = 152 (ri_diskio_byteswritten)
-const PHYS_FOOTPRINT_OFFSET: usize = 16 + 7 * 8; // = 72 (ri_phys_footprint)
-const RUSAGE_V4_SIZE: usize = 16 + 35 * 8; // = 296
-
-/// Per-process resource data: (name, energy_nj, disk_read, disk_write, phys_mem)
-pub fn read_all_process_energy() -> std::collections::HashMap<i32, (String, u64, u64, u64, u64)> {
-    let mut result = std::collections::HashMap::new();
-    unsafe {
-        let mut pids = vec![0i32; 4096];
-        let n = proc_listallpids(pids.as_mut_ptr(), (pids.len() * 4) as i32);
-        if n <= 0 {
-            return result;
-        }
-
-        let mut buf = vec![0u8; RUSAGE_V4_SIZE];
-        let mut name_buf = vec![0u8; 256];
-
-        for i in 0..n as usize {
-            let pid = pids[i];
-            if pid <= 0 {
-                continue;
-            }
-
-            let ret = proc_pid_rusage(pid, RUSAGE_INFO_V4, buf.as_mut_ptr());
-            if ret != 0 {
-                continue;
-            }
-
-            let read_u64 = |off: usize| -> u64 {
-                u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]))
-            };
-            let energy_nj = read_u64(BILLED_ENERGY_OFFSET);
-            if energy_nj == 0 {
-                continue;
-            }
-            let disk_r = read_u64(DISKIO_READ_OFFSET);
-            let disk_w = read_u64(DISKIO_WRITE_OFFSET);
-            let phys_mem = read_u64(PHYS_FOOTPRINT_OFFSET);
-
-            name_buf.fill(0);
-            proc_name(pid, name_buf.as_mut_ptr(), 256);
-            let name = std::ffi::CStr::from_ptr(name_buf.as_ptr() as *const i8)
-                .to_string_lossy()
-                .into_owned();
-
-            result.insert(pid, (name, energy_nj, disk_r, disk_w, phys_mem));
-        }
-    }
-    result
-}
+// The reader and the accounting live in `process_power`. Re-exported so that
+// `metrics::read_all_process_energy` keeps working for existing callers.
+pub use crate::process_power::read_all_process_energy;
 
 fn read_dram_gb() -> u32 {
     command_output_timeout("sysctl", &["-n", "hw.memsize"], Duration::from_millis(500))
@@ -1560,8 +1502,13 @@ impl Sampler {
                     let net = powermetrics::read_proc_net_counters();
                     let now = Instant::now();
 
-                    for (&pid, (name, energy_nj, disk_r, disk_w, phys_mem)) in &cur {
-                        let energy_nj = *energy_nj;
+                    for (&pid, sample) in &cur {
+                        let (name, energy_nj) = (&sample.name, sample.energy_nj);
+                        let (disk_r, disk_w, phys_mem) = (
+                            &sample.disk_read_bytes,
+                            &sample.disk_write_bytes,
+                            &sample.phys_mem_bytes,
+                        );
                         let entry = known.entry(pid).or_insert_with(|| {
                             (name.clone(), energy_nj, 0.0, 0, 0.0, now, 0u64, 0u64, 0u64)
                         });
