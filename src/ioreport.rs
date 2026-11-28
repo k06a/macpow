@@ -366,8 +366,47 @@ fn zip_states(freqs: &[u32], mvs: &[u32]) -> Vec<DvfsState> {
         .collect()
 }
 
-/// Pick the E-CPU, P-CPU and GPU tables out of every `voltage-states*` blob.
-fn select_dvfs_tables(raw: &[(String, Vec<(u32, u32)>)]) -> DvfsTables {
+/// A little-endian `u32` device-tree property (`perf-state-count` and the like).
+fn dt_u32(bytes: &[u8]) -> Option<u32> {
+    let b = bytes.get(..4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Frequencies (MHz) of the GPU's performance states, from the properties of
+/// the device-tree `sgx` node: the table the GPU driver itself runs on.
+///
+/// `perf-states` holds one table per voltage bin, each of `state_count`
+/// (`perf-state-count`) pairs of frequency in Hz and voltage in mV. The bins
+/// differ in voltage only, so the first table is read. Its 0 Hz entry is the
+/// powered-off state, which IOReport lists as `OFF` rather than as a P-state.
+///
+/// `None` when the blob isn't a whole number of such tables, or doesn't hold
+/// the `active_states` (`gpu-num-perf-states`) the node announces: better to
+/// fall back to guessing among the pmgr tables than to trust a misread one.
+fn gpu_freqs_from_sgx(
+    perf_states: &[u8],
+    state_count: usize,
+    active_states: Option<usize>,
+) -> Option<Vec<u32>> {
+    let table_len = state_count.checked_mul(8).filter(|&len| len > 0)?;
+    let mut tables = perf_states.chunks_exact(table_len);
+    let first = tables.next()?;
+    if !tables.remainder().is_empty() {
+        return None;
+    }
+    // Each 8-byte pair starts with its frequency.
+    let hz: Vec<u32> = first
+        .chunks(8)
+        .filter_map(dt_u32)
+        .filter(|&f| f > 0)
+        .collect();
+    let as_announced = active_states.unwrap_or(hz.len()) == hz.len();
+    (!hz.is_empty() && as_announced).then(|| to_mhz(&hz))
+}
+
+/// Pick the E-CPU, P-CPU and GPU tables out of every pmgr `voltage-states*`
+/// blob. `sgx_gpu` is the GPU table of the `sgx` node, where it has one.
+fn select_dvfs_tables(raw: &[(String, Vec<(u32, u32)>)], sgx_gpu: Option<Vec<u32>>) -> DvfsTables {
     // Frequency lists with zero entries dropped, converted to MHz.
     let all_tables: Vec<(String, Vec<u32>)> = raw
         .iter()
@@ -419,8 +458,13 @@ fn select_dvfs_tables(raw: &[(String, Vec<(u32, u32)>)]) -> DvfsTables {
         out.ecpu = zip_states(freqs, &core_voltages(raw, key));
     }
 
-    // Find GPU: non-sram table with max freq in 300-5000 MHz range
-    if let Some((_, freqs)) = non_sram_tables
+    // GPU: the driver's own table if the device tree gave one. Otherwise guess:
+    // the longest non-sram table with max freq in 300-5000 MHz range. (On an
+    // M5 Max that guess lands on `voltage-states8`, 26 states of something
+    // else, and an idle GPU read 732 MHz instead of 338.)
+    if let Some(freqs) = sgx_gpu {
+        out.gpu = freqs;
+    } else if let Some((_, freqs)) = non_sram_tables
         .iter()
         .filter(|(_, v)| {
             let max = v.last().copied().unwrap_or(0);
@@ -447,8 +491,9 @@ fn select_dvfs_tables(raw: &[(String, Vec<(u32, u32)>)]) -> DvfsTables {
     out
 }
 
-/// Read voltage-states from AppleARMIODevice/pmgr and return the DVFS tables
-/// for E-CPU, P-CPU, and GPU.
+/// Read voltage-states from AppleARMIODevice/pmgr, and the GPU's performance
+/// states from AppleARMIODevice/sgx, and return the DVFS tables for E-CPU,
+/// P-CPU, and GPU.
 fn read_dvfs_tables() -> DvfsTables {
     // Known approximate ranges:
     // E-CPU: 600-3500 MHz, P-CPU: 600-4600 MHz, GPU: 300-1800 MHz
@@ -458,6 +503,7 @@ fn read_dvfs_tables() -> DvfsTables {
     use crate::iokit_ffi::*;
 
     let mut raw: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
+    let mut sgx_gpu: Option<Vec<u32>> = None;
 
     unsafe {
         let matching = IOServiceMatching(b"AppleARMIODevice\0".as_ptr() as *const i8);
@@ -537,13 +583,54 @@ fn read_dvfs_tables() -> DvfsTables {
 
                     cf_utils::cf_release(props as _);
                 }
+            } else if name == "sgx" {
+                let mut props = std::ptr::null_mut();
+                if IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null(), 0) == 0
+                    && !props.is_null()
+                {
+                    // SAFETY: `props` is the live dictionary created just
+                    // above; it is released only after the last read from it.
+                    let dict = props as CFDictionaryRef;
+                    let count = |key: &str| {
+                        let n = dt_u32(&cfdict_bytes(dict, key)?)?;
+                        Some(n as usize)
+                    };
+                    if let (Some(blob), Some(state_count)) =
+                        (cfdict_bytes(dict, "perf-states"), count("perf-state-count"))
+                    {
+                        sgx_gpu =
+                            gpu_freqs_from_sgx(&blob, state_count, count("gpu-num-perf-states"));
+                    }
+                    cf_utils::cf_release(props as _);
+                }
             }
             IOObjectRelease(entry);
         }
         IOObjectRelease(iter);
     }
 
-    select_dvfs_tables(&raw)
+    select_dvfs_tables(&raw, sgx_gpu)
+}
+
+/// A copy of the bytes of the `CFData` stored under `key`; `None` if the key
+/// is missing or holds something else.
+///
+/// `dict` must be a valid `CFDictionary`.
+unsafe fn cfdict_bytes(dict: CFDictionaryRef, key: &str) -> Option<Vec<u8>> {
+    let val = cf_utils::cfdict_get(dict, key);
+    if val.is_null() || CFGetTypeID(val) != CFDataGetTypeID() {
+        return None;
+    }
+    let data = val as CFDataRef;
+    let len = usize::try_from(CFDataGetLength(data)).ok()?;
+    let ptr = CFDataGetBytePtr(data);
+    if len == 0 || ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `val` was just checked to be a CFData, whose byte pointer is
+    // valid for its length while the dictionary holding it is alive. The
+    // bytes are copied out before returning, so nothing outlives `dict`.
+    Some(std::slice::from_raw_parts(ptr, len).to_vec())
 }
 
 // ── live power sources for systems where the Energy Model is gated ───────────
@@ -2247,9 +2334,87 @@ mod tests {
 
     // ── DVFS tables ──────────────────────────────────────────────────────────
 
+    /// GPU frequencies of an M5 Max: `sgx` perf-states less the off state.
+    const M5_MAX_GPU_MHZ: [u32; 13] = [
+        338, 486, 636, 796, 888, 988, 1084, 1182, 1278, 1374, 1470, 1578, 1620,
+    ];
+
+    /// pmgr `voltage-states8` of the same machine: not the GPU's table, but
+    /// the longest one in the GPU's frequency range.
+    const M5_MAX_STATES8_MHZ: [u32; 26] = [
+        732, 816, 984, 1068, 1212, 1284, 1428, 1500, 1584, 1656, 1740, 1800, 1872, 1932, 2016,
+        2076, 2112, 2172, 2196, 2244, 2256, 2292, 2304, 2352, 2364, 2472,
+    ];
+
+    /// The `perf-states` property of the `sgx` node as read on an M5 Max
+    /// (Mac17,7): 4 voltage bins × 14 states × (Hz, mV). On that node
+    /// `perf-state-count` is 14 and `gpu-num-perf-states` is 13.
+    fn m5_max_perf_states() -> Vec<u8> {
+        let hex = concat!(
+            "000000007d000000807825147602000080c5f71c7b0200000097e825",
+            "a302000000ff712fda02000000ceed34ee02000000afe33a07030000",
+            "00879c402f03000080e373463903000080bb2c4c660300008093e551",
+            "7f030000806b9e57ac030000805e0e5ef7030000003d8f600b040000",
+            "000000007d000000807825145302000080c5f71c7b0200000097e825",
+            "9402000000ff712fd502000000ceed34df02000000afe33af8020000",
+            "00879c401103000080e373462503000080bb2c4c570300008093e551",
+            "70030000806b9e57a7030000805e0e5ee8030000003d8f600b040000",
+            "000000007d000000807825145302000080c5f71c7b0200000097e825",
+            "9402000000ff712fd502000000ceed34df02000000afe33af8020000",
+            "00879c401103000080e373462503000080bb2c4c570300008093e551",
+            "70030000806b9e57a7030000805e0e5ee8030000003d8f600b040000",
+            "000000007d000000807825147602000080c5f71c7b0200000097e825",
+            "a302000000ff712fda02000000ceed34ee02000000afe33a07030000",
+            "00879c402f03000080e373463903000080bb2c4c660300008093e551",
+            "7f030000806b9e57ac030000805e0e5ef7030000003d8f600b040000",
+        );
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn reads_gpu_frequencies_from_sgx_perf_states() {
+        let blob = m5_max_perf_states();
+        assert_eq!(blob.len(), 4 * 14 * 8);
+        assert_eq!(dt_u32(&[0x0e, 0, 0, 0]), Some(14));
+        assert_eq!(dt_u32(&[0x0d, 0, 0]), None);
+        assert_eq!(
+            gpu_freqs_from_sgx(&blob, 14, Some(13)).as_deref(),
+            Some(&M5_MAX_GPU_MHZ[..])
+        );
+        // A node that doesn't announce its active states, or holds one bin.
+        assert_eq!(
+            gpu_freqs_from_sgx(&blob, 14, None).as_deref(),
+            Some(&M5_MAX_GPU_MHZ[..])
+        );
+        assert_eq!(
+            gpu_freqs_from_sgx(&blob[..14 * 8], 14, Some(13)).as_deref(),
+            Some(&M5_MAX_GPU_MHZ[..])
+        );
+    }
+
+    #[test]
+    fn sgx_perf_states_of_another_shape_are_not_trusted() {
+        let blob = m5_max_perf_states();
+        // Not the number of active states the node announces.
+        assert_eq!(gpu_freqs_from_sgx(&blob, 14, Some(12)), None);
+        // Not a whole number of `perf-state-count` tables, or of pairs.
+        assert_eq!(gpu_freqs_from_sgx(&blob, 15, None), None);
+        assert_eq!(gpu_freqs_from_sgx(&blob[..blob.len() - 8], 14, None), None);
+        assert_eq!(gpu_freqs_from_sgx(&blob[..blob.len() - 3], 14, None), None);
+        assert_eq!(gpu_freqs_from_sgx(&blob, 0, None), None);
+        assert_eq!(gpu_freqs_from_sgx(&[], 14, None), None);
+        // Nothing but off states.
+        assert_eq!(gpu_freqs_from_sgx(&[0; 14 * 8], 14, None), None);
+    }
+
     /// The M5 Max layout: `-sram` tables carry MHz and the SRAM rail voltage,
-    /// the same-numbered plain table carries the core rail voltage.
+    /// the same-numbered plain table carries the core rail voltage. The CPU
+    /// tables are abridged; the two GPU candidates are complete (in Hz).
     fn m5_like_tables() -> Vec<(String, Vec<(u32, u32)>)> {
+        let hz = |mhz: u32| mhz * 1_000_000;
         vec![
             (
                 "voltage-states5".to_string(),
@@ -2269,14 +2434,34 @@ mod tests {
             ),
             (
                 "voltage-states8".to_string(),
-                vec![(732, u32::MAX), (816, u32::MAX), (984, u32::MAX)],
+                M5_MAX_STATES8_MHZ
+                    .iter()
+                    .map(|&f| (hz(f), u32::MAX))
+                    .collect(),
+            ),
+            (
+                // The GPU's real table, off state first. (Voltages elided.)
+                "voltage-states9".to_string(),
+                std::iter::once((0, 125))
+                    .chain(M5_MAX_GPU_MHZ.iter().map(|&f| (hz(f), 0)))
+                    .collect(),
             ),
         ]
     }
 
     #[test]
+    fn gpu_table_is_the_sgx_one_and_only_guessed_without_it() {
+        let raw = m5_like_tables();
+        let sgx = gpu_freqs_from_sgx(&m5_max_perf_states(), 14, Some(13));
+        assert_eq!(select_dvfs_tables(&raw, sgx).gpu, M5_MAX_GPU_MHZ);
+        // No `sgx` node to ask: the guess is what it always was, which on this
+        // machine's pmgr tables is the longer `voltage-states8`.
+        assert_eq!(select_dvfs_tables(&raw, None).gpu, M5_MAX_STATES8_MHZ);
+    }
+
+    #[test]
     fn dvfs_tables_pair_frequencies_with_core_voltages() {
-        let t = select_dvfs_tables(&m5_like_tables());
+        let t = select_dvfs_tables(&m5_like_tables(), None);
         assert_eq!(
             t.pcpu,
             vec![
@@ -2300,14 +2485,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(t.gpu, vec![732, 816, 984]);
     }
 
     #[test]
     fn dvfs_voltage_falls_back_to_sram_rail_then_to_unknown() {
         let mut raw = m5_like_tables();
         raw.retain(|(k, _)| k != "voltage-states5");
-        let t = select_dvfs_tables(&raw);
+        let t = select_dvfs_tables(&raw, None);
         assert_eq!(t.pcpu[0], DvfsState { mhz: 1308, mv: 760 });
 
         // Implausible voltages everywhere → frequency-only weights.
@@ -2315,7 +2499,7 @@ mod tests {
             "voltage-states5-sram".to_string(),
             vec![(1308, u32::MAX), (1620, u32::MAX), (4608, u32::MAX)],
         )];
-        let t = select_dvfs_tables(&raw);
+        let t = select_dvfs_tables(&raw, None);
         assert_eq!(t.pcpu[2], DvfsState { mhz: 4608, mv: 0 });
         assert!((t.pcpu[2].dyn_weight() - 4.608).abs() < 1e-9);
     }
