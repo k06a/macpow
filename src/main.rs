@@ -79,18 +79,12 @@ fn main() -> Result<()> {
 }
 
 fn run_json(rx: mpsc::Receiver<Metrics>) -> Result<()> {
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            sigint_handler as *const () as libc::sighandler_t,
-        );
-    }
-    loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(m) => println!("{}", serde_json::to_string_pretty(&m)?),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+    // No SIGINT handler on purpose: JSON mode has nothing to clean up, so the
+    // default disposition (die at once, even while blocked on a slow reader)
+    // is what we want. A handler that calls `process::exit` is not
+    // async-signal-safe: it aborts when it interrupts a write to stdout.
+    for m in rx {
+        println!("{}", serde_json::to_string_pretty(&m)?);
     }
     Ok(())
 }
@@ -140,10 +134,6 @@ fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
         Ok(inner) => inner,
         Err(_) => anyhow::bail!("TUI panicked unexpectedly. Terminal has been restored."),
     }
-}
-
-extern "C" fn sigint_handler(_: libc::c_int) {
-    std::process::exit(0);
 }
 
 /// Dump every SMC key in the same format as `iSMC raw`, so the output can be
