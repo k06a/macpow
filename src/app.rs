@@ -1961,6 +1961,10 @@ impl App {
                 if m.display.nits > 0.0 && peak > 0.0 {
                     parts.push(format!("{:.0}/{:.0} nits", m.display.nits, peak));
                 }
+                // Measured level of the built-in panel, when it publishes one.
+                if let Some(panel) = m.display.panel_nits {
+                    parts.push(format!("panel {:.0}", panel));
+                }
                 if m.display.refresh_hz > 0.0 {
                     parts.push(format!("{:.0}Hz", m.display.refresh_hz));
                 }

@@ -1,10 +1,13 @@
 //! Hardware checks for the display fields: what macpow reports is compared
 //! with an independent macOS source on the machine running the test (`ioreg`,
-//! `system_profiler`), not with macpow's own FFI readers.
+//! `system_profiler`), not with macpow's own FFI readers. The one exception is
+//! the brightness slider, which only DisplayServices knows: `nits` is checked
+//! against macpow's public slider reader.
 //!
 //! Each check passes with a "skipped" note when its source has nothing to
-//! compare against: no built-in panel, display asleep, virtual machine, or a
-//! system language other than English for `system_profiler`.
+//! compare against: no built-in panel, no brightness control, display asleep,
+//! virtual machine, or a system language other than English for
+//! `system_profiler`.
 
 use macpow::metrics;
 use macpow::types::DisplayInfo;
@@ -130,7 +133,58 @@ fn resolution_is_read_from_every_system_profiler_format() {
 }
 
 #[test]
-fn nits_match_the_level_the_panel_is_driven_at() {
+fn nits_are_the_slider_times_the_preset_peak() {
+    let _guard = ONE_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    // The slider can move while we look (auto-brightness), so read it on both
+    // sides of the sample and accept the span.
+    let before = metrics::read_display_brightness();
+    let display = sample_display();
+    let after = metrics::read_display_brightness();
+    let (Some(before), Some(display), Some(after)) = (before, display, after) else {
+        eprintln!("skipped: no brightness slider on the main display");
+        return;
+    };
+    // The peak as the sampler defines it: the active preset's HDR peak (at
+    // least its SDR cap), or the panel's calibrated maximum without a preset.
+    let sdr_cap = if display.preset_max_sdr_nits > 0.0 {
+        display.preset_max_sdr_nits
+    } else {
+        display.max_nits
+    };
+    let peak = if display.preset_max_hdr_nits > 0.0 {
+        display.preset_max_hdr_nits.max(sdr_cap)
+    } else {
+        sdr_cap
+    };
+    eprintln!(
+        "macpow {:.2} nits, peak {:.0}; slider {:.2} .. {:.2} % x peak {peak:.0} = \
+         {:.2} .. {:.2} nits",
+        display.nits,
+        display.peak_nits,
+        before * 100.0,
+        after * 100.0,
+        before * peak,
+        after * peak
+    );
+    assert!(
+        (display.peak_nits - peak).abs() < 0.01,
+        "peak_nits {} but the preset says {peak} ({:?}, SDR {}, HDR {}, panel max {})",
+        display.peak_nits,
+        display.preset_name,
+        display.preset_max_sdr_nits,
+        display.preset_max_hdr_nits,
+        display.max_nits
+    );
+    let (low, high) = (before.min(after) * peak, before.max(after) * peak);
+    assert!(
+        display.nits >= low - 0.01 && display.nits <= high + 0.01,
+        "macpow reports {} nits but slider x peak is {low} .. {high}",
+        display.nits
+    );
+}
+
+#[test]
+fn panel_nits_match_the_level_the_panel_is_driven_at() {
     let _guard = ONE_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
     if !main_display_is_builtin() {
         eprintln!("skipped: the main display is not a built-in panel");
@@ -145,19 +199,18 @@ fn nits_match_the_level_the_panel_is_driven_at() {
         eprintln!("skipped: no panel level in the registry or no display in the sampler");
         return;
     };
+    eprintln!(
+        "macpow panel_nits {:?}; registry {before:.2} .. {after:.2} nits",
+        display.panel_nits
+    );
+    let panel = display.panel_nits.unwrap_or_else(|| {
+        panic!("the registry publishes {before} .. {after} nits but panel_nits is None")
+    });
     let (low, high) = (before.min(after), before.max(after));
     let slack = 0.02 * high + 0.5;
-    eprintln!(
-        "macpow {:.2} nits at {:.1} % slider; registry {before:.2} .. {after:.2} nits",
-        display.nits, display.brightness_pct
-    );
     assert!(
-        display.nits >= low - slack && display.nits <= high + slack,
-        "macpow reports {} nits but the panel is driven at {before} .. {after} nits \
-         (slider {} %, peak {} nits)",
-        display.nits,
-        display.brightness_pct,
-        display.peak_nits
+        panel >= low - slack && panel <= high + slack,
+        "macpow reports panel_nits {panel} but the panel is driven at {before} .. {after} nits"
     );
 }
 
