@@ -144,7 +144,7 @@ def true_flags(samples):
 
 
 def null_fields(value, path=""):
-    """JSON paths holding null: a NaN or infinity that serde_json cannot write."""
+    """JSON paths holding null: an absent optional value, or a NaN that JSON cannot express."""
     if value is None:
         return [path]
     if isinstance(value, dict):
@@ -182,7 +182,7 @@ def main(directories):
     print(table([""] + names, rows))
 
     print("## Data obtained\n")
-    print("✅ = a real value was reported; `0`, `no`, `empty` = reported but empty; `null` = NaN in the output.\n")
+    print("✅ = a real value was reported; `0`, `no`, `empty` = reported but empty; `null` = no value (absent or NaN).\n")
     rows = [[label] + [cell(machine["samples"], kind, path, unit) for machine in machines] for label, kind, path, unit in ROWS]
     rows.append(["SoC source flags"] + [true_flags(machine["samples"]) for machine in machines])
     rows.append(
