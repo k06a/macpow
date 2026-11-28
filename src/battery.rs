@@ -1,74 +1,95 @@
 use crate::cf_utils;
 use crate::iokit_ffi::*;
 use crate::types::{AdapterInfo, BatteryInfo, UsbPortPower};
-use core_foundation_sys::dictionary::CFDictionaryRef;
+use core_foundation::base::TCFType;
+use core_foundation::number::CFNumber;
+use core_foundation_sys::base::CFGetTypeID;
+use core_foundation_sys::dictionary::{CFDictionaryGetTypeID, CFDictionaryRef};
+use core_foundation_sys::number::{CFNumberGetTypeID, CFNumberRef};
+use std::ffi::CStr;
 
 pub fn read_battery() -> BatteryInfo {
-    unsafe { read_battery_inner().unwrap_or_default() }
+    read_battery_readings()
+        .map(|r| battery_info(&r))
+        .unwrap_or_default()
 }
 
 pub fn read_adapter() -> AdapterInfo {
     unsafe { read_adapter_inner().unwrap_or_default() }
 }
 
-unsafe fn read_battery_inner() -> Option<BatteryInfo> {
-    let matching = IOServiceMatching(b"AppleSmartBattery\0".as_ptr() as *const i8);
-    if matching.is_null() {
-        return None;
+/// Capacity and temperature readings of the battery's fuel gauge, as one
+/// registry dictionary publishes them. `None` means it has no such key.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct GaugeValues {
+    /// "NominalChargeCapacity"
+    nominal_charge_mah: Option<f64>,
+    /// "DesignCapacity"
+    design_capacity_mah: Option<f64>,
+    /// "AppleRawMaxCapacity": the charge the battery holds when full today.
+    raw_max_capacity_mah: Option<f64>,
+    /// "FccComp1": the same, compensated by the gauge; preferred for health.
+    fcc_comp1_mah: Option<f64>,
+    /// "Temperature", in hundredths of a degree Celsius (3045 = 30.45 °C).
+    temperature_centi_c: Option<f64>,
+}
+
+/// Everything `read_battery` takes from the registry, before any arithmetic.
+/// `None` means the key is not published.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct BatteryReadings {
+    voltage_mv: Option<f64>,
+    amperage_ma: Option<f64>,
+    current_capacity: Option<i64>,
+    max_capacity: Option<i64>,
+    is_charging: Option<bool>,
+    external_connected: Option<bool>,
+    time_remaining_min: Option<i64>,
+    cycle_count: Option<i64>,
+    /// The places the gauge values have lived, in the order they are tried:
+    /// AppleSmartBattery itself (older macOS), its "BatteryData" dictionary,
+    /// and the "BatteryData" of the AppleSmartBatteryPack node (macOS 27 keeps
+    /// them only in the last two).
+    gauge_places: [GaugeValues; 3],
+}
+
+impl BatteryReadings {
+    /// The value chosen by `field` from the first place that publishes it.
+    fn gauge(&self, field: impl Fn(&GaugeValues) -> Option<f64>) -> Option<f64> {
+        self.gauge_places.iter().find_map(field)
     }
-    let service = IOServiceGetMatchingService(0, matching);
-    if service == 0 {
-        return None;
-    }
+}
 
-    let mut props = std::ptr::null_mut();
-    let kr = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
-    IOObjectRelease(service);
-    if kr != 0 || props.is_null() {
-        return None;
-    }
+/// Turns the registry readings into the reported battery state.
+///
+/// A gauge value that no place publishes is reported as 0, meaning "unknown":
+/// it is never replaced by another quantity or by a plausible default.
+fn battery_info(r: &BatteryReadings) -> BatteryInfo {
+    let voltage_mv = r.voltage_mv.unwrap_or(0.0);
+    let amperage_ma = r.amperage_ma.unwrap_or(0.0);
+    let current_cap = r.current_capacity.unwrap_or(0);
+    let max_cap = r.max_capacity.unwrap_or(1);
+    let external = r.external_connected.unwrap_or(false);
+    let raw_time = r.time_remaining_min.unwrap_or(-1);
 
-    let dict = props as CFDictionaryRef;
+    let nominal_charge_mah = r.gauge(|g| g.nominal_charge_mah).unwrap_or(0.0);
+    let design_capacity_mah = r.gauge(|g| g.design_capacity_mah).unwrap_or(0.0);
+    let max_capacity_mah = r.gauge(|g| g.raw_max_capacity_mah).unwrap_or(0.0);
+    let temperature_c = r.gauge(|g| g.temperature_centi_c).unwrap_or(0.0) / 100.0;
 
-    let voltage_mv = cf_utils::cfdict_get_f64(dict, "AppleRawBatteryVoltage")
-        .or_else(|| cf_utils::cfdict_get_f64(dict, "Voltage"))
-        .unwrap_or(0.0);
-    let amperage_ma = cf_utils::cfdict_get_f64(dict, "InstantAmperage")
-        .or_else(|| cf_utils::cfdict_get_f64(dict, "Amperage"))
-        .unwrap_or(0.0);
-    let current_cap = cf_utils::cfdict_get_i64(dict, "CurrentCapacity").unwrap_or(0);
-    let max_cap = cf_utils::cfdict_get_i64(dict, "MaxCapacity").unwrap_or(1);
-    let os_is_charging = cf_utils::cfdict_get_bool(dict, "IsCharging").unwrap_or(false);
-    let external = cf_utils::cfdict_get_bool(dict, "ExternalConnected").unwrap_or(false);
-    let raw_time = cf_utils::cfdict_get_i64(dict, "TimeRemaining").unwrap_or(-1);
-    let nominal_charge_mah = cf_utils::cfdict_get_f64(dict, "NominalChargeCapacity").unwrap_or(0.0);
-    let capacity_wh = nominal_charge_mah * voltage_mv / 1_000_000.0;
-
-    // Temperature is in hundredths of a degree Celsius (e.g. 3045 = 30.45°C)
-    let temp_raw = cf_utils::cfdict_get_f64(dict, "Temperature").unwrap_or(0.0);
-    let temperature_c = temp_raw / 100.0;
-
-    let cycle_count = cf_utils::cfdict_get_i64(dict, "CycleCount").unwrap_or(0);
-    let design_capacity_mah = cf_utils::cfdict_get_f64(dict, "DesignCapacity").unwrap_or(0.0);
-    let max_capacity_mah =
-        cf_utils::cfdict_get_f64(dict, "AppleRawMaxCapacity").unwrap_or(design_capacity_mah);
-
+    let full_charge_mah = r
+        .gauge(|g| g.fcc_comp1_mah)
+        .filter(|fcc| *fcc > 0.0)
+        .unwrap_or(max_capacity_mah);
+    // Health needs both capacities. Without the design capacity it is unknown
+    // (0, which the TUI leaves out) rather than a 100 % nobody measured, and
+    // without a full-charge capacity the division gives the same 0.
     let health_pct = if design_capacity_mah > 0.0 {
-        if let Some(battery_data) = cf_utils::cfdict_get_dict(dict, "BatteryData") {
-            let fcc_comp1 = cf_utils::cfdict_get_f64(battery_data, "FccComp1").unwrap_or(0.0);
-            if fcc_comp1 > 0.0 {
-                fcc_comp1 / design_capacity_mah * 100.0
-            } else {
-                max_capacity_mah / design_capacity_mah * 100.0
-            }
-        } else {
-            max_capacity_mah / design_capacity_mah * 100.0
-        }
+        full_charge_mah / design_capacity_mah * 100.0
     } else {
-        100.0
+        0.0
     };
 
-    let is_charging = os_is_charging;
     let power_w = voltage_mv * amperage_ma.abs() / 1_000_000.0;
     let drain_w = if external { -power_w } else { power_w };
     let percent = if max_cap > 0 {
@@ -83,26 +104,144 @@ unsafe fn read_battery_inner() -> Option<BatteryInfo> {
         -1
     };
 
-    cf_utils::cf_release(props as _);
-
-    Some(BatteryInfo {
+    BatteryInfo {
         present: true,
-        charging: is_charging,
+        charging: r.is_charging.unwrap_or(false),
         voltage_mv,
         amperage_ma,
         drain_w,
-        capacity_wh,
+        capacity_wh: nominal_charge_mah * voltage_mv / 1_000_000.0,
         current_capacity: current_cap,
         max_capacity: max_cap,
         percent,
         time_remaining_min: time_remaining,
         external_connected: external,
         temperature_c,
-        cycle_count,
+        cycle_count: r.cycle_count.unwrap_or(0),
         design_capacity_mah,
         max_capacity_mah,
         health_pct,
-    })
+    }
+}
+
+/// Reads the battery values from the registry; `None` when the machine has no
+/// AppleSmartBattery service.
+fn read_battery_readings() -> Option<BatteryReadings> {
+    let battery = copy_service_properties(c"AppleSmartBattery")?;
+    // Absent on older macOS, where AppleSmartBattery has everything.
+    let pack = copy_service_properties(c"AppleSmartBatteryPack");
+    // SAFETY: both are dictionaries we own until the releases below, each
+    // released exactly once; `readings_from` returns plain numbers that do
+    // not point into them.
+    unsafe {
+        let readings = readings_from(battery, pack);
+        cf_utils::cf_release(battery as _);
+        if let Some(pack) = pack {
+            cf_utils::cf_release(pack as _);
+        }
+        Some(readings)
+    }
+}
+
+/// Copies the property dictionary of the first IOService of class
+/// `class_name`; `None` when there is no such service. The caller owns the
+/// dictionary and has to release it.
+fn copy_service_properties(class_name: &CStr) -> Option<CFDictionaryRef> {
+    // SAFETY: `class_name` is NUL-terminated. IOServiceGetMatchingService
+    // consumes the matching dictionary, the service handle is released right
+    // after its properties are copied, and `props` is used only when IOKit
+    // reports success and filled it in.
+    unsafe {
+        let matching = IOServiceMatching(class_name.as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+
+        let mut props = std::ptr::null_mut();
+        let kr = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
+        IOObjectRelease(service);
+        if kr != 0 || props.is_null() {
+            return None;
+        }
+        Some(props as CFDictionaryRef)
+    }
+}
+
+/// Extracts the readings from the properties of AppleSmartBattery and, where
+/// it exists, of AppleSmartBatteryPack.
+///
+/// # Safety
+/// `battery` and `pack` must be valid CFDictionary references.
+unsafe fn readings_from(
+    battery: CFDictionaryRef,
+    pack: Option<CFDictionaryRef>,
+) -> BatteryReadings {
+    BatteryReadings {
+        voltage_mv: cf_utils::cfdict_get_f64(battery, "AppleRawBatteryVoltage")
+            .or_else(|| cf_utils::cfdict_get_f64(battery, "Voltage")),
+        amperage_ma: cf_utils::cfdict_get_f64(battery, "InstantAmperage")
+            .or_else(|| cf_utils::cfdict_get_f64(battery, "Amperage")),
+        current_capacity: cf_utils::cfdict_get_i64(battery, "CurrentCapacity"),
+        max_capacity: cf_utils::cfdict_get_i64(battery, "MaxCapacity"),
+        is_charging: cf_utils::cfdict_get_bool(battery, "IsCharging"),
+        external_connected: cf_utils::cfdict_get_bool(battery, "ExternalConnected"),
+        time_remaining_min: cf_utils::cfdict_get_i64(battery, "TimeRemaining"),
+        cycle_count: cf_utils::cfdict_get_i64(battery, "CycleCount"),
+        gauge_places: [
+            gauge_values(Some(battery)),
+            gauge_values(dict_in(battery, "BatteryData")),
+            gauge_values(pack.and_then(|pack| dict_in(pack, "BatteryData"))),
+        ],
+    }
+}
+
+/// Reads the gauge keys of one dictionary; all `None` without a dictionary.
+///
+/// # Safety
+/// `dict`, when given, must be a valid CFDictionary reference.
+unsafe fn gauge_values(dict: Option<CFDictionaryRef>) -> GaugeValues {
+    let Some(dict) = dict else {
+        return GaugeValues::default();
+    };
+    GaugeValues {
+        nominal_charge_mah: number_in(dict, "NominalChargeCapacity"),
+        design_capacity_mah: number_in(dict, "DesignCapacity"),
+        raw_max_capacity_mah: number_in(dict, "AppleRawMaxCapacity"),
+        fcc_comp1_mah: number_in(dict, "FccComp1"),
+        temperature_centi_c: number_in(dict, "Temperature"),
+    }
+}
+
+// The two getters below check the type of a value before casting it. These
+// keys have already moved between macOS releases; one that comes back with a
+// different type has to read as missing, not reach the wrong CF function.
+
+/// `dict[key]` as a dictionary; `None` when absent or of another type.
+///
+/// # Safety
+/// `dict` must be a valid CFDictionary reference; the result borrows from it.
+unsafe fn dict_in(dict: CFDictionaryRef, key: &str) -> Option<CFDictionaryRef> {
+    let value = cf_utils::cfdict_get(dict, key);
+    if value.is_null() || CFGetTypeID(value) != CFDictionaryGetTypeID() {
+        return None;
+    }
+    Some(value as CFDictionaryRef)
+}
+
+/// `dict[key]` as a number; `None` when absent or of another type.
+///
+/// # Safety
+/// `dict` must be a valid CFDictionary reference.
+unsafe fn number_in(dict: CFDictionaryRef, key: &str) -> Option<f64> {
+    let value = cf_utils::cfdict_get(dict, key);
+    if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
+        return None;
+    }
+    CFNumber::wrap_under_get_rule(value as CFNumberRef).to_f64()
 }
 
 unsafe fn read_adapter_inner() -> Option<AdapterInfo> {
@@ -253,4 +392,218 @@ unsafe fn read_usb_power_per_port_inner() -> Option<Vec<UsbPortPower>> {
 
     cf_utils::cf_release(props as _);
     Some(ports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NO_GAUGE: GaugeValues = GaugeValues {
+        nominal_charge_mah: None,
+        design_capacity_mah: None,
+        raw_max_capacity_mah: None,
+        fcc_comp1_mah: None,
+        temperature_centi_c: None,
+    };
+
+    /// The values `ioreg` showed on a MacBook Pro (Mac17,7) with macOS 27.0.1:
+    /// nothing from the gauge at the top level of AppleSmartBattery, a summary
+    /// in its "BatteryData" and the full set in AppleSmartBatteryPack.
+    fn macos_27() -> BatteryReadings {
+        BatteryReadings {
+            voltage_mv: Some(12014.0),
+            amperage_ma: Some(-1759.0),
+            current_capacity: Some(75),
+            max_capacity: Some(100),
+            is_charging: Some(false),
+            external_connected: Some(false),
+            time_remaining_min: Some(130),
+            cycle_count: Some(241),
+            gauge_places: [
+                NO_GAUGE,
+                GaugeValues {
+                    nominal_charge_mah: Some(5726.0),
+                    design_capacity_mah: Some(6249.0),
+                    ..NO_GAUGE
+                },
+                GaugeValues {
+                    nominal_charge_mah: Some(5726.0),
+                    design_capacity_mah: Some(6249.0),
+                    raw_max_capacity_mah: Some(5574.0),
+                    fcc_comp1_mah: Some(5574.0),
+                    temperature_centi_c: Some(3450.0),
+                },
+            ],
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "{actual} is not {expected}"
+        );
+    }
+
+    #[test]
+    fn macos_27_layout_is_read_from_the_nested_dictionaries() {
+        let b = battery_info(&macos_27());
+        assert!(b.present);
+        assert_close(b.capacity_wh, 5726.0 * 12014.0 / 1_000_000.0);
+        assert_close(b.temperature_c, 34.5);
+        assert_close(b.design_capacity_mah, 6249.0);
+        assert_close(b.max_capacity_mah, 5574.0);
+        assert_close(b.health_pct, 5574.0 / 6249.0 * 100.0);
+        // The values that did not move are passed through as before.
+        assert_close(b.voltage_mv, 12014.0);
+        assert_close(b.amperage_ma, -1759.0);
+        assert_close(b.drain_w, 12014.0 * 1759.0 / 1_000_000.0);
+        assert_close(b.percent, 75.0);
+        assert_eq!((b.current_capacity, b.max_capacity), (75, 100));
+        assert_eq!((b.time_remaining_min, b.cycle_count), (130, 241));
+        assert!(!b.charging && !b.external_connected);
+    }
+
+    /// The layout the code read before macOS 27: the gauge keys at the top
+    /// level, "FccComp1" in "BatteryData", no AppleSmartBatteryPack node. The
+    /// numbers are made up; no machine with that layout was at hand.
+    #[test]
+    fn older_layout_with_top_level_keys_still_works() {
+        let r = BatteryReadings {
+            voltage_mv: Some(12450.0),
+            gauge_places: [
+                GaugeValues {
+                    nominal_charge_mah: Some(4490.0),
+                    design_capacity_mah: Some(4563.0),
+                    raw_max_capacity_mah: Some(4382.0),
+                    fcc_comp1_mah: None,
+                    temperature_centi_c: Some(3033.0),
+                },
+                GaugeValues {
+                    design_capacity_mah: Some(4563.0),
+                    fcc_comp1_mah: Some(4338.0),
+                    ..NO_GAUGE
+                },
+                NO_GAUGE,
+            ],
+            ..macos_27()
+        };
+        let b = battery_info(&r);
+        assert_close(b.capacity_wh, 4490.0 * 12450.0 / 1_000_000.0);
+        assert_close(b.temperature_c, 30.33);
+        assert_close(b.design_capacity_mah, 4563.0);
+        assert_close(b.max_capacity_mah, 4382.0);
+        assert_close(b.health_pct, 4338.0 / 4563.0 * 100.0);
+    }
+
+    #[test]
+    fn a_value_is_taken_from_the_first_place_that_publishes_it() {
+        let place = |mah| GaugeValues {
+            design_capacity_mah: Some(mah),
+            ..NO_GAUGE
+        };
+        let mut r = macos_27();
+        r.gauge_places = [place(1.0), place(2.0), place(3.0)];
+        assert_eq!(r.gauge(|g| g.design_capacity_mah), Some(1.0));
+        r.gauge_places = [NO_GAUGE, place(2.0), place(3.0)];
+        assert_eq!(r.gauge(|g| g.design_capacity_mah), Some(2.0));
+        r.gauge_places = [NO_GAUGE, NO_GAUGE, place(3.0)];
+        assert_eq!(r.gauge(|g| g.design_capacity_mah), Some(3.0));
+        r.gauge_places = [NO_GAUGE; 3];
+        assert_eq!(r.gauge(|g| g.design_capacity_mah), None);
+    }
+
+    /// Desktop Macs can expose a phantom AppleSmartBattery whose values are
+    /// all zero (see the battery row in app.rs, which recognises it by
+    /// `max_capacity == 0`). Nothing else may look like a reading either.
+    #[test]
+    fn desktop_phantom_battery_reports_nothing_made_up() {
+        let zeros = GaugeValues {
+            nominal_charge_mah: Some(0.0),
+            design_capacity_mah: Some(0.0),
+            raw_max_capacity_mah: Some(0.0),
+            fcc_comp1_mah: Some(0.0),
+            temperature_centi_c: Some(0.0),
+        };
+        let r = BatteryReadings {
+            voltage_mv: Some(0.0),
+            amperage_ma: Some(0.0),
+            current_capacity: Some(0),
+            max_capacity: Some(0),
+            is_charging: Some(false),
+            external_connected: Some(true),
+            time_remaining_min: Some(0),
+            cycle_count: Some(0),
+            gauge_places: [zeros, NO_GAUGE, NO_GAUGE],
+        };
+        let b = battery_info(&r);
+        assert_eq!(b.max_capacity, 0);
+        for value in [
+            b.percent,
+            b.drain_w,
+            b.capacity_wh,
+            b.temperature_c,
+            b.design_capacity_mah,
+            b.max_capacity_mah,
+            b.health_pct,
+        ] {
+            assert_close(value, 0.0);
+        }
+        assert_eq!(b.time_remaining_min, -1);
+    }
+
+    #[test]
+    fn health_is_unknown_without_a_design_capacity() {
+        let mut r = macos_27();
+        for place in &mut r.gauge_places {
+            place.design_capacity_mah = None;
+        }
+        let b = battery_info(&r);
+        assert_close(b.design_capacity_mah, 0.0);
+        assert_close(b.health_pct, 0.0);
+        // What was published is still reported.
+        assert_close(b.max_capacity_mah, 5574.0);
+        assert_close(b.capacity_wh, 5726.0 * 12014.0 / 1_000_000.0);
+    }
+
+    #[test]
+    fn design_capacity_never_stands_in_for_the_full_charge_capacity() {
+        let mut r = macos_27();
+        for place in &mut r.gauge_places {
+            place.raw_max_capacity_mah = None;
+            place.fcc_comp1_mah = None;
+        }
+        let b = battery_info(&r);
+        assert_close(b.design_capacity_mah, 6249.0);
+        assert_close(b.max_capacity_mah, 0.0);
+        assert_close(b.health_pct, 0.0);
+    }
+
+    #[test]
+    fn health_falls_back_to_the_raw_capacity_when_fcc_comp1_is_unusable() {
+        let mut r = macos_27();
+        r.gauge_places[2].raw_max_capacity_mah = Some(5600.0);
+        r.gauge_places[2].fcc_comp1_mah = Some(0.0);
+        assert_close(battery_info(&r).health_pct, 5600.0 / 6249.0 * 100.0);
+        r.gauge_places[2].fcc_comp1_mah = None;
+        assert_close(battery_info(&r).health_pct, 5600.0 / 6249.0 * 100.0);
+    }
+
+    #[test]
+    fn missing_values_are_zero_not_guesses() {
+        let b = battery_info(&BatteryReadings::default());
+        for value in [
+            b.voltage_mv,
+            b.amperage_ma,
+            b.drain_w,
+            b.capacity_wh,
+            b.percent,
+            b.temperature_c,
+            b.design_capacity_mah,
+            b.max_capacity_mah,
+            b.health_pct,
+        ] {
+            assert_close(value, 0.0);
+        }
+        assert_eq!(b.time_remaining_min, -1);
+    }
 }
