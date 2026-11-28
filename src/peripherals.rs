@@ -799,9 +799,26 @@ mod network_tests {
 
 // ── Bluetooth devices via pmset -g accps ─────────────────────────────────────
 
+/// How often accessory batteries are read. They move by a percent over
+/// minutes, and every reading starts a `pmset` process.
+pub const BLUETOOTH_POLL_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a reading is due at `now`; if so, the next one is scheduled a
+/// period later. This lets the source run slower than the thread that drives it.
+pub(crate) fn bluetooth_poll_due(
+    next_poll: &mut std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    if now < *next_poll {
+        return false;
+    }
+    *next_poll = now + BLUETOOTH_POLL_PERIOD;
+    true
+}
+
 pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
     let output = match command_output_timeout(
-        "pmset",
+        "/usr/bin/pmset",
         &["-g", "accps"],
         std::time::Duration::from_millis(1000),
     ) {
@@ -870,9 +887,12 @@ fn parse_bluetooth_devices(output: &[u8]) -> Vec<BluetoothDevice> {
         {
             continue;
         }
-        if let Some(name_end) = trimmed.find(" (id=") {
-            let name = trimmed[1..name_end].trim_start_matches('-').trim();
-            let id: u64 = trimmed[name_end + 5..]
+        if let Some((name, after_name)) = trimmed.split_once(" (id=") {
+            // Accessory lines read " -Name (id=123)\t97%; ...". The dash is
+            // removed as a character, never as "byte 0": a line that begins
+            // with a multi-byte character must not panic the Bluetooth thread.
+            let name = name.trim_start_matches('-').trim();
+            let id: u64 = after_name
                 .split(')')
                 .next()
                 .unwrap_or("0")
@@ -999,5 +1019,88 @@ mod bluetooth_tests {
 
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].name, "Sample’s Keyboard");
+    }
+
+    #[test]
+    fn parses_names_and_battery_status_of_accessory_lines() {
+        let output = "Now drawing from 'Battery Power'\n\
+ -InternalBattery-0 (id=23068771)\t67%; discharging; 1:40 remaining present: true\n\
+ -Sample’s Keyboard (id=58458112)\t97%; discharging present: true\n\
+ -Sample Mouse (id=1234)\t45%; charging; 1:20 remaining present: true\n";
+
+        let devices = parse_bluetooth_devices(output.as_bytes());
+
+        // Sorted by id; the internal battery is not an accessory.
+        let parsed: Vec<(&str, &str)> = devices
+            .iter()
+            .map(|d| (d.name.as_str(), d.batteries[0].1.as_str()))
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                ("Sample Mouse", "45%, charging, 1:20 left"),
+                ("Sample’s Keyboard", "97%"),
+            ]
+        );
+    }
+
+    #[test]
+    fn line_starting_with_a_multibyte_character_does_not_panic() {
+        // A name broken across two lines: the second one starts with a
+        // two-byte "é", so byte offset 1 is not a character boundary.
+        let output = "Now drawing from 'AC Power'\n\
+ -Caf\n\
+é Keyboard (id=58458112)\t80%; discharging present: true\n";
+
+        let devices = parse_bluetooth_devices(output.as_bytes());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "é Keyboard");
+        assert_eq!(devices[0].batteries[0].1, "80%");
+    }
+
+    #[test]
+    fn accessories_are_read_once_per_period_not_once_per_tick() {
+        use super::{bluetooth_poll_due, BLUETOOTH_POLL_PERIOD};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut next_poll = start;
+        let tick = Duration::from_millis(250);
+        let read_at: Vec<Duration> = (0..=120)
+            .map(|i| tick * i)
+            .filter(|&t| bluetooth_poll_due(&mut next_poll, start + t))
+            .collect();
+
+        // 30 s of 250 ms ticks: the first tick reads, then one per period.
+        let period = BLUETOOTH_POLL_PERIOD;
+        assert_eq!(read_at, [Duration::ZERO, period, period * 2, period * 3]);
+    }
+
+    #[test]
+    fn a_late_tick_does_not_trigger_a_burst_of_readings() {
+        use super::{bluetooth_poll_due, BLUETOOTH_POLL_PERIOD};
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut next_poll = start;
+        assert!(bluetooth_poll_due(&mut next_poll, start));
+        // The thread was held up for five periods (sleep, a stuck pmset).
+        let late = start + BLUETOOTH_POLL_PERIOD * 5;
+        assert!(bluetooth_poll_due(&mut next_poll, late));
+        assert!(!bluetooth_poll_due(&mut next_poll, late));
+        assert_eq!(next_poll, late + BLUETOOTH_POLL_PERIOD);
+    }
+
+    #[test]
+    fn mac_roman_line_starting_with_a_high_byte_does_not_panic() {
+        // 0x8E is not valid UTF-8, so the line goes through the Mac OS Roman
+        // decoder, where it is "é": again a two-byte first character.
+        let output = b"\x8E Keyboard (id=7)\t80%; discharging present: true\n";
+
+        let devices = parse_bluetooth_devices(output);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "é Keyboard");
     }
 }

@@ -4,7 +4,6 @@ use crate::iokit_ffi::*;
 use crate::ioreport::IOReportSampler;
 use crate::peripherals;
 use crate::powermetrics;
-use crate::process_utils::command_output_timeout;
 use crate::smc::SmcConnection;
 use crate::types::*;
 use core_foundation_sys::dictionary::{CFDictionaryRef, CFMutableDictionaryRef};
@@ -694,25 +693,95 @@ fn read_audio_info(assertions: &[crate::types::PowerAssertion]) -> AudioInfo {
 
 // ── GPU core count from IORegistry ───────────────────────────────────────────
 
+/// GPU core count: the `gpu-core-count` property of the AGX accelerator, the
+/// registry service that `read_gpu_utilization` polls. 0 when there is none.
 fn read_gpu_core_count() -> u32 {
-    command_output_timeout(
-        "sysctl",
-        &["-n", "machdep.gpu.core_count"],
-        Duration::from_millis(500),
-    )
-        .and_then(|o| std::str::from_utf8(&o.stdout).ok()?.trim().parse().ok())
-        .or_else(|| {
-            command_output_timeout(
-                "bash",
-                &[
-                    "-c",
-                    r#"ioreg -l 2>/dev/null | grep -oE '"gpu-core-count" = [0-9]+' | head -1 | grep -oE '[0-9]+$'"#,
-                ],
-                Duration::from_millis(1000),
-            )
-                .and_then(|o| std::str::from_utf8(&o.stdout).ok()?.trim().parse().ok())
-        })
-        .unwrap_or(0)
+    // SAFETY: IOKit calls on objects owned by this function. The matching
+    // dictionary is consumed by IOServiceGetMatchingServices; the iterator,
+    // every service it yields and every property dictionary are released
+    // exactly once, and `props` is alive while `gpu_core_count_prop` reads it.
+    unsafe {
+        // Every AGXAcceleratorG<generation><variant> driver class derives from
+        // IOAccelerator, so the base class finds the GPU on any chip.
+        let matching = IOServiceMatching(b"IOAccelerator\0".as_ptr() as *const i8);
+        if matching.is_null() {
+            return 0;
+        }
+        let mut iter: u32 = 0;
+        if IOServiceGetMatchingServices(0, matching, &mut iter) != 0 {
+            return 0;
+        }
+        let mut cores = None;
+        while cores.is_none() {
+            let service = IOIteratorNext(iter);
+            if service == 0 {
+                break;
+            }
+            let mut props = std::ptr::null_mut();
+            if IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0) == 0
+                && !props.is_null()
+            {
+                cores = gpu_core_count_prop(props as CFDictionaryRef);
+                cf_utils::cf_release(props as _);
+            }
+            IOObjectRelease(service);
+        }
+        IOObjectRelease(iter);
+        cores.unwrap_or(0)
+    }
+}
+
+/// `gpu-core-count` from the properties of one accelerator service.
+unsafe fn gpu_core_count_prop(props: CFDictionaryRef) -> Option<u32> {
+    let value = cf_utils::cfdict_get(props, "gpu-core-count");
+    // The value is whatever the driver published, and reading anything but a
+    // CFNumber as a number is undefined behaviour, so check the type first.
+    if value.is_null()
+        || core_foundation_sys::base::CFGetTypeID(value)
+            != core_foundation_sys::number::CFNumberGetTypeID()
+    {
+        return None;
+    }
+    cf_utils::cfdict_get_i64(props, "gpu-core-count").and_then(|n| u32::try_from(n).ok())
+}
+
+#[cfg(test)]
+mod gpu_core_count_tests {
+    use super::gpu_core_count_prop;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    fn prop_of(pairs: &[(&str, CFType)]) -> Option<u32> {
+        let pairs: Vec<(CFString, CFType)> = pairs
+            .iter()
+            .map(|(key, value)| (CFString::new(key), value.clone()))
+            .collect();
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        // SAFETY: `dict` is a valid CFDictionary that outlives the call.
+        unsafe { gpu_core_count_prop(dict.as_concrete_TypeRef()) }
+    }
+
+    #[test]
+    fn reads_a_number_property() {
+        let cores = CFNumber::from(40i64).as_CFType();
+        let other = CFNumber::from(7i64).as_CFType();
+        assert_eq!(
+            prop_of(&[("gpu-core-count", cores), ("other", other)]),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn ignores_a_missing_non_number_or_negative_property() {
+        let other = CFNumber::from(7i64).as_CFType();
+        assert_eq!(prop_of(&[("other", other)]), None);
+        let text = CFString::new("40").as_CFType();
+        assert_eq!(prop_of(&[("gpu-core-count", text)]), None);
+        let negative = CFNumber::from(-1i64).as_CFType();
+        assert_eq!(prop_of(&[("gpu-core-count", negative)]), None);
+    }
 }
 
 // ── Sampler ──────────────────────────────────────────────────────────────────
@@ -724,14 +793,7 @@ fn read_gpu_core_count() -> u32 {
 pub use crate::process_power::read_all_process_energy;
 
 fn read_dram_gb() -> u32 {
-    command_output_timeout("sysctl", &["-n", "hw.memsize"], Duration::from_millis(500))
-        .and_then(|o| {
-            std::str::from_utf8(&o.stdout)
-                .ok()?
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
+    crate::topology::sysctl_u64("hw.memsize")
         .map(|bytes| (bytes / (1024 * 1024 * 1024)) as u32)
         .unwrap_or(0)
 }
@@ -1432,7 +1494,15 @@ impl Sampler {
         {
             let m = shared.clone();
             let running = running.clone();
+            // Read every BLUETOOTH_POLL_PERIOD, not every tick. The thread keeps
+            // ticking at `dt` and skips in between: spawn_periodic sleeps a whole
+            // period at a time and Drop joins the thread, so passing the 10 s
+            // period here would make dropping a Sampler take up to 10 s.
+            let mut next_poll = Instant::now();
             spawn_periodic(&mut handles, &running, dt, move || {
+                if !peripherals::bluetooth_poll_due(&mut next_poll, Instant::now()) {
+                    return;
+                }
                 let devs = peripherals::read_bluetooth_devices();
                 let pw: f32 = devs.len() as f32 * BT_PERIPHERAL_W;
                 if let Ok(mut mg) = m.lock() {
