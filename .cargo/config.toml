@@ -1,0 +1,7 @@
+# Supply-chain cooldown: when Cargo resolves dependencies (cargo add, cargo update,
+# a new Cargo.lock), it ignores crate versions published less than 7 days ago.
+# Versions already pinned in Cargo.lock are kept as they are; the lock-age check in
+# .github/workflows/ci.yml covers those. Respected by Cargo 1.100 and newer, which
+# rust-toolchain.toml pins.
+[registry]
+global-min-publish-age = "7 days"

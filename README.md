@@ -241,6 +241,12 @@ If a new chip isn't detected correctly, run `macpow --dump` to see the raw IORep
 > release. A newer Rust, and the lints it adds, arrives only through a
 > commit that changes the version in that file — make it a commit of its
 > own, so CI tests it like any other change.
+>
+> **Dependency age.** No dependency is used before it is 7 days old: not a
+> Rust release, a crate or a GitHub Action. `.cargo/config.toml` makes Cargo
+> skip younger crate versions when it resolves, Dependabot waits 7 days
+> before proposing an update, and CI fails if `Cargo.lock` pins a younger
+> version (`python3 -I .github/scripts/lock-age.py`).
 
 ```bash
 # 1. Bump version

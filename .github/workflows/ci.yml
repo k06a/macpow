@@ -34,6 +34,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Every crate version in Cargo.lock must be at least 7 days old (supply-chain
+      # cooldown; .cargo/config.toml applies the same rule when Cargo resolves).
+      - run: python3 -I .github/scripts/lock-age.py Cargo.lock 7
       # rustup is preinstalled on the runner. Without arguments it installs what
       # rust-toolchain.toml names: the Rust release with rustfmt and clippy.
       - run: rustup toolchain install

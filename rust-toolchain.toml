@@ -7,8 +7,9 @@
 # added by that release then fails a commit that did not touch the code.
 #
 # To move to a newer Rust, change the version in a commit of its own, so that its new
-# lints arrive in a change that CI tests like any other.
+# lints arrive in a change that CI tests like any other. Like every dependency of this
+# project, a Rust release is used only once it is at least 7 days old.
 [toolchain]
-channel = "1.100.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
