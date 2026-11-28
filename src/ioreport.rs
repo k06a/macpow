@@ -1093,9 +1093,14 @@ impl SocEstimator {
         soc.cpu_w = cpu_total.unwrap_or(0.0);
 
         // ── the other PMGR rails ────────────────────────────────────────────
-        // GPU keeps its own live counter (`GPU Energy`, AGX driver). Everything
-        // else the Energy Model listed is frozen: take what CLPC has and file
-        // the remainder of the package under fabric so the SoC total is right.
+        // GPU keeps its own live counter (`GPU Energy`, AGX driver). PCIe
+        // energy isn't PMGR's either: the PCIe drivers publish it, and their
+        // reports stay live under the gate (link-state residency keeps
+        // counting), so it is kept as read and only taken out of the package
+        // remainder. (An M5 Max reads 0 W there all the same: its device tree
+        // gives every PCIe link state a power of 0.) Everything PMGR itself
+        // lists is frozen: take what CLPC has and file the remainder of the
+        // package under fabric so the SoC total is right.
         soc.ane_parts.clear();
         soc.gpu_sram_w = 0.0;
         soc.isp_w = 0.0;
@@ -2894,6 +2899,33 @@ mod tests {
         assert!(!soc.rails_unavailable && !soc.rails_merged);
         assert!(approx(soc.ane_w, 0.5) && approx(soc.dram_w, 2.0) && approx(soc.fabric_w, 1.5));
         assert!(approx(soc.total_w, 10.0 + 1.0 + 0.5 + 2.0 + 1.5));
+    }
+
+    #[test]
+    fn pcie_reading_is_kept_and_taken_out_of_the_package_remainder() {
+        // PCIe energy comes from the PCIe drivers, not from PMGR, so unlike a
+        // PMGR rail (ISP here) it stays a rail of its own.
+        let mut est = SocEstimator::new(&m5_max_topology());
+        let mut raw = raw_soc(0.0, [1.0; 6]);
+        raw.em.pcie_w = 2.0;
+        raw.em.isp_w = 0.7;
+        raw.clpc = ClpcSample {
+            cpu_w: Some(14.0),
+            gpu_w: Some(1.0),
+            ane_w: Some(0.5),
+            dram_w: Some(2.0),
+            dcs_w: Some(1.5),
+            package_w: Some(22.0),
+            clusters_w: None,
+        };
+        let soc = est.assemble(raw);
+        assert!(approx(soc.pcie_w, 2.0) && approx(soc.isp_w, 0.0));
+        assert!(approx(
+            soc.fabric_w,
+            1.5 + (22.0 - 14.0 - 1.0 - 0.5 - 2.0 - 1.5 - 2.0)
+        ));
+        // Counted once: the total is still the package.
+        assert!(soc.rails_merged && approx(soc.total_w, 22.0));
     }
 
     #[test]
