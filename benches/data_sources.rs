@@ -72,9 +72,11 @@ fn bench_battery(c: &mut Criterion) {
 }
 
 fn bench_peripherals(c: &mut Criterion) {
-    bench_source(c, "wifi", peripherals::read_wifi_info, |w| {
-        !w.interface_name.is_empty()
-    });
+    // One reader for every call, as in the sampler: it runs the `ipconfig` SSID
+    // fallback once per 30 s, where a fresh reader per call would time that
+    // subprocess on every iteration.
+    let mut wifi = peripherals::WifiReader::default();
+    bench_source(c, "wifi", || wifi.read(), |w| !w.interface_name.is_empty());
     // These enumerate whatever is attached right now: an empty list is a valid result, and the
     // cost grows with the number of entries.
     c.bench_function("bluetooth", |b| b.iter(peripherals::read_bluetooth_devices));
