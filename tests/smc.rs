@@ -73,3 +73,17 @@ fn dump_integers_match_independent_sources() {
         _ => eprintln!("no battery or no B0CT key, cycle count not checked"),
     }
 }
+
+/// The wireless sensor is spelt `TW0P` (upper-case W) and belongs to the
+/// "Wireless" category, not to "Other".
+#[test]
+fn wireless_sensor_is_categorised() {
+    let mut smc = SmcConnection::open().expect("SMC should open on Apple Silicon");
+    let handle = smc.start_temp_discovery();
+    smc.finish_temp_discovery(handle);
+    let temps = smc.read_temperatures();
+    match temps.iter().find(|t| t.key == "TW0P") {
+        Some(sensor) => assert_eq!(sensor.category, "Wireless"),
+        None => eprintln!("no TW0P sensor on this machine, nothing to check"),
+    }
+}
