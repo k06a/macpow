@@ -149,8 +149,10 @@ pub fn read_display_brightness() -> Option<f32> {
 
 /// Read linear brightness (0.0–1.0) — proportional to actual light output (nits).
 /// Unlike GetBrightness (perceptual/gamma-corrected), this is linear, and 1.0
-/// is the active preset's SDR white, not its HDR peak:
+/// is close to the active preset's SDR white, not its HDR peak:
 /// nits ≈ linear_brightness * preset SDR cap (see `display_nits`).
+/// Only close: with a 600-nit SDR cap on an M5 Max, the panel's own level
+/// divided by this value was 600 in one session and 717-720 in all later ones.
 pub fn read_display_linear_brightness() -> Option<f32> {
     let get_linear =
         (*DISPLAY_LINEAR_BRIGHTNESS_FN.get_or_init(load_display_linear_brightness_fn))?;
@@ -189,6 +191,14 @@ fn nits_from_fixed_16_16(raw: i64) -> Option<f32> {
     (raw >= 0).then(|| (raw as f64 / 65536.0) as f32)
 }
 
+/// Whether the main display is the Mac's own panel rather than an external
+/// display.
+fn main_display_is_builtin() -> bool {
+    // SAFETY: both functions take and return plain integers and accept any
+    // display ID, including one that is no longer online.
+    unsafe { CGDisplayIsBuiltin(CGMainDisplayID()) != 0 }
+}
+
 /// Luminance the built-in panel is driven at right now, in nits, as published
 /// by its own framebuffer driver: the `IOMFBBrightnessLevel` property below
 /// the `disp0` device node.
@@ -206,15 +216,15 @@ pub fn read_panel_nits() -> Option<f32> {
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
 
+    if !main_display_is_builtin() {
+        return None;
+    }
     // SAFETY: every pointer handed to IOKit is either a NUL-terminated
     // literal or a live CFString, and each result is checked before use.
     // Ownership follows the documented rules: IOServiceGetMatchingService
     // consumes the matching dictionary, the service port is released once,
     // and the property (Create rule) is released when `value` is dropped.
     unsafe {
-        if CGDisplayIsBuiltin(CGMainDisplayID()) == 0 {
-            return None;
-        }
         let matching = IOServiceNameMatching(b"disp0\0".as_ptr() as *const i8);
         if matching.is_null() {
             return None;
@@ -277,6 +287,16 @@ fn display_nits(
     // A boost only ever raises the level; a factor below 1 is not a boost.
     let boost = hdr_boost.unwrap_or(1.0).max(1.0);
     Some((linear_brightness? * sdr_cap * boost).min(hdr_cap))
+}
+
+/// HDR boost in effect on the main display, for [`display_nits`].
+///
+/// `hdr_active` and `dpb_factor` are read from AppleARMBacklight, the
+/// backlight of the built-in panel, so they describe the main display only
+/// when that is the built-in panel. HDR video on the laptop's own screen must
+/// not raise the modelled level of an external display that is main.
+fn main_display_hdr_boost(main_is_builtin: bool, hdr_active: bool, dpb_factor: f32) -> Option<f32> {
+    (main_is_builtin && hdr_active).then_some(dpb_factor)
 }
 
 /// Classify the panel from its peak millinits into static SDR/HDR/XDR class.
@@ -754,6 +774,20 @@ mod display_tests {
     fn nits_are_unknown_without_any_input() {
         assert_eq!(display_nits(None, None, SDR_CAP, HDR_CAP, None), None);
         assert_eq!(display_nits(None, None, SDR_CAP, HDR_CAP, Some(2.0)), None);
+    }
+
+    #[test]
+    fn hdr_boost_of_the_builtin_backlight_stays_on_the_builtin_panel() {
+        assert_eq!(main_display_hdr_boost(true, true, 2.0), Some(2.0));
+        assert_eq!(main_display_hdr_boost(true, false, 1.0), None);
+        // Lid open, an external display is main, HDR video plays on the
+        // built-in panel: the external display's level is not doubled.
+        let boost = main_display_hdr_boost(false, true, 2.0);
+        assert_eq!(boost, None);
+        assert_nits(
+            display_nits(None, Some(0.5), SDR_CAP, HDR_CAP, boost),
+            300.0,
+        );
     }
 
     // IO flags as CoreGraphics reports them on a 14" MacBook Pro (M5 Max):
@@ -1669,6 +1703,7 @@ impl Sampler {
             handles.push(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     let brightness = read_display_brightness();
+                    let main_is_builtin = main_display_is_builtin();
                     let panel_nits = read_panel_nits();
                     // Only the fallback model needs this second round trip
                     // to DisplayServices.
@@ -1713,7 +1748,11 @@ impl Sampler {
                                 sdr_cap
                             };
                             mg.display.peak_nits = hdr_cap;
-                            let hdr_boost = mg.display.hdr_active.then_some(mg.display.dpb_factor);
+                            let hdr_boost = main_display_hdr_boost(
+                                main_is_builtin,
+                                mg.display.hdr_active,
+                                mg.display.dpb_factor,
+                            );
                             // 0 = unknown; the TUI then omits the figure.
                             mg.display.nits = display_nits(
                                 panel_nits,
