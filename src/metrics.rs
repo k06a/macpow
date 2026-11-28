@@ -1552,7 +1552,15 @@ impl Sampler {
         {
             let m = shared.clone();
             let running = running.clone();
+            // Read every BLUETOOTH_POLL_PERIOD, not every tick. The thread keeps
+            // ticking at `dt` and skips in between: spawn_periodic sleeps a whole
+            // period at a time and Drop joins the thread, so passing the 10 s
+            // period here would make dropping a Sampler take up to 10 s.
+            let mut next_poll = Instant::now();
             spawn_periodic(&mut handles, &running, dt, move || {
+                if !peripherals::bluetooth_poll_due(&mut next_poll, Instant::now()) {
+                    return;
+                }
                 let devs = peripherals::read_bluetooth_devices();
                 let pw: f32 = devs.len() as f32 * BT_PERIPHERAL_W;
                 if let Ok(mut mg) = m.lock() {

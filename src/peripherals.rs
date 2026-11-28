@@ -444,6 +444,23 @@ pub fn read_wifi_info() -> WifiInfo {
 
 // ── Bluetooth devices via pmset -g accps ─────────────────────────────────────
 
+/// How often accessory batteries are read. They move by a percent over
+/// minutes, and every reading starts a `pmset` process.
+pub const BLUETOOTH_POLL_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a reading is due at `now`; if so, the next one is scheduled a
+/// period later. This lets the source run slower than the thread that drives it.
+pub(crate) fn bluetooth_poll_due(
+    next_poll: &mut std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    if now < *next_poll {
+        return false;
+    }
+    *next_poll = now + BLUETOOTH_POLL_PERIOD;
+    true
+}
+
 pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
     let output = match command_output_timeout(
         "/usr/bin/pmset",
@@ -685,6 +702,39 @@ mod bluetooth_tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].name, "é Keyboard");
         assert_eq!(devices[0].batteries[0].1, "80%");
+    }
+
+    #[test]
+    fn accessories_are_read_once_per_period_not_once_per_tick() {
+        use super::{bluetooth_poll_due, BLUETOOTH_POLL_PERIOD};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut next_poll = start;
+        let tick = Duration::from_millis(250);
+        let read_at: Vec<Duration> = (0..=120)
+            .map(|i| tick * i)
+            .filter(|&t| bluetooth_poll_due(&mut next_poll, start + t))
+            .collect();
+
+        // 30 s of 250 ms ticks: the first tick reads, then one per period.
+        let period = BLUETOOTH_POLL_PERIOD;
+        assert_eq!(read_at, [Duration::ZERO, period, period * 2, period * 3]);
+    }
+
+    #[test]
+    fn a_late_tick_does_not_trigger_a_burst_of_readings() {
+        use super::{bluetooth_poll_due, BLUETOOTH_POLL_PERIOD};
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut next_poll = start;
+        assert!(bluetooth_poll_due(&mut next_poll, start));
+        // The thread was held up for five periods (sleep, a stuck pmset).
+        let late = start + BLUETOOTH_POLL_PERIOD * 5;
+        assert!(bluetooth_poll_due(&mut next_poll, late));
+        assert!(!bluetooth_poll_due(&mut next_poll, late));
+        assert_eq!(next_poll, late + BLUETOOTH_POLL_PERIOD);
     }
 
     #[test]
