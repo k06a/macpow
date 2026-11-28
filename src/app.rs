@@ -529,6 +529,9 @@ pub struct App {
     // Insert-only: labels are kept for chart titles of dead/pinned processes.
     labels: BTreeMap<&'static str, String>,
     proc_baseline: std::collections::HashMap<i32, f64>,
+    /// `all_procs_energy_mj` at the last reset. The per-pid baselines above cannot
+    /// stand in for it: the total also covers processes that are not listed.
+    proc_total_baseline: f64,
     proc_keys: std::collections::HashMap<i32, &'static str>,
     proc_prev_disk: std::collections::HashMap<i32, (u64, u64, Instant)>,
     proc_prev_net: std::collections::HashMap<i32, (u64, u64, Instant)>,
@@ -593,6 +596,7 @@ impl App {
             row_is_sep: Vec::new(),
             labels: BTreeMap::new(),
             proc_baseline: std::collections::HashMap::new(),
+            proc_total_baseline: 0.0,
             proc_keys: std::collections::HashMap::new(),
             proc_prev_disk: std::collections::HashMap::new(),
             proc_prev_net: std::collections::HashMap::new(),
@@ -851,7 +855,7 @@ impl App {
                     self.proc_net_rates.insert(p.pid, (nr, nt));
                     self.proc_prev_net
                         .insert(p.pid, (p.net_rx_bytes, p.net_tx_bytes, now));
-                } else if elapsed > 2.0 {
+                } else if elapsed > macpow::process_power::NET_COUNTERS_IDLE_SECS {
                     self.proc_net_rates.insert(p.pid, (0.0, 0.0));
                 }
             } else {
@@ -1050,6 +1054,7 @@ impl App {
             .iter()
             .map(|p| (p.pid, p.energy_mj))
             .collect();
+        self.proc_total_baseline = self.metrics.all_procs_energy_mj;
     }
 
     fn cycle_sma(&mut self) {
@@ -2579,8 +2584,7 @@ impl App {
 
         // ── Software (standalone collapsible section after the tree)
         rows.push(TreeRow::separator());
-        let all_sw_energy =
-            (m.all_procs_energy_mj - self.proc_baseline.values().sum::<f64>()).max(0.0);
+        let all_sw_energy = (m.all_procs_energy_mj - self.proc_total_baseline).max(0.0);
         // Dynamic limit: count only visible rows (after collapse filtering)
         let visible_tree_rows = rows.iter().filter(|r| !self.is_hidden(r, &rows)).count();
         let chart_slots = if self.pinned.is_empty() {

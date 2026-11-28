@@ -9,6 +9,7 @@ pub mod ioreport;
 pub mod metrics;
 pub mod peripherals;
 pub mod powermetrics;
+pub mod process_power;
 pub mod process_utils;
 pub mod sma;
 pub mod smc;

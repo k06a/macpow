@@ -719,67 +719,9 @@ fn read_gpu_core_count() -> u32 {
 
 // ── Per-process energy via proc_pid_rusage ───────────────────────────────────
 
-extern "C" {
-    fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
-    fn proc_name(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
-}
-
-const RUSAGE_INFO_V4: i32 = 4;
-// rusage_info_v4: 16-byte UUID + 35 uint64_t fields = 296 bytes
-// ri_billed_energy is field #31 (0-indexed) after the UUID
-const BILLED_ENERGY_OFFSET: usize = 16 + 31 * 8; // = 264
-const DISKIO_READ_OFFSET: usize = 16 + 16 * 8; // = 144 (ri_diskio_bytesread)
-const DISKIO_WRITE_OFFSET: usize = 16 + 17 * 8; // = 152 (ri_diskio_byteswritten)
-const PHYS_FOOTPRINT_OFFSET: usize = 16 + 7 * 8; // = 72 (ri_phys_footprint)
-const RUSAGE_V4_SIZE: usize = 16 + 35 * 8; // = 296
-
-/// Per-process resource data: (name, energy_nj, disk_read, disk_write, phys_mem)
-pub fn read_all_process_energy() -> std::collections::HashMap<i32, (String, u64, u64, u64, u64)> {
-    let mut result = std::collections::HashMap::new();
-    unsafe {
-        let mut pids = vec![0i32; 4096];
-        let n = proc_listallpids(pids.as_mut_ptr(), (pids.len() * 4) as i32);
-        if n <= 0 {
-            return result;
-        }
-
-        let mut buf = vec![0u8; RUSAGE_V4_SIZE];
-        let mut name_buf = vec![0u8; 256];
-
-        for i in 0..n as usize {
-            let pid = pids[i];
-            if pid <= 0 {
-                continue;
-            }
-
-            let ret = proc_pid_rusage(pid, RUSAGE_INFO_V4, buf.as_mut_ptr());
-            if ret != 0 {
-                continue;
-            }
-
-            let read_u64 = |off: usize| -> u64 {
-                u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]))
-            };
-            let energy_nj = read_u64(BILLED_ENERGY_OFFSET);
-            if energy_nj == 0 {
-                continue;
-            }
-            let disk_r = read_u64(DISKIO_READ_OFFSET);
-            let disk_w = read_u64(DISKIO_WRITE_OFFSET);
-            let phys_mem = read_u64(PHYS_FOOTPRINT_OFFSET);
-
-            name_buf.fill(0);
-            proc_name(pid, name_buf.as_mut_ptr(), 256);
-            let name = std::ffi::CStr::from_ptr(name_buf.as_ptr() as *const i8)
-                .to_string_lossy()
-                .into_owned();
-
-            result.insert(pid, (name, energy_nj, disk_r, disk_w, phys_mem));
-        }
-    }
-    result
-}
+// The reader and the accounting live in `process_power`. Re-exported so that
+// `metrics::read_all_process_energy` keeps working for existing callers.
+pub use crate::process_power::read_all_process_energy;
 
 fn read_dram_gb() -> u32 {
     command_output_timeout("sysctl", &["-n", "hw.memsize"], Duration::from_millis(500))
@@ -1546,100 +1488,31 @@ impl Sampler {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                // (name, energy_nj, session_mj, delta_nj, dt_s, last_seen, disk_r, disk_w, phys_mem)
-                #[allow(clippy::type_complexity)]
-                let mut known: std::collections::HashMap<
-                    i32,
-                    (String, u64, f64, u64, f64, Instant, u64, u64, u64),
-                > = std::collections::HashMap::new();
-                let mut proc_sma: std::collections::HashMap<i32, crate::sma::TimeSma> =
-                    std::collections::HashMap::new();
-                let mut total_sma = crate::sma::TimeSma::new(5.0);
+                use crate::process_power::{refresh_due, ProcessTracker, NET_COUNTERS_REFRESH};
+                let mut tracker = ProcessTracker::default();
+                let mut net = powermetrics::ProcNetCounters::new();
+                let mut net_read_at = None;
                 while running.load(Ordering::Relaxed) {
-                    let cur = read_all_process_energy();
-                    let net = powermetrics::read_proc_net_counters();
+                    let scan = read_all_process_energy();
+                    // Stamp the scan before anything slower runs, so the time
+                    // between two stamps is the time the energy deltas cover.
                     let now = Instant::now();
-
-                    for (&pid, (name, energy_nj, disk_r, disk_w, phys_mem)) in &cur {
-                        let energy_nj = *energy_nj;
-                        let entry = known.entry(pid).or_insert_with(|| {
-                            (name.clone(), energy_nj, 0.0, 0, 0.0, now, 0u64, 0u64, 0u64)
-                        });
-                        // Detect PID reuse: name changed or energy counter reset
-                        if entry.0 != *name || energy_nj < entry.1 {
-                            *entry = (
-                                name.clone(),
-                                energy_nj,
-                                0.0,
-                                0,
-                                0.0,
-                                now,
-                                *disk_r,
-                                *disk_w,
-                                *phys_mem,
-                            );
-                            continue;
-                        }
-                        let delta_nj = energy_nj.saturating_sub(entry.1);
-                        let dt_s = now.duration_since(entry.5).as_secs_f64();
-                        entry.0 = name.clone();
-                        entry.1 = energy_nj;
-                        entry.2 += delta_nj as f64 / 1e6;
-                        entry.3 = delta_nj;
-                        entry.4 = dt_s;
-                        entry.5 = now;
-                        entry.6 = *disk_r;
-                        entry.7 = *disk_w;
-                        entry.8 = *phys_mem;
+                    if refresh_due(net_read_at, now, NET_COUNTERS_REFRESH) {
+                        net = powermetrics::read_proc_net_counters();
+                        net_read_at = Some(now);
                     }
 
-                    known.retain(|_, entry| now.duration_since(entry.5).as_secs() < 30);
-
-                    let mut procs: Vec<ProcessPower> = known
-                        .iter()
-                        .filter(|(_, entry)| entry.2 > 0.0)
-                        .map(|(&pid, entry)| {
-                            let raw_power = if entry.4 > 0.01 {
-                                (entry.3 as f64 / 1e9 / entry.4) as f32
-                            } else {
-                                0.0
-                            };
-                            let sma = proc_sma
-                                .entry(pid)
-                                .or_insert_with(|| crate::sma::TimeSma::new(5.0));
-                            sma.push(raw_power);
-                            let power_w = sma.get();
-                            let alive = cur.contains_key(&pid);
-                            let (net_rx, net_tx) = net.get(&pid).copied().unwrap_or((0, 0));
-                            ProcessPower {
-                                pid,
-                                name: entry.0.clone(),
-                                power_w,
-                                energy_mj: entry.2,
-                                alive,
-                                disk_read_bytes: entry.6,
-                                disk_write_bytes: entry.7,
-                                phys_mem_bytes: entry.8,
-                                net_rx_bytes: net_rx,
-                                net_tx_bytes: net_tx,
-                            }
-                        })
-                        .collect();
-                    proc_sma.retain(|pid, _| known.contains_key(pid));
-                    let total_raw: f32 = procs.iter().map(|p| p.power_w).sum();
-                    total_sma.push(total_raw);
-                    let total_power = total_sma.get();
-                    let total_energy: f64 = procs.iter().map(|p| p.energy_mj).sum();
-                    procs.sort_by(|a, b| {
-                        b.energy_mj
-                            .partial_cmp(&a.energy_mj)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    procs.truncate(50);
+                    let mut report = tracker.update(&scan, now);
+                    for p in &mut report.processes {
+                        if let Some(&(rx, tx)) = net.get(&p.pid) {
+                            p.net_rx_bytes = rx;
+                            p.net_tx_bytes = tx;
+                        }
+                    }
                     if let Ok(mut mg) = m.lock() {
-                        mg.all_procs_power_w = total_power;
-                        mg.all_procs_energy_mj = total_energy;
-                        mg.top_processes = procs;
+                        mg.all_procs_power_w = report.total_power_w;
+                        mg.all_procs_energy_mj = report.total_energy_mj;
+                        mg.top_processes = report.processes;
                     }
 
                     std::thread::sleep(dt);
