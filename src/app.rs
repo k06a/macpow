@@ -930,7 +930,7 @@ impl App {
             KeyCode::Char('r') => self.reset(),
             KeyCode::Char('a') => self.cycle_sma(),
             KeyCode::Char('l') => self.cycle_latency(),
-            KeyCode::Home => self.cursor = 0,
+            KeyCode::Home => self.cursor = cursor_target(&self.row_is_sep, 0, 0),
             KeyCode::PageUp => self.move_cursor(-10),
             KeyCode::PageDown => self.move_cursor(10),
             KeyCode::Char(' ') => self.toggle_pin(),
@@ -942,15 +942,7 @@ impl App {
     }
 
     fn move_cursor(&mut self, delta: i32) {
-        let max = self.total_rows.saturating_sub(1) as i32;
-        let mut pos = (self.cursor as i32 + delta).clamp(0, max);
-        let dir = if delta >= 0 { 1 } else { -1 };
-        // Skip separator rows
-        while pos >= 0 && pos <= max && self.row_is_sep.get(pos as usize).copied().unwrap_or(false)
-        {
-            pos += dir;
-        }
-        self.cursor = pos.clamp(0, max) as usize;
+        self.cursor = cursor_target(&self.row_is_sep, self.cursor, delta);
     }
 
     pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
@@ -980,12 +972,8 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp => {
-                self.cursor = self.cursor.saturating_sub(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.cursor = (self.cursor + 3).min(self.total_rows.saturating_sub(1));
-            }
+            MouseEventKind::ScrollUp => self.move_cursor(-3),
+            MouseEventKind::ScrollDown => self.move_cursor(3),
             _ => {}
         }
     }
@@ -3515,6 +3503,27 @@ fn nice_scale(max_val: f64) -> f64 {
         .unwrap_or(max_val.ceil().max(1.0))
 }
 
+/// The row the cursor lands on when it moves `delta` rows from `cursor`
+/// (`is_sep[i]`: row `i` is a separator). The move stops at the first and the
+/// last row; from there the nearest row that is not a separator is taken,
+/// looking in the direction of travel first and then back.
+fn cursor_target(is_sep: &[bool], cursor: usize, delta: i32) -> usize {
+    let Some(max) = is_sep.len().checked_sub(1) else {
+        return 0;
+    };
+    let start = (cursor as i64 + i64::from(delta)).clamp(0, max as i64) as usize;
+    let usable = |i: &usize| !is_sep[*i];
+    let up = || (0..=start).rev().find(usable);
+    let down = || (start..=max).find(usable);
+    let row = if delta < 0 {
+        up().or_else(down)
+    } else {
+        down().or_else(up)
+    };
+    // Only separators: stay where the move ended.
+    row.unwrap_or(start)
+}
+
 /// Chart axis label for a power in watts. Fits the 6-column axis for every
 /// scale `nice_scale` picks: whole watts first, or 50 W would read "50000mW".
 fn fmt_axis_power(w: f64) -> String {
@@ -3728,6 +3737,47 @@ mod tests {
             value_celsius: temp,
             stale: false,
         }
+    }
+
+    #[test]
+    fn cursor_never_rests_on_a_separator() {
+        // The tree starts with a separator under the header, as on screen.
+        let sep = [true, false, false, true, false];
+        // Up from the first data row used to end on the separator above it.
+        assert_eq!(cursor_target(&sep, 1, -1), 1);
+        assert_eq!(cursor_target(&sep, 4, -10), 1);
+        // Home is a move to row 0.
+        assert_eq!(cursor_target(&sep, 0, 0), 1);
+        // A separator in the way is skipped in the direction of travel.
+        assert_eq!(cursor_target(&sep, 2, 1), 4);
+        assert_eq!(cursor_target(&sep, 4, -1), 2);
+        assert_eq!(cursor_target(&sep, 2, 10), 4);
+        // Past a separator at the end, the nearest row before it.
+        assert_eq!(cursor_target(&[false, false, true], 0, 5), 1);
+        assert_eq!(cursor_target(&[], 3, -1), 0);
+        assert_eq!(cursor_target(&[true], 0, 1), 0);
+    }
+
+    #[test]
+    fn home_and_the_wheel_skip_the_top_separator() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = App::new(250);
+        app.row_is_sep = vec![true, false, false, false, false];
+        app.total_rows = app.row_is_sep.len();
+        app.cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.cursor, 1);
+        app.cursor = 2;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.cursor, 1);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.cursor, 4);
     }
 
     #[test]
