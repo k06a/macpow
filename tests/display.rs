@@ -3,7 +3,8 @@
 //! `system_profiler`), not with macpow's own FFI readers.
 //!
 //! Each check passes with a "skipped" note when its source has nothing to
-//! compare against: no built-in panel, display asleep, virtual machine.
+//! compare against: no built-in panel, display asleep, virtual machine, or a
+//! system language other than English for `system_profiler`.
 
 use macpow::metrics;
 use macpow::types::DisplayInfo;
@@ -64,8 +65,13 @@ fn ioreg_panel_nits() -> Option<f32> {
     Some(raw as f32 / 65536.0)
 }
 
-/// "Resolution: W x H" of the display that `system_profiler` marks as main.
-fn system_profiler_main_resolution() -> Option<(u32, u32)> {
+/// Text after "Resolution:" for the display that `system_profiler` marks as
+/// main, e.g. "3024 x 1964 Retina".
+///
+/// For an Apple panel this is a constant looked up by the panel's product ID,
+/// so it names the physical panel whatever scaling is selected. (For other
+/// displays it follows the current mode.)
+fn system_profiler_main_resolution() -> Option<String> {
     let out = Command::new("/usr/sbin/system_profiler")
         .arg("SPDisplaysDataType")
         .output()
@@ -74,9 +80,7 @@ fn system_profiler_main_resolution() -> Option<(u32, u32)> {
     let mut resolution = None;
     for line in text.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix("Resolution: ") {
-            // "3024 x 1964 Retina": the first two numbers.
-            let mut numbers = rest.split_whitespace().filter_map(|w| w.parse().ok());
-            resolution = numbers.next().zip(numbers.next());
+            resolution = Some(rest.to_string());
         } else if line == "Main Display: Yes" {
             return resolution;
         }
@@ -86,8 +90,43 @@ fn system_profiler_main_resolution() -> Option<(u32, u32)> {
 
 /// `system_profiler` now and then answers without any display section (seen
 /// in about one run in eight, always an instant reply), so ask a few times.
-fn main_resolution() -> Option<(u32, u32)> {
+fn main_resolution() -> Option<String> {
     (0..4).find_map(|_| system_profiler_main_resolution())
+}
+
+/// The "W x H" pair inside a resolution string of `system_profiler`. The pair
+/// is not always in front ("Retina 4.5K (4480 x 2520)") and other numbers can
+/// surround it, so it is located by its " x ".
+fn parse_resolution(text: &str) -> Option<(u32, u32)> {
+    let (before, after) = text.split_once(" x ")?;
+    let width = before.rsplit(|c: char| !c.is_ascii_digit()).next()?;
+    let height = after.split(|c: char| !c.is_ascii_digit()).next()?;
+    Some((width.parse().ok()?, height.parse().ok()?))
+}
+
+#[test]
+fn resolution_is_read_from_every_system_profiler_format() {
+    // Strings from the Localizable.loctable of SPDisplaysReporter.
+    for (text, expected) in [
+        ("3024 x 1964 Retina", (3024, 1964)),
+        ("Retina 4.5K (4480 x 2520)", (4480, 2520)),
+        ("Retina 5K (5120 x 2880)", (5120, 2880)),
+        ("6016 x 3384 Retina 6K", (6016, 3384)),
+        (
+            "3840 x 2160 (2160p/4K UHD 1 - Ultra High Definition)",
+            (3840, 2160),
+        ),
+        (
+            "1920 x 1080 @ 60Hz (1080p FHD - Full High Definition)",
+            (1920, 1080),
+        ),
+        ("704 x 480 60Hz (480i)", (704, 480)),
+    ] {
+        assert_eq!(parse_resolution(text), Some(expected), "{text:?}");
+    }
+    for text in ["", "Retina", "Retina 5K", "3024 by 1964", "wide x tall"] {
+        assert_eq!(parse_resolution(text), None, "{text:?}");
+    }
 }
 
 #[test]
@@ -123,20 +162,31 @@ fn nits_match_the_level_the_panel_is_driven_at() {
 }
 
 #[test]
-fn width_and_height_are_pixels_not_points() {
+fn width_and_height_are_the_panel_pixels() {
     let _guard = ONE_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(display) = sample_display() else {
         eprintln!("skipped: no display in the sampler");
         return;
     };
-    // system_profiler lists no display at all while the display sleeps.
-    let Some(expected) = main_resolution() else {
-        eprintln!("skipped: system_profiler reports no main display");
+    // system_profiler lists no display at all while the display sleeps, and
+    // its labels are translated when the system language is not English.
+    let Some(resolution) = main_resolution() else {
+        eprintln!(
+            "skipped: system_profiler printed no \"Resolution:\" line followed by \
+             \"Main Display: Yes\""
+        );
+        return;
+    };
+    let Some(expected) = parse_resolution(&resolution) else {
+        eprintln!("skipped: no \"W x H\" in system_profiler's resolution {resolution:?}");
         return;
     };
     eprintln!(
-        "macpow {} x {}; system_profiler {} x {}",
-        display.width_px, display.height_px, expected.0, expected.1
+        "macpow {} x {}; system_profiler {resolution:?}",
+        display.width_px, display.height_px
     );
+    // Not the size in points (half of this on a Retina mode) and not the
+    // rendered size of a scaled mode (3600 x 2338 for "More Space" on a
+    // 3024 x 1964 panel).
     assert_eq!((display.width_px, display.height_px), expected);
 }
