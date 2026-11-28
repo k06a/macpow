@@ -175,7 +175,7 @@ pub type ProcNetCounters = HashMap<i32, (u64, u64)>; // pid → (rx_bytes, tx_by
 /// Returns in ~18ms. Parses CSV: "name.pid,,iface,state,bytes_in,bytes_out,..."
 pub fn read_proc_net_counters() -> ProcNetCounters {
     let output = match command_output_timeout(
-        "nettop",
+        "/usr/bin/nettop",
         &["-P", "-n", "-L", "1", "-x"],
         std::time::Duration::from_millis(1000),
     ) {

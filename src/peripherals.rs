@@ -446,7 +446,7 @@ pub fn read_wifi_info() -> WifiInfo {
 
 pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
     let output = match command_output_timeout(
-        "pmset",
+        "/usr/bin/pmset",
         &["-g", "accps"],
         std::time::Duration::from_millis(1000),
     ) {
