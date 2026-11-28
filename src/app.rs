@@ -538,6 +538,7 @@ pub struct App {
     proc_net_rates: std::collections::HashMap<i32, (f64, f64)>,
     fan_wh: Vec<f64>,
     usb_wh: Vec<f64>,
+    usb_orphan_wh: std::collections::HashMap<u32, f64>,
     usb_prev_bytes: Vec<(u64, u64)>,
     usb_rates: Vec<(f64, f64)>,
     machine_name: String,
@@ -601,6 +602,7 @@ impl App {
             proc_net_rates: std::collections::HashMap::new(),
             fan_wh: Vec::new(),
             usb_wh: Vec::new(),
+            usb_orphan_wh: std::collections::HashMap::new(),
             usb_prev_bytes: Vec::new(),
             usb_rates: Vec::new(),
             machine_name,
@@ -665,7 +667,8 @@ impl App {
             self.usb_wh.resize(m.usb_devices.len(), 0.0);
             self.usb_rates.resize(m.usb_devices.len(), (0.0, 0.0));
             self.usb_prev_bytes.resize(m.usb_devices.len(), (0, 0));
-            let port_power = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
+            let (port_power, orphan_ports) =
+                assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
             for (i, d) in m.usb_devices.iter().enumerate() {
                 let watts =
                     port_power[i].unwrap_or(d.power_ma.unwrap_or(0) as f32 * 5.0 / 1000.0) as f64;
@@ -678,6 +681,13 @@ impl App {
                     );
                 }
                 self.usb_prev_bytes[i] = (d.bytes_read, d.bytes_written);
+            }
+            // Accumulate Wh for charging-only ports that matched no device,
+            // keyed by stable PortIndex so reordering doesn't lose energy.
+            for &pi in &orphan_ports {
+                let port = &m.usb_power_per_port[pi];
+                *self.usb_orphan_wh.entry(port.port_index).or_insert(0.0) +=
+                    port.power_w as f64 * dt_h;
             }
             self.wh.wifi += if m.wifi_power_w > 0.0 {
                 m.wifi_power_w as f64 * dt_h
@@ -757,10 +767,14 @@ impl App {
             self.push_history(fan_key(i), fan.estimated_power_w as f64);
         }
         {
-            let pp = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
+            let (pp, orphan_ports) = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
             for (i, d) in m.usb_devices.iter().enumerate() {
                 let watts = pp[i].unwrap_or(d.power_ma.unwrap_or(0) as f32 * 5.0 / 1000.0);
                 self.push_history(usb_key(i), watts as f64);
+            }
+            for &pi in &orphan_ports {
+                let port = &m.usb_power_per_port[pi];
+                self.push_history(usb_port_key(port.port_index), port.power_w as f64);
             }
         }
         self.push_history(
@@ -1027,6 +1041,7 @@ impl App {
         self.history.clear();
         self.fan_wh.iter_mut().for_each(|v| *v = 0.0);
         self.usb_wh.iter_mut().for_each(|v| *v = 0.0);
+        self.usb_orphan_wh.clear();
         self.usb_prev_bytes.clear();
         self.usb_rates.clear();
         self.proc_baseline = self
@@ -1383,26 +1398,56 @@ impl App {
             let soc_wh = w.cpu + w.gpu + w.ane + w.dram + w.gpu_sram + w.isp + w.media + w.fabric;
             let cp = c("soc");
 
-            rows.push(TreeRow::pw(
+            // Where the OS withholds the Energy Model and nothing replaces
+            // it, the SoC figure is a partial sum: say what it covers.
+            let soc_label = if m.soc.cpu_unavailable {
+                "SoC (GPU only)"
+            } else if m.soc.rails_unavailable {
+                "SoC (CPU + GPU only)"
+            } else {
+                "SoC"
+            };
+            let soc_row = if m.soc.cpu_estimated {
+                TreeRow::pw_est
+            } else {
+                TreeRow::pw
+            };
+            rows.push(soc_row(
                 "soc",
                 Some("system"),
                 &t("soc"),
-                "SoC",
+                soc_label,
                 s.soc_total.get(),
                 soc_wh,
                 BOLD,
                 pin("soc"),
             ));
-            // Per-CPU usage from Mach API (first e_count are E-cores, next p_count are P-cores)
-            // Mach API returns P-cores first (perflevel0), then E-cores (perflevel1)
+            // Per-CPU usage from the Mach API, indexed by logical CPU. Which
+            // logical CPUs form the top tier is chip-specific (M1–M4 put the
+            // efficiency cluster first, M5 Pro/Max put the Super cluster
+            // last), so it comes from the device-tree topology.
             let cpu_usage = &m.cpu_usage_pct;
-            let p_usage: Vec<f32> = cpu_usage.iter().take(p_count).copied().collect();
-            let e_usage: Vec<f32> = cpu_usage
-                .iter()
-                .skip(p_count)
-                .take(e_count)
-                .copied()
-                .collect();
+            let (e_usage, p_usage) =
+                split_usage_by_tier(cpu_usage, &m.cpu_high_tier, e_count, p_count);
+            let e_tier = tier_label(m.cpu_tier_names.first().map(String::as_str), "E");
+            let p_tier = tier_label(m.cpu_tier_names.get(1).map(String::as_str), "P");
+            // On systems where the OS withholds the Energy Model, cluster and
+            // per-core figures may be estimates; mark those rows with "≈".
+            let cluster_row = if m.soc.clusters_estimated {
+                TreeRow::pw_full_est
+            } else {
+                TreeRow::pw_full
+            };
+            let core_row = if m.soc.cores_estimated {
+                TreeRow::pw_full_est
+            } else {
+                TreeRow::pw_full
+            };
+            let cpu_row = if m.soc.cpu_estimated {
+                TreeRow::pw_full_est
+            } else {
+                TreeRow::pw_full
+            };
             let e_avg_usage = if e_usage.is_empty() {
                 0.0
             } else {
@@ -1420,11 +1465,21 @@ impl App {
                 cpu_usage.iter().take(total_cores).sum::<f32>() / total_cores as f32
             };
 
-            rows.push(TreeRow::pw_full(
+            let cpu_note = if m.soc.cpu_unavailable {
+                ", power n/a"
+            } else {
+                ""
+            };
+            rows.push(cpu_row(
                 "cpu",
                 Some("soc"),
                 &format!("{}├─ ", cp),
-                &format!("CPU ({} cores, {:.0}%)", e_count + p_count, cpu_avg_usage),
+                &format!(
+                    "CPU ({} cores, {:.0}%{})",
+                    e_count + p_count,
+                    cpu_avg_usage,
+                    cpu_note
+                ),
                 s.cpu.get(),
                 w.cpu,
                 "",
@@ -1451,11 +1506,11 @@ impl App {
                 format!("{:.0}°C ({:.0}–{:.0})", avg, min, max)
             };
 
-            rows.push(TreeRow::pw_full(
+            rows.push(cluster_row(
                 "ecpu",
                 Some("cpu"),
                 &format!("{}│  ├─ ", cp),
-                &format!("E-Cores ({} cores, {:.0}%)", e_count, e_avg_usage),
+                &format!("{} ({} cores, {:.0}%)", e_tier, e_count, e_avg_usage),
                 s.ecpu.get(),
                 w.ecpu,
                 &fmt_freq(s.ecpu_freq.get()),
@@ -1495,7 +1550,7 @@ impl App {
                         .get(ci)
                         .map(|u| format!(" ({:>3.0}%) {}", u, usage_bar(*u)))
                         .unwrap_or_default();
-                    rows.push(TreeRow::pw_full(
+                    let mut row = core_row(
                         key,
                         Some("ecpu"),
                         &pfx,
@@ -1506,14 +1561,20 @@ impl App {
                         &temp,
                         Style::default(),
                         pin(key),
-                    ));
+                    );
+                    if m.soc.cores_estimated {
+                        // Per-core energy isn't accumulated; an "≈0.00 mWh"
+                        // would read as an estimate of zero.
+                        row.total.clear();
+                    }
+                    rows.push(row);
                 }
             }
-            rows.push(TreeRow::pw_full(
+            rows.push(cluster_row(
                 "pcpu",
                 Some("cpu"),
                 &format!("{}│  └─ ", cp),
-                &format!("P-Cores ({} cores, {:.0}%)", p_count, p_avg_usage),
+                &format!("{} ({} cores, {:.0}%)", p_tier, p_count, p_avg_usage),
                 s.pcpu.get(),
                 w.pcpu,
                 &fmt_freq(s.pcpu_freq.get()),
@@ -1545,7 +1606,7 @@ impl App {
                         .get(ci)
                         .map(|u| format!(" ({:>3.0}%) {}", u, usage_bar(*u)))
                         .unwrap_or_default();
-                    rows.push(TreeRow::pw_full(
+                    let mut row = core_row(
                         key,
                         Some("pcpu"),
                         &pfx,
@@ -1556,7 +1617,13 @@ impl App {
                         &temp,
                         Style::default(),
                         pin(key),
-                    ));
+                    );
+                    if m.soc.cores_estimated {
+                        // Per-core energy isn't accumulated; an "≈0.00 mWh"
+                        // would read as an estimate of zero.
+                        row.total.clear();
+                    }
+                    rows.push(row);
                 }
             }
             let gpu_util = m.soc.gpu_util_device;
@@ -1623,18 +1690,30 @@ impl App {
                     Style::default().fg(gpu_color),
                 ));
             }
-            rows.push(TreeRow::pw_full(
-                "ane",
-                Some("soc"),
-                &format!("{}├─ ", cp),
-                "ANE",
-                s.ane.get(),
-                w.ane,
-                "",
-                &temp_info("ANE"),
-                Style::default(),
-                pin("ane"),
-            ));
+            // Rails the OS no longer reports to unentitled readers and for
+            // which no other source exists: say so instead of showing 0 W.
+            let no_rails = m.soc.rails_unavailable;
+            let unavailable = |prefix: &str, label: &str, temp: String| -> TreeRow {
+                let mut r = TreeRow::info(Some("soc"), prefix, label, "n/a", "", DIM);
+                r.temp = temp;
+                r
+            };
+            if no_rails {
+                rows.push(unavailable(&format!("{}├─ ", cp), "ANE", temp_info("ANE")));
+            } else {
+                rows.push(TreeRow::pw_full(
+                    "ane",
+                    Some("soc"),
+                    &format!("{}├─ ", cp),
+                    "ANE",
+                    s.ane.get(),
+                    w.ane,
+                    "",
+                    &temp_info("ANE"),
+                    Style::default(),
+                    pin("ane"),
+                ));
+            }
             // ANE sub-engines (collapsed by default)
             if m.soc.ane_parts.len() > 1 {
                 let ane_cont = format!("{}│  ", cp);
@@ -1661,58 +1740,83 @@ impl App {
             } else {
                 "DRAM".into()
             };
-            rows.push(TreeRow::pw_full(
-                "dram",
-                Some("soc"),
-                &format!("{}├─ ", cp),
-                &dram_name,
-                s.dram.get(),
-                w.dram,
-                "",
-                &temp_info("Memory"),
-                Style::default(),
-                pin("dram"),
-            ));
-            rows.push(TreeRow::pw(
-                "gpu_sram",
-                Some("soc"),
-                &format!("{}├─ ", cp),
-                "GPU SRAM (SLC)",
-                s.gpu_sram.get(),
-                w.gpu_sram,
-                Style::default(),
-                pin("gpu_sram"),
-            ));
-            rows.push(TreeRow::pw(
-                "media",
-                Some("soc"),
-                &format!("{}├─ ", cp),
-                "Media Engine",
-                s.media.get(),
-                w.media,
-                Style::default(),
-                pin("media"),
-            ));
-            rows.push(TreeRow::pw(
-                "isp",
-                Some("soc"),
-                &format!("{}├─ ", cp),
-                "Camera (ISP)",
-                s.isp.get(),
-                w.isp,
-                Style::default(),
-                pin("isp"),
-            ));
-            rows.push(TreeRow::pw(
-                "fabric",
-                Some("soc"),
-                &format!("{}└─ ", cp),
-                "Fabric",
-                s.fabric.get(),
-                w.fabric,
-                Style::default(),
-                pin("fabric"),
-            ));
+            if no_rails {
+                rows.push(unavailable(
+                    &format!("{}├─ ", cp),
+                    &dram_name,
+                    temp_info("Memory"),
+                ));
+                rows.push(unavailable(
+                    &format!("{}└─ ", cp),
+                    "GPU SRAM, Media, ISP, Fabric",
+                    String::new(),
+                ));
+            } else {
+                rows.push(TreeRow::pw_full(
+                    "dram",
+                    Some("soc"),
+                    &format!("{}├─ ", cp),
+                    &dram_name,
+                    s.dram.get(),
+                    w.dram,
+                    "",
+                    &temp_info("Memory"),
+                    Style::default(),
+                    pin("dram"),
+                ));
+            }
+            // With merged rails these three are part of the fabric row below.
+            if !no_rails && !m.soc.rails_merged {
+                rows.push(TreeRow::pw(
+                    "gpu_sram",
+                    Some("soc"),
+                    &format!("{}├─ ", cp),
+                    "GPU SRAM (SLC)",
+                    s.gpu_sram.get(),
+                    w.gpu_sram,
+                    Style::default(),
+                    pin("gpu_sram"),
+                ));
+                rows.push(TreeRow::pw(
+                    "media",
+                    Some("soc"),
+                    &format!("{}├─ ", cp),
+                    "Media Engine",
+                    s.media.get(),
+                    w.media,
+                    Style::default(),
+                    pin("media"),
+                ));
+                rows.push(TreeRow::pw(
+                    "isp",
+                    Some("soc"),
+                    &format!("{}├─ ", cp),
+                    "Camera (ISP)",
+                    s.isp.get(),
+                    w.isp,
+                    Style::default(),
+                    pin("isp"),
+                ));
+            }
+            if !no_rails {
+                rows.push(TreeRow::pw(
+                    "fabric",
+                    Some("soc"),
+                    &format!("{}└─ ", cp),
+                    // With the Energy Model gated, fabric is "package total minus
+                    // everything measured separately", so it also carries the
+                    // rails above that have no live counter of their own.
+                    if m.soc.rails_merged {
+                        "Fabric + other SoC"
+                    } else {
+                        "Fabric"
+                    },
+                    s.fabric.get(),
+                    w.fabric,
+                    Style::default(),
+                    pin("fabric"),
+                ));
+            }
         }
 
         // ── SSD with Controller/NAND sub-items
@@ -2081,7 +2185,8 @@ impl App {
         } else {
             (descriptor_sum, false)
         };
-        let usb_total_wh: f64 = self.usb_wh.iter().sum();
+        let usb_total_wh: f64 =
+            self.usb_wh.iter().sum::<f64>() + self.usb_orphan_wh.values().sum::<f64>();
         rows.push(TreeRow::pw_est(
             "peripherals",
             Some("system"),
@@ -2301,7 +2406,8 @@ impl App {
             )
         }));
 
-        if m.usb_devices.is_empty() {
+        let (pp, orphan_ports) = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
+        if m.usb_devices.is_empty() && usb_total_w <= 0.0 && orphan_ports.is_empty() {
             rows.push(TreeRow::info(
                 Some("peripherals"),
                 &format!("{}└─ ", pc),
@@ -2316,17 +2422,24 @@ impl App {
             } else {
                 TreeRow::pw_max
             };
+            // When IOKit enumerates nothing but power is measured, the draw
+            // comes from charging-only device(s) on a port (issue #15).
+            let usb_label = if m.usb_devices.is_empty() {
+                "USB (unidentified draw)".to_string()
+            } else {
+                let n = m.usb_devices.len() + orphan_ports.len();
+                format!("USB ({} {})", n, if n == 1 { "device" } else { "devices" })
+            };
             rows.push(usb_row_fn(
                 "usb",
                 Some("peripherals"),
                 &format!("{}└─ ", pc),
-                &format!("USB ({} devices)", m.usb_devices.len()),
+                &usb_label,
                 usb_total_w,
                 usb_total_wh,
                 Style::default(),
                 pin("usb"),
             ));
-            let pp = assign_usb_port_power(&m.usb_power_per_port, &m.usb_devices);
 
             // Build children map for hierarchical rendering
             let mut children_of: std::collections::HashMap<u32, Vec<usize>> =
@@ -2340,10 +2453,19 @@ impl App {
                 }
             }
 
+            // Orphan ports render as extra top-level siblings after enumerated
+            // devices, so the last real device uses ├─ when orphans follow.
+            let orphan_count = orphan_ports.len();
+
             // DFS stack: (device_index, parent_key, base_continuation, siblings_after)
             let mut stack: Vec<(usize, &'static str, String, usize)> = Vec::new();
             for (pos, &i) in top_level.iter().enumerate().rev() {
-                stack.push((i, "usb", format!("{}   ", pc), top_level.len() - 1 - pos));
+                stack.push((
+                    i,
+                    "usb",
+                    format!("{}   ", pc),
+                    (top_level.len() - 1 - pos) + orphan_count,
+                ));
             }
 
             while let Some((i, parent_key, base, siblings_after)) = stack.pop() {
@@ -2420,6 +2542,38 @@ impl App {
                         stack.push((ci, key, cont.clone(), kids.len() - 1 - pos));
                     }
                 }
+            }
+
+            // Charging-only ports with no enumerated device (issue #15).
+            let orphan_base = format!("{}   ", pc);
+            let orphan_style = Style::new().add_modifier(Modifier::ITALIC);
+            for (j, &pi) in orphan_ports.iter().enumerate() {
+                let port = &m.usb_power_per_port[pi];
+                let is_last = j + 1 == orphan_ports.len();
+                let pfx = if is_last {
+                    format!("{}└─ ", orphan_base)
+                } else {
+                    format!("{}├─ ", orphan_base)
+                };
+                // Stable key by PortIndex so the row identity (history, pin,
+                // collapse state) doesn't shift when enumerated devices come
+                // and go on other ports (issue #15 follow-up).
+                let key = usb_port_key(port.port_index);
+                let orphan_wh = self
+                    .usb_orphan_wh
+                    .get(&port.port_index)
+                    .copied()
+                    .unwrap_or(0.0);
+                rows.push(TreeRow::pw(
+                    key,
+                    Some("usb"),
+                    &pfx,
+                    &format!("Port {} (unidentified)", port.port_index),
+                    port.power_w,
+                    orphan_wh,
+                    orphan_style,
+                    pin(key),
+                ));
             }
         }
 
@@ -3372,13 +3526,70 @@ fn fan_key(index: usize) -> &'static str {
     KEYS.get(index).copied().unwrap_or("fan0")
 }
 
+/// Split per-logical-CPU usage into (low tier, top tier), in logical order.
+/// `high_tier` marks the top-tier CPUs; when it doesn't describe every CPU
+/// (topology unreadable) fall back to assuming the top tier comes first.
+fn split_usage_by_tier(
+    usage: &[f32],
+    high_tier: &[bool],
+    e_count: usize,
+    p_count: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let consistent = high_tier.len() == usage.len()
+        && high_tier.iter().filter(|h| **h).count() == p_count
+        && high_tier.len() == e_count + p_count;
+    if consistent {
+        let pick = |want: bool| -> Vec<f32> {
+            usage
+                .iter()
+                .zip(high_tier)
+                .filter(|(_, h)| **h == want)
+                .map(|(u, _)| *u)
+                .collect()
+        };
+        (pick(false), pick(true))
+    } else {
+        (
+            usage.iter().skip(p_count).take(e_count).copied().collect(),
+            usage.iter().take(p_count).copied().collect(),
+        )
+    }
+}
+
+/// Row label for a CPU tier: the initial(s) of its marketing name plus
+/// "-Cores" — "E-Cores", "P-Cores", "S-Cores" (Super).
+fn tier_label(name: Option<&str>, fallback: &str) -> String {
+    let initials: Vec<String> = name
+        .unwrap_or("")
+        .split('+')
+        .filter_map(|part| part.trim().chars().next())
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .collect();
+    if initials.is_empty() {
+        format!("{fallback}-Cores")
+    } else {
+        format!("{}-Cores", initials.join("+"))
+    }
+}
+
 /// Assign PowerOutDetails entries to USB devices without duplicates.
-/// Returns one Option<f32> per device. Priority: exact location_id match,
-/// then port_idx_b (upper byte — root hub / controller), then port_idx_a.
-fn assign_usb_port_power(ports: &[UsbPortPower], devices: &[UsbDevice]) -> Vec<Option<f32>> {
+/// Returns one Option<f32> per device (matched only by exact location_id or by
+/// controller id — the two signals that actually tie a port to a device) plus
+/// the indices of ports that carry power but matched no enumerated device.
+///
+/// We deliberately do NOT greedily pair leftover devices with leftover ports:
+/// PowerOutDetails ports carry location_id == 0, so a greedy guess would let an
+/// enumerated device (e.g. an idle, fully-charged iPhone whose own port dropped
+/// out of PowerOutDetails) steal the port of a charging-only device and hide it.
+/// Unmatched devices instead fall back to their bMaxPower descriptor estimate,
+/// and unmatched powered ports surface as "unidentified" rows (issue #15).
+fn assign_usb_port_power(
+    ports: &[UsbPortPower],
+    devices: &[UsbDevice],
+) -> (Vec<Option<f32>>, Vec<usize>) {
     let mut result = vec![None; devices.len()];
     if ports.is_empty() {
-        return result;
+        return (result, Vec::new());
     }
     let mut claimed = vec![false; ports.len()];
 
@@ -3408,28 +3619,25 @@ fn assign_usb_port_power(ports: &[UsbPortPower], devices: &[UsbDevice]) -> Vec<O
         let controller_id = (dev.location_id >> 24) & 0xFF;
         let expected_port = controller_id + 1;
         for (pi, port) in ports.iter().enumerate() {
-            if !claimed[pi] && port.port_index == expected_port && port.power_w > 0.0 {
-                result[di] = Some(port.power_w);
+            if !claimed[pi] && port.port_index == expected_port {
+                if port.power_w > 0.0 {
+                    result[di] = Some(port.power_w);
+                }
                 claimed[pi] = true;
                 break;
             }
         }
     }
 
-    // Pass 4: pair remaining unmatched devices with remaining unclaimed ports
-    let mut unclaimed: Vec<usize> = (0..ports.len())
-        .filter(|pi| !claimed[*pi] && ports[*pi].power_w > 0.0)
+    // Any sourcing port not claimed by an enumerated device is an orphan
+    // (issue #15): a device charging without a USB data handshake, invisible to
+    // IOKit. Presence is the sourcing flag, not the instantaneous wattage, so
+    // the row stays put even when PowerOutDetails momentarily reports 0 W.
+    let orphans: Vec<usize> = (0..ports.len())
+        .filter(|pi| !claimed[*pi] && ports[*pi].sourcing)
         .collect();
-    for di in 0..devices.len() {
-        if result[di].is_some() || unclaimed.is_empty() {
-            continue;
-        }
-        let pi = unclaimed.remove(0);
-        result[di] = Some(ports[pi].power_w);
-        claimed[pi] = true;
-    }
 
-    result
+    (result, orphans)
 }
 
 fn usb_key(index: usize) -> &'static str {
@@ -3438,6 +3646,30 @@ fn usb_key(index: usize) -> &'static str {
         "usb11", "usb12", "usb13", "usb14", "usb15",
     ];
     KEYS.get(index).copied().unwrap_or("usb0")
+}
+
+/// Stable key for an unidentified USB port row, keyed by its PortIndex so the
+/// row identity stays put when enumerated devices appear/disappear elsewhere.
+fn usb_port_key(port_index: u32) -> &'static str {
+    const KEYS: [&str; 16] = [
+        "usbport0",
+        "usbport1",
+        "usbport2",
+        "usbport3",
+        "usbport4",
+        "usbport5",
+        "usbport6",
+        "usbport7",
+        "usbport8",
+        "usbport9",
+        "usbport10",
+        "usbport11",
+        "usbport12",
+        "usbport13",
+        "usbport14",
+        "usbport15",
+    ];
+    KEYS.get(port_index as usize).copied().unwrap_or("usbport0")
 }
 
 // Intentional Box::leak: history/charts require &'static str keys. Dead PIDs stay
@@ -3538,6 +3770,45 @@ mod tests {
                 cpu_sensor(&format!("{}{}", bank, suffix), temp)
             })
             .collect()
+    }
+
+    #[test]
+    fn usage_follows_device_tree_tiers_not_cpu_order() {
+        // M5 Max: logical CPUs 0–11 are Performance, 12–17 Super.
+        let usage: Vec<f32> = (0..18).map(|i| i as f32).collect();
+        let mut high = vec![false; 12];
+        high.extend([true; 6]);
+        let (low, top) = split_usage_by_tier(&usage, &high, 12, 6);
+        assert_eq!(low, (0..12).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(top, (12..18).map(|i| i as f32).collect::<Vec<_>>());
+
+        // Classic layout with the efficiency cluster first.
+        let usage = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let high = [false, false, true, true, true, true];
+        let (low, top) = split_usage_by_tier(&usage, &high, 2, 4);
+        assert_eq!(low, vec![1.0, 2.0]);
+        assert_eq!(top, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn usage_falls_back_when_topology_does_not_match() {
+        let usage = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // No topology, or one that disagrees with the IOReport core counts.
+        for high in [vec![], vec![true; 6], vec![false, true]] {
+            let (low, top) = split_usage_by_tier(&usage, &high, 2, 4);
+            assert_eq!(top, vec![1.0, 2.0, 3.0, 4.0]);
+            assert_eq!(low, vec![5.0, 6.0]);
+        }
+    }
+
+    #[test]
+    fn tier_labels_use_marketing_initials() {
+        assert_eq!(tier_label(Some("Efficiency"), "E"), "E-Cores");
+        assert_eq!(tier_label(Some("Performance"), "P"), "P-Cores");
+        assert_eq!(tier_label(Some("Super"), "P"), "S-Cores");
+        assert_eq!(tier_label(Some("Efficiency+Performance"), "E"), "E+P-Cores");
+        assert_eq!(tier_label(None, "E"), "E-Cores");
+        assert_eq!(tier_label(Some(""), "P"), "P-Cores");
     }
 
     #[test]

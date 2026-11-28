@@ -450,8 +450,53 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
         &["-g", "accps"],
         std::time::Duration::from_millis(1000),
     ) {
-        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Some(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
+    };
+
+    parse_bluetooth_devices(&output)
+}
+
+/// Mac OS Roman code points for bytes 0x80..=0xFF; the lower half is ASCII.
+/// `pmset` can print accessory names in this legacy encoding (0xD5 is the
+/// typographic apostrophe in "Someone’s Keyboard").
+#[rustfmt::skip]
+const MAC_ROMAN_HIGH: [char; 128] = [
+    'Ä', 'Å', 'Ç', 'É', 'Ñ', 'Ö', 'Ü', 'á', // 0x80
+    'à', 'â', 'ä', 'ã', 'å', 'ç', 'é', 'è', // 0x88
+    'ê', 'ë', 'í', 'ì', 'î', 'ï', 'ñ', 'ó', // 0x90
+    'ò', 'ô', 'ö', 'õ', 'ú', 'ù', 'û', 'ü', // 0x98
+    '†', '°', '¢', '£', '§', '•', '¶', 'ß', // 0xA0
+    '®', '©', '™', '´', '¨', '≠', 'Æ', 'Ø', // 0xA8
+    '∞', '±', '≤', '≥', '¥', 'µ', '∂', '∑', // 0xB0
+    '∏', 'π', '∫', 'ª', 'º', 'Ω', 'æ', 'ø', // 0xB8
+    '¿', '¡', '¬', '√', 'ƒ', '≈', '∆', '«', // 0xC0
+    '»', '…', '\u{00A0}', 'À', 'Ã', 'Õ', 'Œ', 'œ', // 0xC8
+    '–', '—', '“', '”', '‘', '’', '÷', '◊', // 0xD0
+    'ÿ', 'Ÿ', '⁄', '€', '‹', '›', 'ﬁ', 'ﬂ', // 0xD8
+    '‡', '·', '‚', '„', '‰', 'Â', 'Ê', 'Á', // 0xE0
+    'Ë', 'È', 'Í', 'Î', 'Ï', 'Ì', 'Ó', 'Ô', // 0xE8
+    '\u{F8FF}', 'Ò', 'Ú', 'Û', 'Ù', 'ı', 'ˆ', '˜', // 0xF0
+    '¯', '˘', '˙', '˚', '¸', '˝', '˛', 'ˇ', // 0xF8
+];
+
+fn decode_mac_roman(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                MAC_ROMAN_HIGH[(b - 0x80) as usize]
+            }
+        })
+        .collect()
+}
+
+fn parse_bluetooth_devices(output: &[u8]) -> Vec<BluetoothDevice> {
+    let output = match std::str::from_utf8(output) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => std::borrow::Cow::Owned(decode_mac_roman(output)),
     };
 
     struct Entry {
@@ -556,4 +601,48 @@ pub fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
     }
 
     devices
+}
+
+#[cfg(test)]
+mod bluetooth_tests {
+    use super::parse_bluetooth_devices;
+
+    #[test]
+    fn parses_mac_roman_bluetooth_device_names_without_replacement_chars() {
+        let output = b"Now drawing from 'AC Power'\n\
+ -Sample\xD5s Magic Keyboard (id=58458112)\t97%; discharging present: true\n";
+
+        let devices = parse_bluetooth_devices(output);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Sample\u{2019}s Magic Keyboard");
+        assert!(!devices[0].name.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn mac_roman_table_matches_the_encoding() {
+        use super::decode_mac_roman;
+        assert_eq!(decode_mac_roman(b"plain ASCII ~"), "plain ASCII ~");
+        // Corners and a sample of each row of the high half.
+        assert_eq!(
+            decode_mac_roman(&[0x80, 0x8E, 0xA5, 0xB9, 0xCA, 0xD0, 0xD5, 0xDB, 0xF0, 0xFF]),
+            "Äé•π\u{A0}–’€\u{F8FF}ˇ"
+        );
+        // Every byte maps to exactly one character, none of them a replacement.
+        let all: Vec<u8> = (0..=255).collect();
+        let text = decode_mac_roman(&all);
+        assert_eq!(text.chars().count(), 256);
+        assert!(!text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn preserves_utf8_bluetooth_device_names() {
+        let output = "Now drawing from 'AC Power'\n\
+ -Sample’s Keyboard (id=58458112)\t97%; discharging present: true\n";
+
+        let devices = parse_bluetooth_devices(output.as_bytes());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Sample’s Keyboard");
+    }
 }

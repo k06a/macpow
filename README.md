@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/k06a/macpow/actions/workflows/ci.yml/badge.svg)](https://github.com/k06a/macpow/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/macpow)](https://crates.io/crates/macpow)
-[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.19-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
+[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.20-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](https://github.com/k06a/macpow)
 
@@ -36,7 +36,7 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 
 ## Features
 
-- **SoC breakdown** — CPU (E/P cores with per-core power, utilization bars, temperatures), GPU, ANE, DRAM, GPU SRAM, Media Engine, Camera (ISP), Fabric — all from IOReport Energy Model
+- **SoC breakdown** — CPU (core tiers with per-core power, utilization bars, temperatures), GPU, ANE, DRAM, GPU SRAM, Media Engine, Camera (ISP), Fabric — from the IOReport Energy Model, or from CLPC energy counters on macOS 27+ where the Energy Model is no longer live (see [macOS 27](#macos-27-energy-model-is-gated))
 - **CPU utilization** — per-core usage % with visual bars from Mach `host_processor_info`
 - **Real frequencies** — CPU and GPU MHz from DVFS voltage-states tables, not percentages
 - **Temperatures** — per-component and per-core from SMC sensors (CPU, GPU, ANE, DRAM, SSD, Battery); universal bank-based key mapping for all Apple Silicon generations (M1–M5+, including Ultra dual-die); stale value caching with `~` indicator when sensors temporarily read invalid
@@ -140,15 +140,16 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 +------------------+---------------------------------------------+
 | Data source      | What it provides                            |
 +------------------+---------------------------------------------+
-| IOReport         | SoC power (Energy Model),                   |
+| IOReport         | SoC power (Energy Model; on macOS 27+ CLPC  |
+|                  | energy counters, PMP histograms as backup), |
 |                  | CPU/GPU frequencies (DVFS residency)        |
-| SMC              | System power (PSTR), display backlight     |
-|                  | (PBwo on M5/Neo, PDBR on M1-M4),         |
-|                  | adapter (PDTR), WiFi (wiPm), temps, fans   |
+| SMC              | System power (PSTR), display backlight      |
+|                  | (PBwo on M5/Neo, PDBR on M1-M4),            |
+|                  | adapter (PDTR), WiFi (wiPm), temps, fans    |
 | IORegistry       | Battery, display brightness, keyboard PWM,  |
 |                  | USB devices, SSD model, disk I/O counters   |
 | CoreAudio        | Volume level, mute state                    |
-| Mach API         | Per-CPU utilization ticks, memory stats      |
+| Mach API         | Per-CPU utilization ticks, memory stats     |
 | proc_pid_rusage  | Per-process billed energy                   |
 | getifaddrs       | Network traffic byte counters               |
 | CoreWLAN/pmset   | WiFi info, Bluetooth devices                |
@@ -161,6 +162,7 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 | Component | Source | Method |
 |-----------|--------|--------|
 | CPU, GPU, ANE, DRAM | IOReport | Direct energy measurement (mJ/uJ/nJ deltas) |
+| CPU cores on macOS 27+ | IOReport CPU Stats | Estimate (`≈`): cores' share of cluster power split by V²·f-weighted residency |
 | Media Engine, Camera (ISP) | IOReport | Direct energy measurement (AVE + MSR, ISP) |
 | Fabric (AMCC, DCS, FAB, AFR) | IOReport | Direct energy measurement |
 | Thunderbolt/PCIe | IOReport | Direct energy measurement (PCIe ports + controllers) |
@@ -185,6 +187,33 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 | Network | getifaddrs | Per-interface byte counters for Ethernet and WiFi |
 | USB | IORegistry PowerOutDetails | Per-port power measurement (Watts/PDPowermW) |
 
+### macOS 27: Energy Model is gated
+
+Since macOS 27 the kernel recomputes the IOReport `Energy Model` counters (CPU, per-core, DRAM, ANE, …) only when the sampling process holds the private entitlement `com.apple.private.pmgr.nrg.reporting`. Everyone else — root included — reads values left behind by the last entitled sampler (`powermetrics`, the powerlog daemons): frozen for minutes, then one catch-up jump worth kilowatts if divided by a sample interval. This affects every Apple Silicon Mac, not a particular chip. Only `GPU Energy` (published by the GPU driver) stays live.
+
+macpow detects this at runtime and switches sources:
+
+| Figure | Source on macOS 27+ | Quality |
+|--------|---------------------|---------|
+| CPU total, ANE, DRAM | AppleCLPC energy counters (same accumulators as the Energy Model, not gated) | Exact |
+| GPU | `GPU Energy` from the GPU driver, as before (it was never gated) | Exact |
+| Cluster totals | CLPC per-cluster counter where its ID is known (M5 Pro/Max); otherwise the CPU total divided in proportion to the PMP power histograms (M5 family) or to DVFS residency | Exact / estimate (`≈`) |
+| Per-core power | Cluster power × core share × each core's V²·f-weighted active residency. The core share (≈ 0.6–0.75) is the part of a cluster's energy the Energy Model books to cores rather than to the cluster's shared logic and SRAM, so cores add up to less than their cluster, as they do with a live Energy Model | Estimate (`≈`) |
+| Fabric | DCS counter + "CLPC package total minus everything measured separately" — shown as `Fabric + other SoC` because it also holds GPU SRAM, ISP, media and display-controller power | Exact sum |
+| SoC total | Sum of the rows above, i.e. the CLPC package total with the GPU taken from its own counter | Exact |
+
+Checked on an M5 Max (macOS 27.0.1) against the exact energies that an entitled sampler publishes, over 5–9 minute windows: CPU total, cluster totals, DRAM and fabric within 0.1–1.4 %; per-core power within ±5 % for most loaded cores, with one core of the Super cluster consistently 10–14 % high.
+
+CLPC reports are not listed in the IOReport legend; they are addressed by opaque IDs that differ per SoC driver and per macOS major version (`src/clpc.rs`; the scalar IDs come from the [macmon](https://github.com/vladkens/macmon) project). At startup macpow checks which of them the driver really delivers. Where the per-cluster counter is missing it subscribes to the PMP histograms instead; where no CLPC counter works at all (an unknown driver, or a macOS version whose IDs aren't in the table) the histograms also supply an estimated CPU total and the remaining rails are reported as unavailable (`rails_unavailable` in `--json`, `n/a` in the tree) rather than as 0 W. Macs without PMP histograms (M1–M4) then have no CPU power source at all (`cpu_unavailable`).
+
+`--json` keeps its field names and adds flags that are present only when true: `energy_model_gated`, `cores_estimated`, `clusters_estimated`, `cpu_estimated`, `cpu_unavailable`, `rails_merged`, `rails_unavailable`.
+
+### CPU tiers
+
+The tree labels the two CPU tiers by the names macOS reports in `hw.perflevelN.name`: `E-Cores` / `P-Cores` on M1–M4 and base M5, `P-Cores` / `S-Cores` (Performance / Super) on M5 Pro/Max. `--json` keeps `ecpu_clusters` (lower tier) and `pcpu_cluster` (top tier) and adds `cpu_tier_names`.
+
+Logical CPU numbering is chip-specific — M1–M4 list the efficiency cluster first, M5 Pro/Max list the Super cluster last — so per-core utilization is matched to cores through the device-tree topology (`cpu_high_tier` in `--json`), not by position.
+
 ### IOReport channel naming (multi-die support)
 
 IOReport channel names vary between single-die and multi-die (Ultra) chips. The parser handles both generically:
@@ -195,10 +224,15 @@ Single-die (M1/M2/M3/M4 base/Pro/Max):
   Energy Model: EACC_CPU0, PACC0_CPU5     ← _CPU suffix
   Blocks:       ISP, DRAM, ANE, DISP      ← bare names
 
+M5 Pro/Max (Performance = MCPU clusters, Super = PCPU):
+  CPU Stats:    MCPU00, MCPU15, PCPU3     ← MCPU{cluster}{core}
+  Energy Model: MCPU1_2, PACC_3           ← {cluster}_{core}
+  Clusters:     MCPU0, MCPU1, PCPU
+
 Multi-die (M1/M2/M3 Ultra):
   CPU Stats:    DIE_0_ECPU_CPU0, DIE_1_PCPU1_CPU3   ← DIE_N_ prefix + _CPU suffix
   Energy Model: DIE_0_EACC_CPU0, DIE_1_PACC1_CPU3   ← DIE_N_ prefix + _CPU suffix
-  Blocks:       ISP0_0, DRAM0_1, ANE0_0              ← per-die suffix
+  Blocks:       ISP0_0, DRAM0_1, ANE0_0             ← per-die suffix
 ```
 
 Two design rules keep this forward-compatible with future chips:
@@ -304,7 +338,7 @@ If per-core temperatures are missing or incorrect on your Mac, please open an is
 macpow --dump > dump.txt                       # IOReport channel names
 macpow --dump-smc > smc.txt                    # all SMC keys (incl. power rails)
 macpow --json > metrics.json                   # full metrics (Ctrl+C after ~15s)
-system_profiler SPHardwareDataType | head -10   # chip model
+system_profiler SPHardwareDataType | head -10  # chip model
 ```
 
 This helps add support for new Apple Silicon variants.

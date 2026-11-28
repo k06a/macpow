@@ -42,6 +42,14 @@ pub struct Metrics {
     /// are not being refreshed (observed on macOS 27 unless a privileged
     /// sampler such as `powermetrics` is running).
     pub energy_counters_stalled: bool,
+    /// Marketing names of the two CPU tiers as `[ecpu_*, pcpu_*]`:
+    /// `["Efficiency", "Performance"]` on most chips, `["Performance",
+    /// "Super"]` on M5 Pro/Max (field names keep their historical e/p prefix).
+    pub cpu_tier_names: Vec<String>,
+    /// For each logical CPU (same index as `cpu_usage_pct`): whether it is one
+    /// of the `pcpu_cluster` cores. Logical CPU order is chip-specific; empty
+    /// when the device tree couldn't be read.
+    pub cpu_high_tier: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -80,6 +88,38 @@ pub struct SocPower {
     pub ecpu_freq_mhz: u32,
     pub pcpu_freq_mhz: u32,
     pub gpu_freq_mhz: u32,
+    /// The OS withholds live "Energy Model" counters from unentitled readers
+    /// (macOS 27+), so the CPU figures below come from CLPC energy counters,
+    /// PMP power histograms and DVFS residency instead.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub energy_model_gated: bool,
+    /// Per-core watts are estimated: the cores' share of the cluster's power
+    /// (the part the Energy Model books to cores rather than to the cluster's
+    /// shared logic and SRAM) divided by each core's V²·f-weighted residency.
+    /// As with a live Energy Model, cores add up to less than their cluster.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cores_estimated: bool,
+    /// Cluster totals are estimated (CPU total divided by PMP histograms or
+    /// residency) rather than read from a per-cluster energy counter.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub clusters_estimated: bool,
+    /// `cpu_w` is estimated from PMP power histograms rather than read from an
+    /// energy counter.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cpu_estimated: bool,
+    /// No live source for CPU power exists on this system; CPU figures are 0.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cpu_unavailable: bool,
+    /// GPU SRAM, ISP, media and display-controller power have no live source
+    /// of their own; `fabric_w` holds them together with the fabric rails
+    /// (package total minus everything measured separately).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rails_merged: bool,
+    /// ANE, DRAM, fabric and the other non-CPU/GPU rails have no live source
+    /// (no CLPC counters for this driver / macOS version); they read 0 and
+    /// `total_w` covers CPU + GPU only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rails_unavailable: bool,
 }
 
 impl SocPower {
@@ -231,6 +271,12 @@ pub struct UsbPortPower {
     pub port_index: u32,
     pub power_w: f32,
     pub location_id: u32,
+    /// True when the port controller reports the Mac is actively sourcing power
+    /// out of this port (PortControllerInfo FetStatus high bit). This is the
+    /// authoritative presence signal: PowerOutDetails transiently drops a port
+    /// during USB-PD renegotiation, but the controller keeps reporting it, so
+    /// we surface the port whenever it is sourcing — even at zero measured W.
+    pub sourcing: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
