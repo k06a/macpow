@@ -166,7 +166,7 @@ Each data source runs in its own thread, updating shared metrics at its own pace
 | Per-process memory | Kernel | `ri_phys_footprint` from rusage_info_v4 |
 | Per-process network | nettop | Cumulative bytes per process (~18ms subprocess) |
 | CPU utilization | Mach API | `host_processor_info` tick deltas |
-| Memory | Mach API | `host_statistics64` (active + inactive + wired + compressor pages) |
+| Memory | Mach API | `host_statistics64` (anonymous − purgeable + wired + compressor pages: Activity Monitor's Memory Used; the file cache is not counted) |
 | Keyboard | IORegistry PWM | Duty cycle * 0.5W max |
 | Fans | SMC RPM | Cubic model: (RPM/RPM_max)^3 * 1W |
 | Audio | CoreAudio + IOPMAssertions | Idle 0.05W + volume^2 * 1W |
