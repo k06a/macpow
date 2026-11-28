@@ -1,0 +1,84 @@
+# Builds macpow on every macOS version GitHub hosts for Apple Silicon and
+# reports which data it really obtained there.
+#
+# GitHub's runners are virtual machines, so most hardware telemetry is expected
+# to be missing: the hardware tests and the probe are informational and never
+# fail the job. What does fail it: the build and the hermetic unit tests.
+name: macOS matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/macos-matrix]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Free arm64 images (Apple M1 guests): macOS 15, macOS 26 and macOS 27.
+        runner: [macos-15, macos-26, xcode-27]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --lib --locked
+
+      - name: Hardware tests (informational)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          mkdir -p out
+          cargo test --locked --test integration -- --test-threads=1 2>&1 | tee out/hardware-tests.txt
+
+      - name: Probe
+        timeout-minutes: 5
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: .github/scripts/probe.sh target/release/macpow out "$RUNNER_LABEL"
+
+      - name: Report
+        run: python3 .github/scripts/coverage.py out | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: ${{ matrix.runner }}
+          path: out/
+          retention-days: 14
+
+  report:
+    name: Coverage across the matrix
+    needs: probe
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: reports
+
+      - name: Report
+        run: python3 .github/scripts/coverage.py reports/* | tee -a "$GITHUB_STEP_SUMMARY"
