@@ -10,12 +10,17 @@ cooldown, or `cargo update --precise`). This check closes that gap.
 
 Publication times come from the crates.io sparse index ("pubtime"). A version
 without one was published before crates.io started recording it, so it is old.
+A locked version the index does not list at all is an error. Dependencies from
+git or another registry cannot be checked here and get a warning.
 """
 
 import json
 import sys
+import time
 import tomllib
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
@@ -31,37 +36,56 @@ def index_url(name):
 
 
 def publish_times(name, attempts=3):
+    """Map every published version of `name` to its pubtime (or None)."""
     request = urllib.request.Request(index_url(name), headers={"User-Agent": "lock-age-check"})
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 entries = [json.loads(line) for line in response.read().decode().splitlines()]
             return {entry["vers"]: entry.get("pubtime") for entry in entries}
+        except urllib.error.HTTPError as error:
+            # 404 and other client errors will not change on a retry.
+            if error.code < 500 or attempt == attempts:
+                raise
         except OSError:
-            # A timeout or a dropped connection: try again, then give up loudly.
+            # A timeout or a dropped connection.
             if attempt == attempts:
                 raise
+        time.sleep(attempt)
 
 
 def main(lock_path="Cargo.lock", days="7"):
     with open(lock_path, "rb") as lock_file:
-        packages = [p for p in tomllib.load(lock_file)["package"] if p.get("source") == CRATES_IO]
+        packages = tomllib.load(lock_file)["package"]
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
 
-    too_young = []
-    times = {}
+    # Packages without a source are this workspace's own crates.
+    from_crates_io = [p for p in packages if p.get("source") == CRATES_IO]
     for package in packages:
-        if package["name"] not in times:
-            times[package["name"]] = publish_times(package["name"])
-        published = times[package["name"]].get(package["version"])
-        if published and datetime.fromisoformat(published.replace("Z", "+00:00")) > cutoff:
-            too_young.append(f"{package['name']} {package['version']} (published {published})")
+        if package.get("source") not in (None, CRATES_IO):
+            print(f"::warning::{package['name']} {package['version']} comes from "
+                  f"{package['source']}; its age cannot be checked")
 
-    if too_young:
-        print(f"::error::{len(too_young)} locked crate version(s) are younger than {days} days:")
-        print("\n".join(f"  {line}" for line in too_young))
+    names = sorted({p["name"] for p in from_crates_io})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        times = dict(zip(names, pool.map(publish_times, names)))
+
+    failures = 0
+    for package in from_crates_io:
+        versions = times[package["name"]]
+        label = f"{package['name']} {package['version']}"
+        if package["version"] not in versions:
+            print(f"::error::{label} is not in the crates.io index")
+            failures += 1
+            continue
+        published = versions[package["version"]]
+        if published and datetime.fromisoformat(published.replace("Z", "+00:00")) > cutoff:
+            print(f"::error::{label} was published {published}, less than {days} days ago")
+            failures += 1
+
+    if failures:
         return 1
-    print(f"All {len(packages)} crates.io packages in {lock_path} are at least {days} days old.")
+    print(f"All {len(from_crates_io)} crates.io packages in {lock_path} are at least {days} days old.")
     return 0
 
 
