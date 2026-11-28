@@ -289,6 +289,14 @@ fn fp_divisor(t: &str) -> Option<(f32, bool)> {
     Some((div, signed))
 }
 
+/// Number of keys an enumeration walks for a reported `#KEY` value.
+///
+/// Apple Silicon Macs report about 1500–3900 keys (3864 on an M5 Max). The
+/// bound keeps a corrupt count from turning into billions of SMC calls.
+fn bounded_key_count(reported: u32) -> u32 {
+    reported.min(8192)
+}
+
 /// Category of a temperature key, chosen by its prefix; "Other" when no prefix
 /// is listed.
 fn temp_category(key: &str) -> &'static str {
@@ -356,47 +364,14 @@ impl SmcConnection {
     /// Start async temperature key discovery. Call `finish_temp_discovery`
     /// later to collect results without blocking.
     pub fn start_temp_discovery(&self) -> std::thread::JoinHandle<Vec<(String, String)>> {
-        // Open a second SMC connection for the background thread
-        let conn2 = Self::open_raw_conn().unwrap_or(0);
-        std::thread::spawn(move || {
-            if conn2 == 0 {
-                return Vec::new();
-            }
-            let mut tmp = SmcConnection {
-                conn: conn2,
-                temp_keys: None,
-                key_info_cache: std::collections::HashMap::new(),
-                temp_value_cache: std::collections::HashMap::new(),
-            };
-            let keys = tmp.discover_temp_keys();
-            // Don't close via Drop — we manually close
-            unsafe {
-                IOServiceClose(conn2);
-            }
-            std::mem::forget(tmp);
-            keys
+        // The thread enumerates over a connection of its own, so its thousands
+        // of calls never delay a sample on `self`. It is an ordinary
+        // `SmcConnection`: dropping it when the closure returns closes the
+        // connection and frees its key-info cache.
+        std::thread::spawn(|| match Self::open() {
+            Ok(mut smc) => smc.discover_temp_keys(),
+            Err(_) => Vec::new(),
         })
-    }
-
-    fn open_raw_conn() -> Option<u32> {
-        unsafe {
-            let matching = IOServiceMatching(b"AppleSMC\0".as_ptr() as *const i8);
-            if matching.is_null() {
-                return None;
-            }
-            let service = IOServiceGetMatchingService(0, matching);
-            if service == 0 {
-                return None;
-            }
-            let mut conn: u32 = 0;
-            let kr = IOServiceOpen(service, mach_task_self(), 0, &mut conn);
-            IOObjectRelease(service);
-            if kr != 0 {
-                None
-            } else {
-                Some(conn)
-            }
-        }
     }
 
     pub fn finish_temp_discovery(
@@ -518,10 +493,7 @@ impl SmcConnection {
     /// Output order matches the SMC's internal index ordering (alphabetical).
     /// Skips keys whose info or value read fails.
     pub fn dump_all(&mut self) -> Vec<RawSmcEntry> {
-        let count = self.key_count();
-        // Sane upper bound — current Apple Silicon Macs report ~1500–2700 keys.
-        // Guards against a corrupt #KEY value.
-        let count = count.min(8192);
+        let count = bounded_key_count(self.key_count());
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
             let Some(key_fcc) = self.key_at_index(i) else {
@@ -586,7 +558,7 @@ impl SmcConnection {
     }
 
     fn discover_temp_keys(&mut self) -> Vec<(String, String)> {
-        let count = self.key_count();
+        let count = bounded_key_count(self.key_count());
         (0..count)
             .filter_map(|i| {
                 let key_fcc = self.key_at_index(i)?;
@@ -899,5 +871,15 @@ mod tests {
         for key in ["TG0B", "TS0P", "TPD0", "TR0Z", "TH0x", "TVMD", "Tf06"] {
             assert_eq!(temp_category(key), "Other", "{key}");
         }
+    }
+
+    #[test]
+    fn bounded_key_count_passes_real_counts_and_caps_corrupt_ones() {
+        assert_eq!(bounded_key_count(0), 0);
+        assert_eq!(bounded_key_count(3864), 3864);
+        assert_eq!(bounded_key_count(8192), 8192);
+        // The #KEY payload 00 00 0f 18 read in the wrong byte order.
+        assert_eq!(bounded_key_count(0x180f_0000), 8192);
+        assert_eq!(bounded_key_count(u32::MAX), 8192);
     }
 }
