@@ -36,6 +36,7 @@ pub const SSD_MAX_ACTIVE_W: f32 = 2.5;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsBuiltin(display: u32) -> libc::boolean_t;
     fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
     fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
     fn CGDisplayScreenSize(display: u32) -> CGSize;
@@ -146,8 +147,9 @@ pub fn read_display_brightness() -> Option<f32> {
 }
 
 /// Read linear brightness (0.0–1.0) — proportional to actual light output (nits).
-/// Unlike GetBrightness (perceptual/gamma-corrected), this is linear:
-/// nits ≈ linear_brightness * max_nits_hdr.
+/// Unlike GetBrightness (perceptual/gamma-corrected), this is linear, and 1.0
+/// is the active preset's SDR white, not its HDR peak:
+/// nits ≈ linear_brightness * preset SDR cap (see `display_nits`).
 pub fn read_display_linear_brightness() -> Option<f32> {
     let get_linear =
         (*DISPLAY_LINEAR_BRIGHTNESS_FN.get_or_init(load_display_linear_brightness_fn))?;
@@ -161,6 +163,119 @@ pub fn read_display_linear_brightness() -> Option<f32> {
             None
         }
     }
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOServiceNameMatching(name: *const i8) -> *mut libc::c_void;
+    fn IORegistryEntrySearchCFProperty(
+        entry: u32,
+        plane: *const i8,
+        key: core_foundation_sys::string::CFStringRef,
+        allocator: core_foundation_sys::base::CFAllocatorRef,
+        options: u32,
+    ) -> core_foundation_sys::base::CFTypeRef;
+}
+
+/// `kIORegistryIterateRecursively`: also search the entry's children.
+const IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
+
+/// Decode a brightness level published by the framebuffer driver: nits in
+/// 16.16 fixed point. 0 is a real reading (the panel is dark while the display
+/// sleeps). A level the driver has not set is all-ones, which arrives here as
+/// a negative number.
+fn nits_from_fixed_16_16(raw: i64) -> Option<f32> {
+    (raw >= 0).then(|| (raw as f64 / 65536.0) as f32)
+}
+
+/// Luminance the built-in panel is driven at right now, in nits, as published
+/// by its own framebuffer driver: the `IOMFBBrightnessLevel` property below
+/// the `disp0` device node.
+///
+/// This is the only live source of real nits found so far: it follows the
+/// slider and auto-brightness and is 0 while the display sleeps, whereas
+/// AppleARMBacklight's `BrightnessMilliNits` kept one old value through all
+/// of those changes.
+///
+/// `None` when the main display is not the built-in panel (the level of
+/// `disp0` says nothing about an external display) or the driver does not
+/// publish a level.
+pub fn read_panel_nits() -> Option<f32> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    // SAFETY: every pointer handed to IOKit is either a NUL-terminated
+    // literal or a live CFString, and each result is checked before use.
+    // Ownership follows the documented rules: IOServiceGetMatchingService
+    // consumes the matching dictionary, the service port is released once,
+    // and the property (Create rule) is released when `value` is dropped.
+    unsafe {
+        if CGDisplayIsBuiltin(CGMainDisplayID()) == 0 {
+            return None;
+        }
+        let matching = IOServiceNameMatching(b"disp0\0".as_ptr() as *const i8);
+        if matching.is_null() {
+            return None;
+        }
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+        // The property sits on the framebuffer, a child of `disp0` whose
+        // class name differs between macOS releases, hence the search.
+        let key = CFString::new("IOMFBBrightnessLevel");
+        let value = IORegistryEntrySearchCFProperty(
+            service,
+            b"IOService\0".as_ptr() as *const i8,
+            key.as_concrete_TypeRef(),
+            std::ptr::null(),
+            IO_REGISTRY_ITERATE_RECURSIVELY,
+        );
+        IOObjectRelease(service);
+        if value.is_null() {
+            return None;
+        }
+        let value = CFType::wrap_under_create_rule(value);
+        nits_from_fixed_16_16(value.downcast::<CFNumber>()?.to_i64()?)
+    }
+}
+
+/// Luminance of white on the display at the current brightness, in nits.
+///
+/// `panel_nits`, the panel driver's own reading ([`read_panel_nits`]), wins
+/// whenever it exists and is passed through untouched: it is the level the
+/// panel is actually driven at, including auto-brightness, any system
+/// brightness limit, and 0 while the display sleeps. How that level behaves
+/// while HDR content is shown has not been observed, so no modelled boost is
+/// stacked on top of a measurement.
+///
+/// Without it the value is modelled from `linear_brightness`, the slider in
+/// light-linear terms where 1.0 is the preset's SDR white (`sdr_cap`). While
+/// HDR content is on screen the panel is boosted above SDR white; pass that
+/// factor as `hdr_boost` then, and `None` otherwise. The result never exceeds
+/// `hdr_cap`, the preset's peak. The model is an approximation: on an M5 Max
+/// it equalled the panel's reading in one session (190 nits at a 74 % slider)
+/// and was 17 % below it in another (183 vs 219 nits at 72 %).
+///
+/// The perceptual slider value is deliberately not an input: it is
+/// gamma-encoded, and scaling it by a nit cap reported 1190 nits for a panel
+/// that was emitting 190.
+///
+/// `None` when neither input is available.
+fn display_nits(
+    panel_nits: Option<f32>,
+    linear_brightness: Option<f32>,
+    sdr_cap: f32,
+    hdr_cap: f32,
+    hdr_boost: Option<f32>,
+) -> Option<f32> {
+    if panel_nits.is_some() {
+        return panel_nits;
+    }
+    // A boost only ever raises the level; a factor below 1 is not a boost.
+    let boost = hdr_boost.unwrap_or(1.0).max(1.0);
+    Some((linear_brightness? * sdr_cap * boost).min(hdr_cap))
 }
 
 /// Classify the panel from its peak millinits into static SDR/HDR/XDR class.
@@ -471,6 +586,98 @@ pub fn read_backlight_current() -> Option<(i64, i64)> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    // "Apple XDR Display (P3-1600 nits)", the default preset of an XDR panel.
+    const SDR_CAP: f32 = 600.0;
+    const HDR_CAP: f32 = 1600.0;
+
+    fn assert_nits(actual: Option<f32>, expected: f32) {
+        let actual = actual.expect("a value, got None");
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{actual} nits, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn framebuffer_level_decodes_from_16_16_fixed_point() {
+        // Registry values of an M5 Max MacBook Pro at 73 % and 100 % slider.
+        assert_nits(nits_from_fixed_16_16(12_126_980), 185.04);
+        assert_nits(nits_from_fixed_16_16(23_592_960), 360.0);
+        // The unused external framebuffers of the same machine read 1 nit.
+        assert_nits(nits_from_fixed_16_16(65_536), 1.0);
+        // Display asleep: a real reading of darkness, not a missing one.
+        assert_eq!(nits_from_fixed_16_16(0), Some(0.0));
+        // Unset levels are published as u64::MAX.
+        assert_eq!(nits_from_fixed_16_16(u64::MAX as i64), None);
+    }
+
+    #[test]
+    fn panel_reading_is_reported_as_is() {
+        // The reported bug: slider 72.5 %, panel at 185 nits, macpow said
+        // 1160 (0.725 x the 1600-nit HDR peak).
+        assert_nits(
+            display_nits(Some(185.04), Some(0.3084), SDR_CAP, HDR_CAP, None),
+            185.04,
+        );
+        // The reading also wins where the model disagrees with it (it would
+        // say 297 here), and no HDR boost is stacked on top of a measurement.
+        assert_nits(
+            display_nits(Some(356.48), Some(0.4955), SDR_CAP, HDR_CAP, Some(2.0)),
+            356.48,
+        );
+        // Display asleep: dark, although the slider still stands at 75 %.
+        assert_eq!(
+            display_nits(Some(0.0), Some(0.3224), SDR_CAP, HDR_CAP, None),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn model_scales_linear_brightness_by_the_sdr_cap() {
+        for (linear, expected) in [(0.0, 0.0), (0.3084, 185.04), (0.5, 300.0), (1.0, 600.0)] {
+            assert_nits(
+                display_nits(None, Some(linear), SDR_CAP, HDR_CAP, None),
+                expected,
+            );
+        }
+        // Without a preset both caps fall back to the same panel maximum.
+        assert_nits(display_nits(None, Some(0.5), 500.0, 500.0, None), 250.0);
+    }
+
+    #[test]
+    fn model_applies_the_hdr_boost_up_to_the_preset_peak() {
+        assert_nits(
+            display_nits(None, Some(0.5), SDR_CAP, HDR_CAP, Some(2.0)),
+            600.0,
+        );
+        // 600 x 4 = 2400 is more than the panel can emit in this preset.
+        assert_nits(
+            display_nits(None, Some(1.0), SDR_CAP, HDR_CAP, Some(4.0)),
+            1600.0,
+        );
+        // An SDR-only preset ("P3-600") has no headroom to boost into.
+        assert_nits(
+            display_nits(None, Some(1.0), SDR_CAP, SDR_CAP, Some(2.0)),
+            600.0,
+        );
+        // A factor below 1 is not a boost and must not dim SDR white.
+        assert_nits(
+            display_nits(None, Some(0.5), SDR_CAP, HDR_CAP, Some(0.5)),
+            300.0,
+        );
+    }
+
+    #[test]
+    fn nits_are_unknown_without_any_input() {
+        assert_eq!(display_nits(None, None, SDR_CAP, HDR_CAP, None), None);
+        assert_eq!(display_nits(None, None, SDR_CAP, HDR_CAP, Some(2.0)), None);
     }
 }
 
@@ -1308,6 +1515,14 @@ impl Sampler {
             handles.push(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     let brightness = read_display_brightness();
+                    let panel_nits = read_panel_nits();
+                    // Only the fallback model needs this second round trip
+                    // to DisplayServices.
+                    let linear_brightness = if panel_nits.is_none() {
+                        read_display_linear_brightness()
+                    } else {
+                        None
+                    };
                     let backlight_current = read_backlight_current();
                     let refresh_hz = read_display_refresh_hz();
                     let pixel_size = read_display_pixel_size();
@@ -1317,25 +1532,18 @@ impl Sampler {
                             mg.display.available = true;
                             mg.display.brightness_pct = br * 100.0;
                             mg.display.max_nits = max_nits;
-                            // Map the slider linearly to the active Reference
-                            // Mode's full peak (e.g. 1600 in "P3-1600",
-                            // 600 in "P3-600"). This matches the user's
-                            // mental model: slider 100% = mode's stated peak,
-                            // exactly the number shown in System Settings.
+                            // `nits` is the luminance the panel emits now and
+                            // `peak_nits` is the ceiling of the active
+                            // Reference Mode (1600 in "P3-1600", 600 in
+                            // "P3-600"). The two are not tied by the slider:
+                            // SDR white tops out at the preset's SDR cap and
+                            // only HDR content is boosted towards the peak.
                             //
-                            // We deliberately don't try to reflect the
-                            // SDR-vs-HDR-boost split: physically, an SDR
-                            // pixel at slider 100% in "P3-1600" tops out near
-                            // 600 nits and only HDR content can push to 1600
-                            // via DPB boost — but that's confusing UX. Apple's
-                            // own Settings UI labels the peak as the slider
-                            // ceiling, so we follow that convention.
-                            //
-                            // Limitation: AppleARMBacklight's `MilliNits` /
-                            // `MicroAmps` channels don't refresh on slider
-                            // movement on Apple Silicon (event-driven, often
-                            // stale for many seconds), so we can't use the
-                            // actual measured brightness for live display.
+                            // AppleARMBacklight's `MilliNits` / `MicroAmps`
+                            // channels don't refresh on slider movement on
+                            // Apple Silicon (event-driven, often stale for
+                            // minutes), which is why the level comes from the
+                            // framebuffer (`read_panel_nits`) instead.
                             // Thermal throttling on XDR mini-LED can also
                             // reduce achievable nits ~10–15% under sustained
                             // peak HDR, but we have no clean live signal for
@@ -1351,7 +1559,16 @@ impl Sampler {
                                 sdr_cap
                             };
                             mg.display.peak_nits = hdr_cap;
-                            mg.display.nits = br * hdr_cap;
+                            let hdr_boost = mg.display.hdr_active.then_some(mg.display.dpb_factor);
+                            // 0 = unknown; the TUI then omits the figure.
+                            mg.display.nits = display_nits(
+                                panel_nits,
+                                linear_brightness,
+                                sdr_cap,
+                                hdr_cap,
+                                hdr_boost,
+                            )
+                            .unwrap_or(0.0);
                             mg.display.panel_class = panel_class;
                             mg.display.refresh_hz = refresh_hz;
                             mg.display.supports_promotion = supports_promotion;

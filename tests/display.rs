@@ -11,6 +11,18 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsBuiltin(display: u32) -> i32;
+}
+
+fn main_display_is_builtin() -> bool {
+    // SAFETY: both functions take and return plain integers and accept any
+    // display ID, including one that is no longer online.
+    unsafe { CGDisplayIsBuiltin(CGMainDisplayID()) != 0 }
+}
+
 /// Samplers start a dozen threads each; run one at a time whatever
 /// `--test-threads` says.
 static ONE_SAMPLER: Mutex<()> = Mutex::new(());
@@ -30,6 +42,26 @@ fn sample_display() -> Option<DisplayInfo> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Level the built-in panel is driven at, in nits, as printed by `ioreg` for
+/// the framebuffer below `disp0` (16.16 fixed point in the registry).
+fn ioreg_panel_nits() -> Option<f32> {
+    let out = Command::new("/usr/sbin/ioreg")
+        .args(["-r", "-n", "disp0", "-d", "2", "-l", "-w", "0"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let raw: i64 = text
+        .lines()
+        .find_map(|line| {
+            line.trim_start_matches([' ', '|'])
+                .strip_prefix("\"IOMFBBrightnessLevel\" = ")
+        })?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(raw as f32 / 65536.0)
 }
 
 /// "Resolution: W x H" of the display that `system_profiler` marks as main.
@@ -56,6 +88,38 @@ fn system_profiler_main_resolution() -> Option<(u32, u32)> {
 /// in about one run in eight, always an instant reply), so ask a few times.
 fn main_resolution() -> Option<(u32, u32)> {
     (0..4).find_map(|_| system_profiler_main_resolution())
+}
+
+#[test]
+fn nits_match_the_level_the_panel_is_driven_at() {
+    let _guard = ONE_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    if !main_display_is_builtin() {
+        eprintln!("skipped: the main display is not a built-in panel");
+        return;
+    }
+    // Auto-brightness and display sleep can move the level while we look, so
+    // read the registry on both sides of the sample and accept the span.
+    let before = ioreg_panel_nits();
+    let display = sample_display();
+    let after = ioreg_panel_nits();
+    let (Some(before), Some(display), Some(after)) = (before, display, after) else {
+        eprintln!("skipped: no panel level in the registry or no display in the sampler");
+        return;
+    };
+    let (low, high) = (before.min(after), before.max(after));
+    let slack = 0.02 * high + 0.5;
+    eprintln!(
+        "macpow {:.2} nits at {:.1} % slider; registry {before:.2} .. {after:.2} nits",
+        display.nits, display.brightness_pct
+    );
+    assert!(
+        display.nits >= low - slack && display.nits <= high + slack,
+        "macpow reports {} nits but the panel is driven at {before} .. {after} nits \
+         (slider {} %, peak {} nits)",
+        display.nits,
+        display.brightness_pct,
+        display.peak_nits
+    );
 }
 
 #[test]
