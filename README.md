@@ -120,7 +120,7 @@ macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 | `Home` | Jump to top |
 | Mouse click | Select row |
 
-All letter keys work on any keyboard layout (QWERTY, Russian, Dvorak, etc).
+Letter keys are matched by the Latin letter they type, so on a non-Latin layout (Russian, for example) switch to a Latin one, or use the arrow keys and `Esc`.
 
 ## Architecture
 
