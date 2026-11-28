@@ -36,8 +36,8 @@ pub const SSD_MAX_ACTIVE_W: f32 = 2.5;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
     fn CGDisplayScreenSize(display: u32) -> CGSize;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayCopyAllDisplayModes(
@@ -188,6 +188,35 @@ pub fn read_display_refresh_hz() -> f32 {
         let hz = CGDisplayModeGetRefreshRate(mode) as f32;
         CGDisplayModeRelease(mode);
         hz
+    }
+}
+
+/// Width and height of the main display's current mode in pixels: the size the
+/// frame is rendered at. At default scaling that is the panel's native
+/// resolution (3024 x 1964 on a 14" MacBook Pro, the "Resolution" line of
+/// `system_profiler`); a "More Space" mode is rendered larger than the panel
+/// (3600 x 2338) and scaled down to it.
+///
+/// `CGDisplayPixelsWide/High` must not be used for this: despite the name they
+/// return the mode's size in points, which on a HiDPI ("Retina") mode is half
+/// the pixel size in each direction (1512 x 982 on the same panel).
+///
+/// `None` if the display has no current mode.
+pub fn read_display_pixel_size() -> Option<(u32, u32)> {
+    // SAFETY: `CGDisplayCopyDisplayMode` returns either null or a mode we own
+    // (Copy rule). It is null-checked, only read while we hold it, and
+    // released exactly once.
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        if mode.is_null() {
+            return None;
+        }
+        let size = (
+            CGDisplayModeGetPixelWidth(mode) as u32,
+            CGDisplayModeGetPixelHeight(mode) as u32,
+        );
+        CGDisplayModeRelease(mode);
+        Some(size)
     }
 }
 
@@ -1281,6 +1310,7 @@ impl Sampler {
                     let brightness = read_display_brightness();
                     let backlight_current = read_backlight_current();
                     let refresh_hz = read_display_refresh_hz();
+                    let pixel_size = read_display_pixel_size();
                     let preset = read_display_preset();
                     if let Ok(mut mg) = m.lock() {
                         if let Some(br) = brightness {
@@ -1345,8 +1375,12 @@ impl Sampler {
                                     br * MAX_DISPLAY_W
                                 };
                             let display = unsafe { CGMainDisplayID() };
-                            mg.display.width_px = unsafe { CGDisplayPixelsWide(display) } as u32;
-                            mg.display.height_px = unsafe { CGDisplayPixelsHigh(display) } as u32;
+                            // 0 x 0 = unknown (no current mode).
+                            (mg.display.width_px, mg.display.height_px) =
+                                pixel_size.unwrap_or_default();
+                            // The diagonal is derived from the panel's physical
+                            // size in millimetres, so it is the same whether the
+                            // mode is counted in pixels or in points.
                             let size_mm = unsafe { CGDisplayScreenSize(display) };
                             let diag_mm = (size_mm.width.powi(2) + size_mm.height.powi(2)).sqrt();
                             mg.display.diagonal_inches =
